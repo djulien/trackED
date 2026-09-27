@@ -7,6 +7,21 @@ with named point/range timing marks and named timing tracks into the
 Canvas panel, with playback controls and Export Timing (xLights/LRC/
 Audacity) in a right-click track menu.
 
+Also (v1.1):
+  - Stem analysis (audio_analysis.py): demucs vocal/instrumental stems cached
+    next to the audio as <stem>-vocals.wav / <stem>-non_vocals.wav (the old
+    audio_tab.py names), waveform colored green/blue/teal/gray for
+    vocal/instrumental/mixed/silent, region counts in the text panel.
+  - Transcribe: Whisper text for the vocal parts of the selected range,
+    used as the range's label; model auto-picked from free RAM or chosen
+    from the Transcribe ▾ menu (remembered as the "whisper_model" preference).
+  - Timing panel (timing_panel.py): selecting a track, or a mark in one,
+    shows its marks in the text panel with editable start/end/text,
+    -/+/@ time buttons, Split (text-proportional) and Merge.
+  - Ctrl+click places a time cursor; Shift+Play loops the selection.
+  - Everything per-file lives in one "<stem>-cache.json" (see
+    timing_helpers.load_cache).
+
 Ported from the Sequence Editor project's tabs.py (an earlier, standalone
 multi-tab editor this session also worked on), adapted to trackED's
 plugin/onload() contract and generic EditorTab (sash position, cursor/
@@ -51,6 +66,7 @@ them (see WaveformController.min_panel_height).
 
 from __future__ import annotations
 
+import bisect
 import copy
 import subprocess
 import sys
@@ -60,21 +76,156 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+import re
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, colorchooser, filedialog
 
 from logview_tab import debug
-from utils import insert_styled_text
+from utils import insert_styled_text, get_preference, set_preference, get_stem_min_seconds
 
 import timing_helpers as th
+import audio_analysis as aa
+from timing_panel import TimingPanel
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+
+# Waveform colors by stem region (after demucs), as in the old audio_tab.py
+REGION_COLORS = {             # defaults; customizable (click the color key under the waveform)
+    "vocal": "#229954",       # green  - vocal-only (a darker green, to stand apart from teal)
+    "novocal": "#3498db",     # blue   - instrumental-only
+    "mixed": "#1abc9c",       # teal   - both
+    "silent": "#6b6b6b",      # gray   - neither (the old tab counted this as "mixed")
+}
+STEM_LABELS = {"vocal": "vocal", "novocal": "instrumental", "mixed": "mixed", "silent": "silent"}
+
+
+def stem_colors():
+    """The stem colors in use: the "stem_colors" preference over the defaults."""
+    colors = dict(REGION_COLORS)
+    saved = get_preference("stem_colors", {}) or {}
+    if isinstance(saved, dict):
+        for kind, color in saved.items():
+            if kind in colors and isinstance(color, str) and re.match(r"^#[0-9a-fA-F]{6}$", color):
+                colors[kind] = color
+    return colors
+WAVE_COLOR = "#4fc3f7"     # before/without stem analysis
+CURSOR_COLOR = "#e0e0e0"
+CURSOR_PLAY_COLOR = "#ffffff"   # the @cursor while playing (not red: red is a point mark)
+SHIFT_MASK = 0x0001
+CONTROL_MASK = 0x0004
 AUDIO_EXTS = {".mp3", ".mp4", ".wav"}
 
 
 # ---------------------------------------------------------------------------
 # Small UI helpers (ported as-is from the Sequence Editor)
 # ---------------------------------------------------------------------------
+
+class StemColorPicker:
+    """A small non-native color picker: hue / saturation / brightness
+    sliders, a hex field and a swatch. Every change calls on_change(color)
+    right away (live preview); OK calls on_done(color), Cancel/close calls
+    on_done(None). Explicit colors, so it's readable on dark themes too."""
+
+    BG, FG = "#f2f2f2", "#1e1e1e"
+
+    def __init__(self, parent, title, color, on_change, on_done):
+        import colorsys
+        self._colorsys = colorsys
+        self.on_change, self.on_done = on_change, on_done
+        self.color = color
+        self._done = False
+        h, s, v = self._hex_to_hsv(color)
+        self.top = tk.Toplevel(parent)
+        self.top.title(title)
+        self.top.configure(bg=self.BG)
+        try:
+            self.top.transient(parent.winfo_toplevel())
+        except tk.TclError:
+            pass
+        self.swatch = tk.Frame(self.top, width=220, height=36, bg=color, relief="solid", bd=1)
+        self.swatch.pack(padx=12, pady=(12, 6), fill="x")
+        self.scales = {}
+        for key, label, top, value in (("h", "Hue", 360, h * 360), ("s", "Saturation", 100, s * 100),
+                                       ("v", "Brightness", 100, v * 100)):
+            sc = tk.Scale(self.top, label=label, from_=0, to=top, orient="horizontal", length=240,
+                          bg=self.BG, fg=self.FG, troughcolor="#d0d0d0", highlightthickness=0,
+                          command=lambda _v: self._from_sliders())
+            sc.set(round(value))
+            sc.pack(padx=12, fill="x")
+            self.scales[key] = sc
+        row = tk.Frame(self.top, bg=self.BG)
+        row.pack(padx=12, pady=8, fill="x")
+        tk.Label(row, text="Hex", bg=self.BG, fg=self.FG).pack(side="left")
+        self.hex_entry = tk.Entry(row, width=9, bg="#ffffff", fg=self.FG, insertbackground=self.FG)
+        self.hex_entry.pack(side="left", padx=(4, 10))
+        self.hex_entry.insert(0, color)
+        self.hex_entry.bind("<Return>", lambda e: self._from_hex())
+        for text, cmd in (("Cancel", self.cancel), ("OK", self.ok)):
+            tk.Button(row, text=text, command=cmd, bg="#e2e2e2", fg=self.FG, activebackground="#cfe0ff",
+                      activeforeground=self.FG, cursor="hand2", padx=10).pack(side="right", padx=(6, 0))
+        self.top.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.top.bind("<Escape>", lambda e: self.cancel())
+
+    def _hex_to_hsv(self, color):
+        try:
+            r, g, b = (int(color[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+        except (ValueError, IndexError, TypeError):
+            r = g = b = 0.5
+        return self._colorsys.rgb_to_hsv(r, g, b)
+
+    def set_hsv(self, h, s, v):
+        """h in 0..360, s and v in 0..100 (what the sliders show)."""
+        for key, val in (("h", h), ("s", s), ("v", v)):
+            self.scales[key].set(val)
+        self._from_sliders()
+
+    def _from_sliders(self):
+        try:
+            h, s, v = (float(self.scales[k].get()) for k in ("h", "s", "v"))
+        except (tk.TclError, ValueError):
+            return
+        r, g, b = self._colorsys.hsv_to_rgb((h % 360) / 360.0, s / 100.0, v / 100.0)
+        self._apply("#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255)), update_hex=True)
+
+    def _from_hex(self):
+        text = self.hex_entry.get().strip()
+        if not text.startswith("#"):
+            text = "#" + text
+        if re.match(r"^#[0-9a-fA-F]{6}$", text):
+            h, s, v = self._hex_to_hsv(text)
+            for key, val in (("h", h * 360), ("s", s * 100), ("v", v * 100)):
+                self.scales[key].set(round(val))
+            self._apply(text.lower(), update_hex=False)
+
+    def _apply(self, color, update_hex):
+        if color == self.color and not update_hex:
+            return
+        self.color = color
+        try:
+            self.swatch.configure(bg=color)
+            if update_hex and self.hex_entry.get() != color:
+                self.hex_entry.delete(0, "end")
+                self.hex_entry.insert(0, color)
+        except tk.TclError:
+            pass
+        self.on_change(color)
+
+    def ok(self):
+        self._close(self.color)
+
+    def cancel(self):
+        self._close(None)
+
+    def _close(self, result):
+        if self._done:
+            return
+        self._done = True
+        try:
+            self.top.destroy()
+        except tk.TclError:
+            pass
+        self.on_done(result)
+
 
 class _Tooltip:
     """A small delayed tooltip for a toolbar button/control."""
@@ -100,8 +251,11 @@ class _Tooltip:
         self._tip = tk.Toplevel(self.widget)
         self._tip.wm_overrideredirect(True)
         self._tip.wm_geometry(f"+{x}+{y}")
+        # Explicit foreground too: on a dark desktop theme Tk's default text
+        # color is light, which vanished on this light background.
         tk.Label(
-            self._tip, text=self.text, background="#ffffe0", relief="solid", borderwidth=1,
+            self._tip, text=self.text, background="#ffffe0", foreground="#1e1e1e",
+            relief="solid", borderwidth=1, justify="left",
             font=("TkDefaultFont", 8), padx=4, pady=2,
         ).pack()
 
@@ -120,12 +274,13 @@ class _Tooltip:
             self._tip = None
 
 
-def _make_magnifier_icon(sign: str, size: int = 14, color: str = "#333333", bg: str = "#f0f0f0"):
+def _make_magnifier_icon(sign: str, size: int = 14, color: str = "#333333", bg: Optional[str] = "#f0f0f0"):
     """A tiny magnifying-glass icon (circle + handle, with a +/- drawn
     inside) built from raw pixel data -- avoids relying on an emoji glyph
     that isn't available in every system's default UI font."""
     img = tk.PhotoImage(width=size, height=size)
-    img.put(bg, to=(0, 0, size, size))
+    if bg:  # None -> transparent, so the icon works on any (hover) button color
+        img.put(bg, to=(0, 0, size, size))
     cx, cy, r = size // 2 - 2, size // 2 - 2, size // 2 - 4
     for y in range(size):
         for x in range(size):
@@ -151,11 +306,96 @@ def _make_magnifier_icon(sign: str, size: int = 14, color: str = "#333333", bg: 
 
 
 # ---------------------------------------------------------------------------
+# Toolbar look: dark, to match the waveform canvas. Classic Tk widgets with
+# explicit colors (ttk themes ignore/override colors differently per
+# platform, and default text colors follow the desktop theme).
+# ---------------------------------------------------------------------------
+TB_BG = "#252526"
+TB_BTN = "#333336"
+TB_HOVER = "#45494e"
+TB_PRESS = "#555a60"
+TB_FG = "#e0e0e0"
+TB_DIM = "#9a9a9a"
+TB_DISABLED = "#6a6a6a"
+TB_ACCENT = "#4fc3f7"
+TB_LOOP = "#f0b429"
+TB_WARN = "#f0b429"
+TB_SEP = "#48484c"
+TB_READOUT_BG = "#1b1b1c"
+TB_FONT = ("TkDefaultFont", 10)
+TB_MONO = ("TkFixedFont", 10)
+
+
+def _tb_hover(widget, normal_bg=TB_BTN):
+    def enter(_e):
+        if str(widget.cget("state")) != "disabled":
+            widget.configure(bg=TB_HOVER)
+    widget.bind("<Enter>", enter, add="+")
+    widget.bind("<Leave>", lambda _e: widget.configure(bg=normal_bg), add="+")
+
+
+def _tb_button(parent, text="", command=None, width=None, image=None, fg=TB_FG):
+    """A flat, dark toolbar button with hover highlight and hand cursor."""
+    kw = dict(text=text, command=command, bg=TB_BTN, fg=fg, activebackground=TB_PRESS,
+              activeforeground=fg, disabledforeground=TB_DISABLED, relief="flat", bd=0,
+              highlightthickness=0, padx=7, pady=3, cursor="hand2", font=TB_FONT, takefocus=0)
+    if image is not None:
+        kw.update(image=image, compound="center" if not text else "left")
+    if width is not None:
+        kw["width"] = width
+    btn = tk.Button(parent, **kw)
+    _tb_hover(btn)
+    return btn
+
+
+def _tb_menubutton(parent, text):
+    mb = tk.Menubutton(parent, text=text, bg=TB_BTN, fg=TB_FG, activebackground=TB_HOVER,
+                       activeforeground=TB_FG, disabledforeground=TB_DISABLED, relief="flat", bd=0,
+                       highlightthickness=0, padx=7, pady=3, cursor="hand2", font=TB_FONT, takefocus=0)
+    _tb_hover(mb)
+    menu = tk.Menu(mb, tearoff=False, bg="#2d2d30", fg=TB_FG, activebackground=TB_HOVER,
+                   activeforeground="#ffffff", selectcolor=TB_ACCENT, bd=1)
+    mb.configure(menu=menu)
+    return mb, menu
+
+
+def _tb_separator(parent):
+    tk.Frame(parent, width=1, height=20, bg=TB_SEP).pack(side="left", padx=8, pady=2)
+
+
+# ---------------------------------------------------------------------------
 # Missing playback-dependency UI (mirrors audio_tab.py's own pattern:
 # detect what's missing, offer to pip install it, report back in the
 # status area) -- but scoped to *playback only*, not the whole plugin, so
 # marks/tracks editing still works even before/without installing it.
 # ---------------------------------------------------------------------------
+
+def _bind_undo_keys(tab, text):
+    """Ctrl+Z / Ctrl+Y (and Ctrl+Shift+Z) in the text panel go to the tab's
+    undo_hook/redo_hook when a plugin set them, else fall through to the
+    Text widget's own undo. Bound once per tab; the handlers look the hooks
+    up at key time, so they follow whatever file the tab holds now."""
+    if text is None or getattr(tab, "_undo_keys_bound", False):
+        return
+    tab._undo_keys_bound = True
+
+    def run(name):
+        hook = getattr(tab, name, None)
+        if hook:
+            hook()
+            return "break"
+        return None
+
+    for seq in ("<Control-z>", "<Control-Z>"):
+        text.bind(seq, lambda e: run("undo_hook"), add="+")
+    for seq in ("<Control-y>", "<Control-Y>", "<Control-Shift-z>", "<Control-Shift-Z>"):
+        text.bind(seq, lambda e: run("redo_hook"), add="+")
+    try:
+        # The generated info text itself shouldn't be undoable.
+        text.configure(undo=False)
+    except tk.TclError:
+        pass
+
 
 def _decoder_hint(filepath):
     """One-line explanation of what's needed to decode this file, for the
@@ -173,24 +413,38 @@ def _num_fmt(val, fmt) -> str:
 
 
 def _metadata_text(filepath):
-    """The old audio_tab.py's TinyTag metadata block, as styled text."""
+    """The old audio_tab.py's metadata block, as styled text. TinyTag when
+    installed, else the Sequence Editor's built-in ID3/MP4 readers."""
     meta = th.read_metadata(filepath)
-    if meta is None:
-        return "{yellow}tinytag not installed \u2013 limited metadata (pip install tinytag)\n"
-    if "error" in meta:
-        debug(1, f"{{red}}tinytag error: {meta['error']}")
-        return f"{{red}}tinytag error: {meta['error']}\n"
     dash = "\u2014"
+    out = ""
+    if meta.get("error") and len(meta) <= 2:
+        debug(1, f"{{red}}metadata error: {meta['error']}")
+        return f"{{red}}metadata error: {meta['error']}\n"
     dur = th.format_time_ms(meta["duration"]) if meta.get("duration") else dash
-    return (
+    out += (
         f"{{blue}}Title:  {{cyan}}{meta.get('title') or dash}\n"
         f"{{blue}}Artist: {{cyan}}{meta.get('artist') or dash}\n"
         f"{{blue}}Album:  {{cyan}}{meta.get('album') or dash}\n"
-        f"{{blue}}Duration: {{cyan}}{dur}\n"
-        f"{{blue}}Sample rate: {{cyan}}{_num_fmt(meta.get('samplerate'), '.0f')}\n"
-        f"{{blue}}Channels: {{cyan}}{_num_fmt(meta.get('channels'), '.0f')}\n"
-        f"{{blue}}Bitrate: {{cyan}}{_num_fmt(meta.get('bitrate'), '.1f')}\n"
     )
+    if meta["source"] == "tinytag":
+        out += (
+            f"{{blue}}Duration: {{cyan}}{dur}\n"
+            f"{{blue}}Sample rate: {{cyan}}{_num_fmt(meta.get('samplerate'), '.0f')}\n"
+            f"{{blue}}Channels: {{cyan}}{_num_fmt(meta.get('channels'), '.0f')}\n"
+            f"{{blue}}Bitrate: {{cyan}}{_num_fmt(meta.get('bitrate'), '.1f')}\n"
+        )
+    else:
+        for key, label in (("year", "Year"), ("genre", "Genre"), ("track_number", "Track #"),
+                           ("composer", "Composer"), ("comment", "Comment")):
+            if meta.get(key):
+                out += f"{{blue}}{label}: {{cyan}}{meta[key]}\n"
+        if meta.get("duration"):
+            out += f"{{blue}}Duration: {{cyan}}{dur}\n"
+        out += "{yellow}(built-in tag reader; pip install tinytag for sample rate/bitrate)\n"
+    if meta.get("error"):
+        out += f"{{yellow}}({meta['error']})\n"
+    return out
 
 
 def _install_packages(packages, status_callback):
@@ -224,6 +478,9 @@ class WaveformController:
 
     LABEL_ZONE_HEIGHT = 24
     TRACK_HEIGHT = 30
+    STATUS_ROW_HEIGHT = 22  # combined status / new-track drop row under the waveform
+    OVERSHOOT_FACTOR = 1.1  # zooming out past "fit" shows this much of the duration (10% past the end)
+    SEEK_CLICK_WINDOW = 0.6  # s: a skip click this soon after a double/triple-click seek repeats the seek
     TRACK_PALETTE = ["#3a86ff", "#ff6b6b", "#51cf66", "#ffb703"]
     SELECTION_COLOR = "#ffe066"
     EDGE_ZONE = 10
@@ -242,6 +499,8 @@ class WaveformController:
         self.peaks = []
         self.view_start = 0.0
         self.view_end = 0.0
+        self._view_gen = 0              # bumps on every view change (drops stale detail decodes)
+        self._detail_after_id = None    # pending debounced detail decode
 
         # -- marks/tracks state --
         self.marks = th.load_marks(filepath)
@@ -258,21 +517,42 @@ class WaveformController:
         self._mark_history = [self._mark_snapshot()]
         self._mark_history_index = 0
 
+        # -- stem regions / analysis state --
+        self.region_colors = stem_colors()
+        self._raw_regions = th.load_regions(filepath)      # as analyzed (saved in the cache)
+        self.regions = aa.smooth_regions(self._raw_regions, get_stem_min_seconds())
+        self._region_starts = [r["start"] for r in self.regions]
+        self._analysis_busy = None   # None | "stems" | "transcribe"
+        self.info_text = ""          # the tab's normal text-panel content (see set_info_text)
+        self.panel = TimingPanel(self, text) if text is not None else None
+
+        # -- time cursor (Ctrl+click), used by Split / "@" when not playing --
+        self.cursor_time = 0.0
+
         # -- playback state --
         self.engine = th.make_playback_engine()
         self._play_state = "stopped"  # "stopped" | "playing" | "paused"
         self._play_seg_start = 0.0
         self._play_seg_end: Optional[float] = None
         self._play_position = 0.0
+        self._play_origin = 0.0       # the @cursor when Play was pressed (Reset returns here)
+        self._last_click_mark_id = None  # point made by the last plain click (Shift+click extends it)
         self._play_speed = 1.0
         self._play_started_wall: Optional[float] = None
+        self._loop = False            # Shift+Play: repeat the segment until stopped
+        self._play_mark_id = None     # the mark whose span is playing (for the card Play/Pause buttons)
+        self._shift_on_play = False
 
         self._build_toolbars()
+        self._setup_file_drop()
         self._configure_canvas()
         self._start_load()
 
     # ------------------------------------------------------------------ setup
     def _build_toolbars(self):
+        """One grouped toolbar row above the waveform -- transport | view |
+        analysis -- and a status strip below it (playback state, visible
+        range, analysis progress, region color key)."""
         # Clear any toolbar rows a previous onload() call on this same
         # canvas/tab left behind (editor_tab.py clears the canvas' own
         # children on reload, but not sibling frames packed into
@@ -284,73 +564,159 @@ class WaveformController:
                 pass
         toolbars = []
 
-        zoom_bar = ttk.Frame(self.parent)
-        zoom_bar.pack(side="top", fill="x", before=self.canvas)
-        toolbars.append(zoom_bar)
-        self.duration_label = ttk.Label(zoom_bar, text="Duration: detecting...")
-        self.duration_label.pack(side="left")
-        self._duration_text_base = "Duration: detecting..."
+        bar = tk.Frame(self.parent, bg=TB_BG, padx=4, pady=3)
+        bar.pack(side="top", fill="x", before=self.canvas)
+        toolbars.append(bar)
 
-        controls = ttk.Frame(zoom_bar)
-        controls.pack(side="right")
-        self.jump_start_btn = ttk.Button(controls, text="\u25c0|", width=3, state="disabled",
-                                          command=lambda: self.jump_waveform_edge("start"))
-        self._zoom_out_icon = _make_magnifier_icon("-")
-        self._zoom_in_icon = _make_magnifier_icon("+")
-        self.zoom_out_btn = ttk.Button(controls, image=self._zoom_out_icon, text="\u2212", compound="left",
-                                        width=3, state="disabled", command=lambda: self.zoom_waveform("out"))
-        self.zoom_fit_btn = ttk.Button(controls, text="Fit", width=3, state="disabled",
-                                        command=lambda: self.zoom_waveform("fit"))
-        self.zoom_in_btn = ttk.Button(controls, image=self._zoom_in_icon, text="+", compound="left",
-                                       width=3, state="disabled", command=lambda: self.zoom_waveform("in"))
-        self.jump_end_btn = ttk.Button(controls, text="|\u25b6", width=3, state="disabled",
-                                        command=lambda: self.jump_waveform_edge("end"))
-        self.jump_start_btn.pack(side="left", padx=(0, 2))
-        self.zoom_out_btn.pack(side="left", padx=(0, 2))
-        self.zoom_fit_btn.pack(side="left", padx=(0, 2))
-        self.zoom_in_btn.pack(side="left", padx=(0, 2))
-        self.jump_end_btn.pack(side="left")
+        # -- transport --
+        self.play_back_btn = _tb_button(bar, "\u25c0\u25c0", lambda: self.skip_play(-5.0))
+        self.play_btn = _tb_button(bar, "\u25b6", self.toggle_play, width=2, fg=TB_ACCENT)
+        self.play_stop_btn = _tb_button(bar, "\u25a0", self.stop_play)
+        self.play_fwd_btn = _tb_button(bar, "\u25b6\u25b6", lambda: self.skip_play(5.0))
+        for btn in (self.play_back_btn, self.play_btn, self.play_stop_btn, self.play_fwd_btn):
+            btn.pack(side="left", padx=(0, 2))
+        _Tooltip(self.play_back_btn, "Back 5 seconds\nShift+click: start of the stem region\n"
+                                     "Ctrl+click: start of the audio")
+        # Remember the modifier keys on release (widget bindings run before
+        # the class binding that invokes the command).
+        for btn in (self.play_back_btn, self.play_fwd_btn):
+            btn.bind("<ButtonRelease-1>", lambda e: setattr(self, "_skip_mods", e.state), add="+")
+        _Tooltip(self.play_btn, "Play / pause from the @cursor\n"
+                                "Shift+click: loop (from the @cursor to the end of the selected range,\n"
+                                "or the selected mark from its start) until Reset")
+        _Tooltip(self.play_stop_btn, "Reset: back to where Play started")
+        _Tooltip(self.play_fwd_btn, "Forward 5 seconds\nShift+click: end of the stem region\n"
+                                    "Ctrl+click: end of the audio")
+        # Shift detection for the Play button: remember Shift on release
+        # (widget bindings run before the class binding that invokes the
+        # command), and show a loop cursor while Shift is held over it.
+        self.play_btn.bind("<ButtonRelease-1>", self._on_play_btn_release, add="+")
+        self.play_btn.bind("<Enter>", lambda e: self._set_play_cursor(bool(e.state & SHIFT_MASK)), add="+")
+        self.play_btn.bind("<Motion>", lambda e: self._set_play_cursor(bool(e.state & SHIFT_MASK)), add="+")
+        self.play_btn.bind("<Leave>", lambda e: self._set_play_cursor(False), add="+")
+        self._bind_shift_keys()
+
+        self.play_speed_var = tk.StringVar(value="1x")
+        self.speed_btn, speed_menu = _tb_menubutton(bar, "1x \u25be")
+        for choice in ("0.5x", "1x", "2x"):
+            speed_menu.add_radiobutton(label=choice, value=choice, variable=self.play_speed_var,
+                                       command=self._on_play_speed_changed)
+        self.speed_btn.pack(side="left", padx=(4, 0))
+        _Tooltip(self.speed_btn, "Playback speed")
+
+        # Volume (persisted): - / level / +
+        self.volume = self._saved_volume()
+        self.engine.set_volume(self.volume)
+        self.vol_down_btn = _tb_button(bar, "\u2212", lambda: self.change_volume(-self.VOLUME_STEP))
+        self.vol_label = tk.Label(bar, text="", width=8, bg=TB_BG, fg=TB_DIM, font=TB_FONT)
+        self.vol_up_btn = _tb_button(bar, "+", lambda: self.change_volume(self.VOLUME_STEP))
+        self.vol_down_btn.pack(side="left", padx=(6, 0))
+        self.vol_label.pack(side="left")
+        self.vol_up_btn.pack(side="left")
+        _Tooltip(self.vol_down_btn, "Volume down")
+        _Tooltip(self.vol_up_btn, "Volume up")
+        self._update_volume_label()
+
+        # Fixed-width, monospaced position readout (current / total), so the
+        # controls to its right never shift as the numbers change.
+        # The position is an entry: type a time + Enter to move the @cursor.
+        self.time_var = tk.StringVar(value="--:--.--- / --:--.---")
+        readout = tk.Frame(bar, bg=TB_READOUT_BG, padx=4, pady=1)
+        readout.pack(side="left", padx=(8, 0))
+        self.pos_entry = tk.Entry(readout, width=10, justify="right", font=TB_MONO, bg=TB_READOUT_BG, fg=TB_FG,
+                                  insertbackground=TB_FG, relief="flat", bd=0, highlightthickness=1,
+                                  highlightbackground=TB_READOUT_BG, highlightcolor=TB_ACCENT,
+                                  selectbackground="#264f78", selectforeground="#ffffff")
+        self.pos_entry.pack(side="left")
+        self.total_label = tk.Label(readout, text="/ --:--.---", bg=TB_READOUT_BG, fg=TB_DIM, font=TB_MONO)
+        self.total_label.pack(side="left", padx=(4, 2))
+        self.pos_entry.bind("<Return>", self._on_pos_entered)
+        self.pos_entry.bind("<KP_Enter>", self._on_pos_entered)
+        self.pos_entry.bind("<Escape>", lambda e: (self._update_time_readout(force=True), self.canvas.focus_set(), "break")[2])
+        self.pos_entry.bind("<FocusIn>", lambda e: self.pos_entry.after(1, lambda: self.pos_entry.select_range(0, "end")))
+        _Tooltip(self.pos_entry, "@cursor (= playhead). Type a time (m:ss.mmm or seconds) + Enter to move it.\n"
+                                 "Click the waveform to move it; M adds a point mark at it.")
+
+        _tb_separator(bar)
+
+        # -- view --
+        self._zoom_out_icon = _make_magnifier_icon("-", color=TB_FG, bg=None)
+        self._zoom_in_icon = _make_magnifier_icon("+", color=TB_FG, bg=None)
+        self.jump_start_btn = _tb_button(bar, "|\u25c0", lambda: self.jump_waveform_edge("start"))
+        self.zoom_out_btn = _tb_button(bar, image=self._zoom_out_icon, command=lambda: self.zoom_waveform("out"))
+        self.zoom_fit_btn = _tb_button(bar, "\u2194", lambda: self.zoom_waveform("fit"))
+        self.zoom_in_btn = _tb_button(bar, image=self._zoom_in_icon, command=lambda: self.zoom_waveform("in"))
+        self.jump_end_btn = _tb_button(bar, "\u25b6|", lambda: self.jump_waveform_edge("end"))
+        for btn in (self.jump_start_btn, self.zoom_out_btn, self.zoom_fit_btn, self.zoom_in_btn, self.jump_end_btn):
+            btn.pack(side="left", padx=(0, 2), fill="y")
         _Tooltip(self.jump_start_btn, "Jump to start")
-        _Tooltip(self.zoom_out_btn, "Zoom out")
+        _Tooltip(self.zoom_out_btn, "Zoom out (or mouse wheel)")
         _Tooltip(self.zoom_fit_btn, "Fit whole waveform in view")
-        _Tooltip(self.zoom_in_btn, "Zoom in")
+        _Tooltip(self.zoom_in_btn, "Zoom in (or mouse wheel)")
         _Tooltip(self.jump_end_btn, "Jump to end")
 
-        play_bar = ttk.Frame(self.parent)
-        play_bar.pack(side="top", fill="x", before=self.canvas)
-        toolbars.append(play_bar)
-        self.play_btn = ttk.Button(play_bar, text="\u25b6", width=3, state="disabled", command=self.toggle_play)
-        self.play_back_btn = ttk.Button(play_bar, text="\u25c0\u25c0", width=3, state="disabled",
-                                         command=lambda: self.skip_play(-5.0))
-        self.play_fwd_btn = ttk.Button(play_bar, text="\u25b6\u25b6", width=3, state="disabled",
-                                        command=lambda: self.skip_play(5.0))
-        self.play_stop_btn = ttk.Button(play_bar, text="\u25a0", width=3, state="disabled", command=self.stop_play)
-        self.play_back_btn.pack(side="left", padx=(0, 2))
-        self.play_btn.pack(side="left", padx=(0, 2))
-        self.play_stop_btn.pack(side="left", padx=(0, 2))
-        self.play_fwd_btn.pack(side="left", padx=(0, 8))
-        _Tooltip(self.play_back_btn, "Skip back 5 seconds")
-        _Tooltip(self.play_btn, "Play / pause (plays the selected mark or range, else the whole file)")
-        _Tooltip(self.play_stop_btn, "Stop playback")
-        _Tooltip(self.play_fwd_btn, "Skip forward 5 seconds")
+        # -- navigator: visible range + a slider (its thumb = the visible
+        # part of the audio; drag it, or click beside it, to scroll) --
+        self.view_var = tk.StringVar(value="")
+        tk.Label(bar, textvariable=self.view_var, bg=TB_BG, fg=TB_DIM, font=("TkFixedFont", 9)).pack(
+            side="left", padx=(10, 6))
+        self.nav = tk.Canvas(bar, width=self.NAV_WIDTH, height=12, bg=TB_BG, highlightthickness=0, cursor="hand2")
+        self.nav.pack(side="left")
+        self.nav.bind("<ButtonPress-1>", self._on_nav_press)
+        self.nav.bind("<B1-Motion>", self._on_nav_drag)
+        self.nav.bind("<Configure>", lambda e: self._draw_nav())
+        _Tooltip(self.nav, "Visible part of the audio: drag to scroll, click to jump there")
 
-        ttk.Label(play_bar, text="Speed:").pack(side="left")
-        self.play_speed_var = tk.StringVar(value="1x")
-        self.play_speed_combo = ttk.Combobox(play_bar, textvariable=self.play_speed_var, state="readonly",
-                                              values=["0.5x", "1x", "2x"], width=4)
-        self.play_speed_combo.pack(side="left", padx=(4, 8))
-        self.play_speed_combo.bind("<<ComboboxSelected>>", self._on_play_speed_changed)
-        _Tooltip(self.play_speed_combo, "Playback speed")
+        # -- analysis (right) --
+        right = tk.Frame(bar, bg=TB_BG)
+        right.pack(side="right")
+        self.stems_btn = _tb_button(right, "Stems", self.run_stem_analysis)
+        self.stems_btn.pack(side="left", padx=(0, 4))
+        _Tooltip(self.stems_btn, "Separate vocals / instrumental with demucs (cached next to the audio\n"
+                                 "file) and color the waveform: green = vocal, blue = instrumental, "
+                                 "teal = mixed.\nClick the color key under the waveform to change colors.\n"
+                                 "Shift+click to re-run even if cached.")
+        self.stems_btn.bind("<ButtonRelease-1>",
+                            lambda e: setattr(self, "_force_stems", bool(e.state & SHIFT_MASK)), add="+")
+        # Stems \u25be: turn the (non-empty) stem regions into timing tracks.
+        self.stems_menu_btn, self.stems_menu = _tb_menubutton(right, "\u25be")
+        self.stems_menu_btn.configure(padx=4)
+        self.stems_menu_btn.pack(side="left", padx=(0, 6), before=self.stems_btn)
+        self.stems_btn.pack_configure(padx=(0, 1))
+        self.stems_btn.pack(side="left", before=self.stems_menu_btn)
+        self.stems_menu.configure(postcommand=self._fill_stems_menu)
+        _Tooltip(self.stems_menu_btn, "Create timing tracks from the stem regions")
+        self.mood_btn = _tb_button(right, "Mood", self.run_genre_mood)
+        self.mood_btn.pack(side="left", padx=(0, 6))
+        _Tooltip(self.mood_btn, "Estimate the overall genre and mood (rule-based guess from tempo,\n"
+                                "loudness and spectrum; lyrics from Transcribe help). Needs librosa.")
+        self.transcribe_btn = _tb_button(right, "Transcribe", self.transcribe_selected)
+        self.transcribe_btn.pack(side="left", padx=(0, 1))
+        _Tooltip(self.transcribe_btn, "Transcribe the vocal parts of the selected range with Whisper\n"
+                                      "and use the text as its label")
+        self.model_var = tk.StringVar()
+        self._merge_var = tk.BooleanVar(value=bool(get_preference("stem_track_merge", True)))
+        self.model_btn, self.model_menu = _tb_menubutton(right, "\u25be")
+        self.model_btn.configure(padx=4)
+        self.model_btn.pack(side="left")
+        self._refresh_model_combo()
+        # Warning slot: the install button only appears when packages are missing.
+        self._warn_slot = tk.Frame(right, bg=TB_BG)
+        self._warn_slot.pack(side="left")
+        self.install_btn = _tb_button(self._warn_slot, "\u26a0", self._on_install_clicked, fg=TB_WARN)
+        self._install_tip = _Tooltip(self.install_btn, "")
 
+        # Status texts are drawn on the canvas in the row under the waveform
+        # (see _render_status_row); a change redraws it (coalesced).
         self.play_status_var = tk.StringVar(value="")
-        ttk.Label(play_bar, textvariable=self.play_status_var, foreground="#555555").pack(side="left", padx=(0, 8))
-
-        # Missing-playback-dependency prompt (hidden unless actually needed;
-        # see _refresh_playback_availability). Placed in the same row so it
-        # doesn't block marks/tracks editing above the fold.
-        self.install_btn = ttk.Button(play_bar, text="Install missing packages",
-                                       command=self._on_install_clicked)
+        self.analysis_status_var = tk.StringVar(value="")
+        for var in (self.play_status_var, self.analysis_status_var):
+            try:
+                var.trace_add("write", lambda *_a: self._schedule_status_redraw())
+            except (AttributeError, tk.TclError):
+                pass
         self._refresh_playback_availability()
+        self._update_play_controls()   # Stop starts hidden (only shown while paused)
 
         self.canvas._waveform_toolbars = toolbars
         self._toolbars = toolbars
@@ -376,11 +742,11 @@ class WaveformController:
         return total
 
     def min_panel_height(self):
-        tracks_h = (len(self.tracks) + 1) * self.TRACK_HEIGHT
+        tracks_h = self.STATUS_ROW_HEIGHT + len(self.tracks) * self.TRACK_HEIGHT
         return self._toolbar_height() + self.MIN_WORK_HEIGHT + tracks_h
 
     def preferred_panel_height(self):
-        tracks_h = (len(self.tracks) + 1) * self.TRACK_HEIGHT
+        tracks_h = self.STATUS_ROW_HEIGHT + len(self.tracks) * self.TRACK_HEIGHT
         return self._toolbar_height() + self.PREFERRED_WORK_HEIGHT + tracks_h
 
     def _canvas_size(self):
@@ -405,17 +771,42 @@ class WaveformController:
         controls' usability."""
         playback_missing = bool(th.PLAYBACK_MISSING) and isinstance(self.engine, th.SoundDevicePlaybackEngine)
         if playback_missing or th.OPTIONAL_MISSING:
-            self.install_btn.pack(side="left")
+            self.install_btn.pack(side="left", padx=(6, 0))
+            self._install_tip.text = ("Missing packages: " + ", ".join(th.installable_missing().values())
+                                      + "\nClick to install them with pip")
             if playback_missing:
                 self.play_status_var.set("Playback packages missing")
         else:
             self.install_btn.pack_forget()
 
+    def _update_legend(self):
+        """The region color key is drawn in the status row by render."""
+        if self.audio_duration is not None:
+            self._last_status_drawn = None   # the key changed even if the text didn't
+            self._schedule_status_redraw()
+
+    def _status_text(self):
+        return " \u00b7 ".join(v for v in (self.play_status_var.get(), self.analysis_status_var.get()) if v)
+
+    def _schedule_status_redraw(self):
+        # Playback re-sets the same status 10x/s; only redraw on a real change.
+        if self._status_text() == getattr(self, "_last_status_drawn", None):
+            return
+        if getattr(self, "_status_redraw_id", None) is None:
+            try:
+                self._status_redraw_id = self.canvas.after(30, self._status_redraw)
+            except tk.TclError:
+                pass
+
+    def _status_redraw(self):
+        self._status_redraw_id = None
+        self.render_waveform()
+
     def _on_install_clicked(self):
         packages = list(th.installable_missing().values())
         if not packages:
             return
-        self.install_btn.configure(state="disabled", text="Installing...")
+        self.install_btn.configure(state="disabled", text="\u26a0 Installing...")
         self.play_status_var.set("Installing...")
 
         def status_cb(msg):
@@ -430,11 +821,11 @@ class WaveformController:
     def _install_finished(self, success, message):
         if success:
             self.play_status_var.set("Installed -- please restart the app")
-            self.install_btn.configure(text="Installed -- restart required", state="disabled")
+            self.install_btn.configure(text="\u26a0 Restart required", state="disabled")
             messagebox.showinfo("Installation complete", "Packages installed.\nPlease restart the application.")
         else:
             self.play_status_var.set("Install failed")
-            self.install_btn.configure(text="Install failed -- retry?", state="normal")
+            self.install_btn.configure(text="\u26a0 Install failed -- retry?", state="normal")
             messagebox.showerror("Installation failed", message)
 
     def _configure_canvas(self):
@@ -442,6 +833,11 @@ class WaveformController:
         c.configure(background="#1e1e1e", height=160)
         c.create_text(10, 80, text="Preparing waveform...", fill="#aaaaaa", anchor="w", tags="placeholder")
         c.bind("<Button-1>", self._on_waveform_press)
+        # Ctrl+click / Ctrl+drag: place the time cursor (seek) without
+        # creating a mark. More specific than <Button-1>, so Tk picks it.
+        c.bind("<Control-Button-1>", self._on_ctrl_press)
+        c.bind("<Control-B1-Motion>", self._on_ctrl_drag)
+        c.bind("<Control-ButtonRelease-1>", lambda e: "break")
         c.bind("<B1-Motion>", self._on_waveform_drag)
         c.bind("<ButtonRelease-1>", self._on_waveform_release)
         c.bind("<Double-Button-1>", self._on_waveform_double_click)
@@ -450,7 +846,7 @@ class WaveformController:
         c.bind("<MouseWheel>", self._on_waveform_wheel)
         c.bind("<Button-4>", self._on_waveform_wheel)
         c.bind("<Button-5>", self._on_waveform_wheel)
-        c.bind("<Configure>", lambda e: self.render_waveform())
+        c.bind("<Configure>", self._on_canvas_configure)
         c.bind("<Enter>", lambda e: c.focus_set())
         c.bind("<Leave>", self._on_waveform_leave)
         c.bind("<Up>", self._on_key_up)
@@ -458,6 +854,8 @@ class WaveformController:
         c.bind("<Left>", self._on_key_left)
         c.bind("<Right>", self._on_key_right)
         c.bind("<Delete>", self._on_key_delete)
+        for key in ("<Key-m>", "<Key-M>"):
+            c.bind(key, lambda e: (self.add_point_at(self.cursor_position() or 0.0), "break")[1])
         c.bind("<BackSpace>", self._on_key_delete)
         c.bind("<Escape>", self._on_key_escape)
         c.bind("<Tab>", self._on_key_tab)
@@ -475,7 +873,7 @@ class WaveformController:
     def _set_zoom_controls_enabled(self, enabled: bool):
         state = "normal" if enabled else "disabled"
         for btn in (self.jump_start_btn, self.zoom_in_btn, self.zoom_out_btn,
-                    self.zoom_fit_btn, self.jump_end_btn,
+                    self.zoom_fit_btn, self.jump_end_btn, self.speed_btn,
                     self.play_btn, self.play_back_btn, self.play_fwd_btn, self.play_stop_btn):
             btn.configure(state=state)
 
@@ -490,16 +888,17 @@ class WaveformController:
         def worker():
             try:
                 cached = th.load_waveform_cache(self.filepath)
-                if cached:
+                if cached and len(cached["peaks"]) >= th.WAVEFORM_CACHE_RESOLUTION:
                     result["duration"] = cached["duration"]
                     result["peaks"] = cached["peaks"]
                 else:
-                    duration = th.get_audio_duration_seconds(self.filepath)
+                    # No cache, or an older lower-resolution one: (re)decode.
+                    duration = cached["duration"] if cached else th.get_audio_duration_seconds(self.filepath)
                     if duration is None:
                         result["error"] = "Could not determine audio duration.\n" + _decoder_hint(self.filepath)
                         result["details"] = list(th.LAST_DURATION_ERRORS)
                         return
-                    peaks = th.decode_waveform_peaks(self.filepath, 0.0, duration, 2000)
+                    peaks = th.decode_waveform_peaks(self.filepath, 0.0, duration, th.WAVEFORM_CACHE_RESOLUTION)
                     if not peaks:
                         result["error"] = "Could not decode waveform data.\n" + _decoder_hint(self.filepath)
                         return
@@ -531,15 +930,21 @@ class WaveformController:
         self.audio_duration = duration
         self.view_start, self.view_end = 0.0, duration
         self.full_peaks = peaks
-        self.peaks = th.rebucket_peaks(peaks, 0.0, 1.0, 2000)
-        self._duration_text_base = f"Duration: {th.format_time_ms(duration)}"
+        self.peaks = th.rebucket_peaks(peaks, 0.0, 1.0, self._target_buckets())
+        self._duration_text_base = th.format_time_ms(duration)
+        if self.tab is not None:
+            self.tab.title_detail = th.format_time_ms(duration)  # window title: "song.mp3 (3:45.120)"
+            refresh = getattr(self.tab, "refresh_title", None)
+            if callable(refresh):
+                refresh()
         self.render_waveform()
         self._set_zoom_controls_enabled(True)
         debug(2, f"{{green}}waveform_tab loaded {self.filepath}: {th.format_time_ms(duration)}")
+        self._auto_stems()
 
     def _show_waveform_error(self, message):
-        self._duration_text_base = "Duration: unavailable"
-        self.duration_label.configure(text=self._duration_text_base)
+        self._duration_text_base = "unavailable"
+        self.time_var.set("--:--.--- / unavailable")
         self.canvas.delete("all")
         w, h = self._canvas_size()
         self.canvas.create_text(w // 2, h // 2, text=message, fill="#e08080", width=w - 20, justify="center")
@@ -559,10 +964,15 @@ class WaveformController:
             new_end = min(duration, new_start + new_span)
             new_start = max(0.0, new_end - new_span)
         elif action == "out":
-            new_span = min(duration, span * 2)
-            new_start = max(0.0, mid - new_span / 2)
-            new_end = min(duration, new_start + new_span)
-            new_start = max(0.0, new_end - new_span)
+            if span >= duration - 1e-9:
+                # Already showing everything: one extra step leaves a little
+                # room past the end, so marks near the end are easy to reach.
+                new_start, new_end = 0.0, duration * self.OVERSHOOT_FACTOR
+            else:
+                new_span = min(duration, span * 2)
+                new_start = max(0.0, mid - new_span / 2)
+                new_end = min(duration, new_start + new_span)
+                new_start = max(0.0, new_end - new_span)
         else:
             return
         self.view_start, self.view_end = new_start, new_end
@@ -582,32 +992,153 @@ class WaveformController:
             return
         self._refresh_view_from_cache()
 
-    def _refresh_view_from_cache(self):
-        """Redraw for the current view_start/view_end from the cached
-        full-file overview. Unlike the Sequence Editor's original, this
-        port always serves zoom/pan from the cached overview rather than
-        re-invoking ffmpeg for extreme zoom levels -- a deliberate
-        simplification for this port; see the module docstring."""
+    def _target_buckets(self):
+        """One waveform column per canvas pixel (as in the Sequence
+        Editor's _waveform_target_buckets)."""
+        return max(50, min(3000, int(self._canvas_size()[0])))
+
+    def _on_canvas_configure(self, event=None):
+        if self.audio_duration:
+            self._refresh_view_from_cache()
+        else:
+            self.render_waveform()
+
+    DETAIL_BEHIND = 0.25     # pages of detail decoded before the view
+    DETAIL_AHEAD = 1.75      # ...and after it (so the next page is already there)
+    DETAIL_MAX_BUCKETS = 24000
+
+    def _refresh_view_from_cache(self, render=True):
+        """Set self.peaks for the current view.
+
+        - The full-file overview has enough points for this view: rebucket it.
+        - Zoomed in further: use the decoded detail cache if it covers the
+          view at this zoom; otherwise show the coarse overview now and
+          decode detail in the background for the view plus ~1.75 pages
+          ahead (and a little behind), so scrolling on -- e.g. following
+          the playhead -- needs no new decode. When the view comes within
+          half a page of the detail's end, the next stretch is prefetched."""
         if not self.audio_duration:
             return
-        start_frac = self.view_start / self.audio_duration
-        end_frac = self.view_end / self.audio_duration
-        self.peaks = th.rebucket_peaks(self.full_peaks, start_frac, end_frac, 2000)
-        self.render_waveform()
+        duration = self.audio_duration
+        data_end = min(self.view_end, duration)
+        span = self.view_end - self.view_start
+        share = (data_end - self.view_start) / span if span > 0 else 1.0
+        self._peaks_span = (self.view_start, data_end)
+        target = max(2, int(self._target_buckets() * share))
+        start_frac, end_frac = self.view_start / duration, data_end / duration
+        available = (end_frac - start_frac) * len(self.full_peaks or [])
+        self._view_gen = getattr(self, "_view_gen", 0) + 1
+        pending = getattr(self, "_detail_after_id", None)
+        if pending is not None:
+            try:
+                self.canvas.after_cancel(pending)
+            except (tk.TclError, ValueError):
+                pass
+            self._detail_after_id = None
+
+        if available >= target:
+            self.peaks = th.rebucket_peaks(self.full_peaks, start_frac, end_frac, target)
+        else:
+            density = target / max(1e-9, data_end - self.view_start)       # buckets per second needed
+            d = getattr(self, "_detail", None)
+            if d and d["t0"] <= self.view_start + 1e-9 and d["t1"] >= data_end - 1e-9 \
+                    and d["density"] >= density * 0.95:
+                length = d["t1"] - d["t0"]
+                self.peaks = th.rebucket_peaks(d["peaks"], (self.view_start - d["t0"]) / length,
+                                               (data_end - d["t0"]) / length, target)
+                self._maybe_prefetch(density)
+            else:
+                if self.full_peaks:
+                    self.peaks = th.rebucket_peaks(self.full_peaks, start_frac, end_frac, max(2, int(available)))
+                gen = self._view_gen
+                self._detail_after_id = self.canvas.after(
+                    120, lambda: self._decode_detail_window(self.view_start, density, gen=gen))
+        if render:
+            self.render_waveform()
+
+    def _detail_window(self, start, span):
+        t0 = max(0.0, start - self.DETAIL_BEHIND * span)
+        t1 = min(self.audio_duration, start + (1.0 + self.DETAIL_AHEAD) * span)
+        return t0, t1
+
+    def _maybe_prefetch(self, density):
+        """Near the end of the decoded detail: decode the next stretch now,
+        in the background, before the view (or the playhead) gets there."""
+        d = self._detail
+        span = min(self.view_end, self.audio_duration) - self.view_start
+        if d["t1"] >= self.audio_duration - 1e-6 or getattr(self, "_detail_busy", False):
+            return
+        if self.view_end > d["t1"] - 0.5 * span:
+            self._decode_detail_window(self.view_start, density, gen=None)
+
+    def _decode_detail_window(self, start, density, gen=None):
+        """Decode detail peaks for [start - 0.25 page, start + 2.75 pages] at
+        `density` buckets/second in a worker thread, then store them as the
+        detail cache and redraw if the current view can use them. gen=None
+        marks a prefetch (kept even if the view has moved since)."""
+        self._detail_after_id = None
+        if gen is not None and gen != self._view_gen:
+            return
+        if getattr(self, "_detail_busy", False):
+            # one decode at a time; the finished one re-checks the view
+            self._detail_wanted = (start, density)
+            return
+        span = min(self.view_end, self.audio_duration) - self.view_start
+        t0, t1 = self._detail_window(start, max(span, 1e-3))
+        buckets = max(2, min(self.DETAIL_MAX_BUCKETS, int(density * (t1 - t0))))
+        result = {}
+        self._detail_busy = True
+
+        def worker():
+            try:
+                result["peaks"] = th.decode_waveform_peaks(self.filepath, t0, t1 - t0, buckets)
+            except Exception as exc:
+                result["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        def poll():
+            if thread.is_alive():
+                self.canvas.after(60, poll)
+                return
+            self._detail_busy = False
+            if result.get("peaks"):
+                self._detail = {"t0": t0, "t1": t1, "peaks": result["peaks"],
+                                "density": len(result["peaks"]) / max(1e-9, t1 - t0)}
+                self._refresh_view_from_cache()      # uses the new detail if it fits the view
+            elif "error" in result:
+                debug(2, f"{{yellow}}waveform detail decode failed: {result['error']}")
+            wanted = getattr(self, "_detail_wanted", None)
+            self._detail_wanted = None
+            if wanted and not result.get("peaks"):
+                self._decode_detail_window(*wanted)
+
+        self.canvas.after(60, poll)
 
     # ------------------------------------------------------------------ marks/tracks core
     def _mark_snapshot(self):
         return (copy.deepcopy(self.marks), copy.deepcopy(self.tracks))
 
     def _mark_changed(self, record_history=True):
-        """Marks/tracks are saved eagerly (like the waveform cache),
-        rather than tied to trackED's own text-file Save flow -- they live
-        in their own "<mediafile>-marks.json" sidecar (see
-        timing_helpers.save_marks), so there's nothing to lose by not
-        going through File > Save."""
-        th.save_marks(self.filepath, self.marks, self.tracks)
+        """Marks/tracks changed: flag the tab as having unsaved changes
+        (tab label "*"). They're written to the media file's combined
+        "<stem>-cache.json" by File > Save, auto-save, or the close/quit
+        prompt -- all through tab.save_hook = save_marks_now. The audio
+        file itself is never written. Without a tab (standalone use) they
+        are saved immediately, as before."""
         if record_history:
             self._push_mark_history()
+        mark_dirty = getattr(self.tab, "mark_dirty", None) if self.tab is not None else None
+        if callable(mark_dirty):
+            mark_dirty()
+        else:
+            self.save_marks_now()
+
+    def save_marks_now(self):
+        """tab.save_hook: write marks/tracks to the sidecar cache."""
+        th.save_marks(self.filepath, self.marks, self.tracks)
+        return True
 
     def _push_mark_history(self):
         del self._mark_history[self._mark_history_index + 1:]
@@ -628,17 +1159,31 @@ class WaveformController:
             return
         self._mark_history_index -= 1
         self.marks, self.tracks = copy.deepcopy(self._mark_history[self._mark_history_index])
-        self.selected = None
+        self._keep_selection_if_present()
         self._hover = None
         self._mark_changed(record_history=False)
         self.render_waveform()
+
+    def _keep_selection_if_present(self):
+        """After undo/redo, keep the selection if that mark/track still
+        exists (so the timing panel stays on the same track); otherwise
+        fall back to the track the mark was in, or nothing."""
+        if not self.selected:
+            return
+        kind, sel_id = self.selected
+        if kind == "mark" and self.mark_by_id(sel_id):
+            return
+        if kind == "track" and self.track_by_id(sel_id):
+            return
+        track_id = getattr(self, "_last_panel_track", None)
+        self.selected = ("track", track_id) if track_id and self.track_by_id(track_id) else None
 
     def redo_marks(self):
         if not self.can_redo_marks():
             return
         self._mark_history_index += 1
         self.marks, self.tracks = copy.deepcopy(self._mark_history[self._mark_history_index])
-        self.selected = None
+        self._keep_selection_if_present()
         self._hover = None
         self._mark_changed(record_history=False)
         self.render_waveform()
@@ -694,6 +1239,106 @@ class WaveformController:
             self.selected = None
         self._mark_changed()
         self.render_waveform()
+
+    def delete_mark_by_id(self, mark_id):
+        """Delete a mark; if it was in a track, select the next card there
+        (or the previous one if it was the last), else the track itself --
+        so the track keeps the focus."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None:
+            return False
+        after = th.neighbor_mark(self.marks, mark, 1) or th.neighbor_mark(self.marks, mark, -1)
+        track_id = mark.get("track_id")
+        self._delete_mark(mark)
+        if track_id is not None:
+            self.selected = ("mark", after["id"]) if after else ("track", track_id)
+            self.render_waveform()
+        return True
+
+    # ------------------------------------------------------------------ close
+    UNASSIGNED_TRACK_NAME = "Unassigned marks"
+
+    def before_close(self):
+        """tab.before_close_hook: marks still in the work area (not in any
+        track)? Offer to move them into a new track, delete them, or leave
+        them for next time. Returns False if the user cancels the close."""
+        loose = [m for m in self.marks if m.get("track_id") is None]
+        if not loose:
+            return True
+        choice = self.ask_unassigned(len(loose))
+        if choice == "cancel":
+            return False
+        if choice == "track":
+            track = self._new_track(self.UNASSIGNED_TRACK_NAME, record_history=False)
+            for m in loose:
+                m["track_id"] = track["id"]
+            self._mark_changed()
+        elif choice == "delete":
+            ids = {m["id"] for m in loose}
+            self.marks = [m for m in self.marks if m["id"] not in ids]
+            self._mark_changed()
+        self.render_waveform()
+        return True
+
+    def ask_unassigned(self, count):
+        """A small modal choice: "track" / "delete" / "leave" / "cancel"."""
+        try:
+            top = tk.Toplevel(self.canvas)
+        except tk.TclError:
+            return "leave"
+        top.title("Unassigned timing marks")
+        top.configure(bg="#f2f2f2")   # explicit colors: readable on dark desktop themes too
+        top.transient(self.canvas.winfo_toplevel())
+        result = {"choice": "cancel"}
+        name = Path(self.filepath).name
+        tk.Label(top, text=f"\u201c{name}\u201d has {count} timing mark{'s' if count != 1 else ''} "
+                           "on the waveform that aren't in any track.\nWhat should happen to them?",
+                 justify="left", padx=14, pady=10, fg="#1e1e1e", bg="#f2f2f2").pack(anchor="w")
+        row = tk.Frame(top, padx=10, pady=8, bg="#f2f2f2")
+        row.pack(fill="x")
+
+        def pick(value):
+            result["choice"] = value
+            top.destroy()
+
+        for text, value in (("Save into a new track", "track"), ("Delete them", "delete"),
+                            ("Leave them for next time", "leave"), ("Cancel", "cancel")):
+            tk.Button(row, text=text, command=lambda v=value: pick(v), padx=8, bg="#e2e2e2", fg="#1e1e1e",
+                      activebackground="#cfe0ff", activeforeground="#1e1e1e", cursor="hand2").pack(side="left", padx=4)
+        top.protocol("WM_DELETE_WINDOW", lambda: pick("cancel"))
+        top.bind("<Escape>", lambda e: pick("cancel"))
+        try:
+            top.grab_set()
+            top.wait_window()
+        except tk.TclError:
+            pass
+        return result["choice"]
+
+    def select_track_only(self, track_id):
+        """Deselect any card/mark but keep showing that track's panel."""
+        if self.track_by_id(track_id) and self.selected != ("track", track_id):
+            self.selected = ("track", track_id)
+            self.render_waveform()
+
+    def mouse_busy(self):
+        """True while a canvas drag (moving/resizing a mark, drawing a
+        range, reordering a track) is in progress."""
+        return bool(self._move_drag or self._track_drag
+                    or (self._press_info and self._press_info.get("dragging")))
+
+    def neighbor_time(self, mark_id, direction):
+        """For the card snap buttons: the end of the previous mark
+        (direction -1) or the start of the next one (+1) in the same track;
+        with no neighbor, the start (0:00) or end of the audio."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None:
+            return None
+        other = th.neighbor_mark(self.marks, mark, direction)
+        if other is None:
+            return 0.0 if direction < 0 else self.audio_duration
+        if direction < 0:
+            return other["end"] if other.get("type") == "range" and other.get("end") is not None else other["start"]
+        return other["start"]
 
     def _delete_all_marks(self):
         self.marks = []
@@ -751,6 +1396,702 @@ class WaveformController:
             self._mark_changed()
             self.render_waveform()
 
+    # ------------------------------------------------------------------ lookups used by the timing panel
+    def mark_by_id(self, mark_id):
+        if mark_id is None:
+            return None
+        return next((m for m in self.marks if m["id"] == mark_id), None)
+
+    def track_by_id(self, track_id):
+        return next((t for t in self.tracks if t["id"] == track_id), None)
+
+    def track_marks(self, track_id):
+        return sorted((m for m in self.marks if m.get("track_id") == track_id),
+                      key=lambda m: (m["start"], m.get("end") or m["start"], m["id"]))
+
+    def selected_mark_id(self):
+        if self.selected and self.selected[0] == "mark":
+            return self.selected[1]
+        return None
+
+    def panel_track_id(self):
+        """Which track the text panel should show: the selected track, or
+        the track of the selected mark; None -> the normal info text."""
+        if not self.selected:
+            return None
+        kind, sel_id = self.selected
+        if kind == "track":
+            track_id = sel_id if self.track_by_id(sel_id) else None
+        else:
+            mark = self.mark_by_id(sel_id)
+            track_id = mark.get("track_id") if mark else None
+        if track_id:
+            self._last_panel_track = track_id
+        return track_id
+
+    def select_mark(self, mark_id, from_panel=False):
+        mark = self.mark_by_id(mark_id)
+        if mark is None or self.selected == ("mark", mark_id):
+            return
+        self.selected = ("mark", mark_id)
+        self._ensure_mark_visible(mark)
+        self.render_waveform()
+
+    def cursor_position(self):
+        """The @cursor (it moves with playback while playing)."""
+        pos = self.current_play_position()
+        return self.cursor_time if pos is None else pos
+
+    def play_mark_by_id(self, mark_id, loop=False):
+        """Play (or with loop=True, loop) one mark's span from its start."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None:
+            return
+        self.selected = ("mark", mark_id)
+        if self._play_state == "playing":
+            self._halt_engine()
+        self._play_state = "stopped"
+        is_range = mark["type"] == "range" and mark.get("end") is not None
+        self.start_play(loop=loop, segment=(mark["start"], mark["end"] if is_range else None), mark_id=mark_id)
+
+    def toggle_mark_play(self, mark_id, loop=False):
+        """A timing card's Play/Pause button: pause if this mark is
+        playing, resume if it's paused, else start it (looping with Shift)."""
+        mine = self._play_mark_id == mark_id and self._play_state != "stopped"
+        if loop:
+            self.play_mark_by_id(mark_id, loop=True)
+        elif mine and self._play_state == "playing":
+            self.pause_play()
+        elif mine and self._play_state == "paused":
+            self.start_play()
+        else:
+            self.play_mark_by_id(mark_id, loop=False)
+
+    def mark_play_state(self, mark_id):
+        """"playing" / "paused" / "stopped" for one mark's card button."""
+        if self._play_mark_id != mark_id:
+            return "stopped"
+        return self._play_state
+
+    # ------------------------------------------------------------------ edits used by the panel / menus
+    def set_mark_times(self, mark_id, start, end):
+        """Set a mark's start and end (end None -> point). Returns False
+        (and changes nothing) if the values are out of range."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None:
+            return False
+        duration = self.audio_duration or float("inf")
+        if start is None or start < 0 or start > duration:
+            return False
+        if end is not None:
+            if end > duration + 1e-6 or end - start < th.MIN_RANGE - 1e-9:
+                return False
+            mark["type"], mark["start"], mark["end"] = "range", float(start), float(end)
+        else:
+            mark["type"], mark["start"], mark["end"] = "point", float(start), None
+        self._mark_changed()
+        self.render_waveform()
+        return True
+
+    def set_mark_label(self, mark_id, label):
+        mark = self.mark_by_id(mark_id)
+        if mark is None:
+            return False
+        mark["label"] = label.strip()
+        self._mark_changed()
+        self.render_waveform()
+        return True
+
+    def split_mark_by_id(self, mark_id, text_index=None, at_time=None):
+        """Split a mark in two (see timing_helpers.plan_split). With no
+        explicit at_time, the playback/Ctrl+click cursor is used if it
+        falls inside the range. Returns False if it couldn't be split."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None:
+            return False
+        if at_time is None:
+            at_time = self.cursor_position()
+        plan = th.plan_split(mark, at_time=at_time, text_index=text_index)
+        if plan is None:
+            return False
+        (ls, le, ltext), (rs, re_, rtext) = plan["left"], plan["right"]
+        mark["start"], mark["end"], mark["label"] = ls, le, ltext
+        mark["type"] = "range" if le is not None else "point"
+        new = {
+            "id": uuid.uuid4().hex[:8], "type": "range" if re_ is not None else "point",
+            "start": rs, "end": re_, "label": rtext, "track_id": mark.get("track_id"),
+            "source": mark.get("source", "user"),
+        }
+        self.marks.append(new)
+        self._mark_changed()
+        self.render_waveform()
+        return True
+
+    def split_mark_into(self, mark_id, spans):
+        """Split a mark into several at these character spans of its label
+        (a phrase selection, or every word), timing each piece by its word
+        weights -- see timing_helpers.plan_pieces. The first piece keeps the
+        mark's id and stays selected. One undo step."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None:
+            return False
+        plan = th.plan_pieces(mark, spans)
+        if not plan:
+            return False
+        (s0, e0, t0), rest = plan[0], plan[1:]
+        mark["start"], mark["end"], mark["label"] = s0, e0, t0
+        mark["type"] = "range" if e0 is not None else "point"
+        for s1, e1, t1 in rest:
+            self.marks.append({
+                "id": uuid.uuid4().hex[:8], "type": "range" if e1 is not None else "point",
+                "start": s1, "end": e1, "label": t1, "track_id": mark.get("track_id"),
+                "source": mark.get("source", "user"),
+            })
+        self.selected = ("mark", mark_id)
+        self._mark_changed()
+        self.render_waveform()
+        return True
+
+    def merge_mark_by_id(self, mark_id, direction=1):
+        """Merge a mark with its next (+1) / previous (-1) neighbor in the
+        same track (or the unassigned marks) into one range."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None:
+            return False
+        other = th.neighbor_mark(self.marks, mark, direction)
+        if other is None:
+            return False
+        start, end, label = th.merged_fields(mark, other)
+        if end - start < th.MIN_RANGE:
+            return False
+        mark["start"], mark["end"], mark["label"], mark["type"] = start, end, label, "range"
+        self.marks = [m for m in self.marks if m["id"] != other["id"]]
+        self.selected = ("mark", mark["id"])
+        self._mark_changed()
+        self.render_waveform()
+        return True
+
+    # ------------------------------------------------------------------ info text (text panel)
+    def set_info_text(self, styled):
+        self.info_text = styled
+
+    def append_info(self, styled):
+        """Add a line to the tab's info text (shown whenever no timing
+        track is selected)."""
+        self.info_text += styled
+        if self.panel is not None:
+            self.panel.append_info(styled)
+
+    # ------------------------------------------------------------------ Ctrl+click cursor
+    def _on_ctrl_press(self, event):
+        if self.audio_duration is None or self.view_end <= self.view_start:
+            return "break"
+        self._set_cursor(self._time_at_x(event.x))
+        return "break"
+
+    def _on_ctrl_drag(self, event):
+        if self.audio_duration is None or self.view_end <= self.view_start:
+            return "break"
+        self._set_cursor(self._time_at_x(event.x), seek_playing=False)
+        return "break"
+
+    def _set_cursor(self, t, seek_playing=True):
+        """Ctrl+click: move the @cursor (seeking playback if playing)."""
+        if self._play_state == "playing" and not seek_playing:
+            return
+        self.seek_to(t)
+
+    # ------------------------------------------------------------------ stem regions
+    def _set_regions(self, regions):
+        """Keep the analyzed regions, and use them smoothed: changes shorter
+        than the "stem_min_seconds" preference are merged away."""
+        self._raw_regions = list(regions or [])
+        self.regions = aa.smooth_regions(self._raw_regions, get_stem_min_seconds())
+        self._region_starts = [r["start"] for r in self.regions]
+        self._update_legend()
+
+    def resmooth_regions(self):
+        """Re-apply the smoothing preference (after it changes)."""
+        self._set_regions(getattr(self, "_raw_regions", self.regions))
+        if self.regions:
+            self._report_regions()
+        self.render_waveform()
+
+    def _region_kind_at(self, t):
+        if not self.regions:
+            return None
+        i = bisect.bisect_right(self._region_starts, t) - 1
+        if 0 <= i < len(self.regions):
+            return self.regions[i]["kind"]
+        return None
+
+    def _report_regions(self, elapsed=None, reused=None):
+        if not self.regions:
+            return
+        counts = aa.region_counts(self.regions)
+        secs = aa.region_seconds(self.regions)
+        how = ""
+        if reused is True:
+            how = " (from cached stems)"
+        elif reused is False:
+            how = " (new stems)"
+        msg = (
+            f"\n{{green}}Stem regions{how} (changes under {get_stem_min_seconds():g}s merged)\n"
+            f"{{blue}}  vocal-only regions:     {{cyan}}{counts['vocal']:4d}  ({th.format_time(secs['vocal'])})\n"
+            f"{{blue}}  instrumental-only:      {{cyan}}{counts['novocal']:4d}  ({th.format_time(secs['novocal'])})\n"
+            f"{{blue}}  mixed regions:          {{cyan}}{counts['mixed']:4d}  ({th.format_time(secs['mixed'])})\n"
+            f"{{blue}}  silent regions:         {{cyan}}{counts['silent']:4d}  ({th.format_time(secs['silent'])})\n"
+        )
+        if elapsed is not None:
+            msg += f"{{blue}}  elapsed: {{cyan}}{elapsed:.1f}s\n"
+        self.append_info(msg)
+
+    def _set_analysis_busy(self, what):
+        self._analysis_busy = what
+        state = "disabled" if what else "normal"
+        for btn in (self.stems_btn, self.transcribe_btn, self.model_btn, self.mood_btn):
+            try:
+                btn.configure(state=state)
+            except tk.TclError:
+                pass
+
+    def _run_in_thread(self, work, done, progress_prefix=""):
+        """Run work(progress) in a thread; call done(result, error, elapsed)
+        on the UI thread. progress(msg) may be called from the thread."""
+        result = {}
+        last = {"msg": None}
+        t0 = time.time()
+
+        def progress(msg):
+            last["msg"] = msg
+
+        def worker():
+            try:
+                result["value"] = work(progress)
+            except Exception as exc:
+                result["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        shown = {"msg": None}
+
+        def poll():
+            msg = last["msg"]
+            if msg and msg != shown["msg"]:
+                shown["msg"] = msg
+                self.analysis_status_var.set(f"{progress_prefix}{msg}"[:70])
+                if "%" in msg:
+                    self.append_info(f"{{cyan}}  {msg}\n")
+            if thread.is_alive():
+                self.canvas.after(150, poll)
+                return
+            done(result.get("value"), result.get("error"), time.time() - t0)
+
+        self.canvas.after(150, poll)
+
+    def run_stem_analysis(self, force=None, then=None):
+        """Separate stems (or reuse the cached WAVs) and color the waveform.
+        `then` is called afterwards (used by Transcribe)."""
+        if force is None:
+            force = getattr(self, "_force_stems", False)
+            self._force_stems = False
+        if self._analysis_busy or self.audio_duration is None:
+            return
+        if not aa.stems_are_fresh(self.filepath) and not aa.demucs_available():
+            self.append_info("\n{yellow}Stem separation needs demucs: pip install demucs "
+                             "(also installs torch; large download)\n")
+            self.analysis_status_var.set("demucs not installed")
+            if then:
+                then()
+            return
+        if force and not aa.demucs_available():
+            force = False
+        self._set_analysis_busy("stems")
+        self.append_info("\n{yellow}Analyzing stems in the background...\n")
+        duration = self.audio_duration
+        n_bins = max(th.WAVEFORM_CACHE_RESOLUTION, len(self.full_peaks))
+
+        def work(progress):
+            return aa.analyze_stems(self.filepath, duration, n_bins, progress, force=force)
+
+        def done(value, error, elapsed):
+            self._set_analysis_busy(None)
+            if error is not None:
+                self.analysis_status_var.set("Stems failed")
+                self.append_info(f"\n{{red}}Stem analysis error: {error}\n")
+                debug(1, f"{{red}}waveform_tab stems failed: {error}")
+            else:
+                regions, reused = value
+                self._set_regions(regions)
+                th.save_regions(self.filepath, self._raw_regions)
+                self.analysis_status_var.set("Stems ready")
+                self._report_regions(elapsed, reused)
+                self.render_waveform()
+                debug(2, f"{{green}}waveform_tab stems: {len(regions)} regions in {elapsed:.1f}s")
+            if then:
+                then()
+
+        self._run_in_thread(work, done)
+
+    STEM_TRACK_NAMES = {"vocal": "Vocals", "novocal": "Instrumental", "mixed": "Mixed", "silent": "Silence"}
+    STEM_COMBOS = (("Vocal or Mixed", ("vocal", "mixed"), "vocal"),
+                   ("Instrumental or Mixed", ("novocal", "mixed"), "novocal"))
+
+    def _legend_kind_at(self, x, y):
+        layout = self._track_layout()
+        if not (layout["row_top"] <= y < layout["track_top"]):
+            return None
+        for x0, x1, kind in getattr(self, "_legend_hits", []):
+            if x0 <= x <= x1:
+                return kind
+        return None
+
+    def pick_stem_color(self, kind):
+        """Open the stem color picker for one kind: the waveform previews
+        the color live while the sliders move; OK keeps it (saved as the
+        "stem_colors" preference), Cancel restores the previous color."""
+        original = self.region_colors.get(kind, REGION_COLORS.get(kind, "#888888"))
+        picker = StemColorPicker(self.canvas, f"Color for {STEM_LABELS.get(kind, kind)} stem regions", original,
+                                 on_change=lambda c: self._preview_stem_color(kind, c),
+                                 on_done=lambda c: self._finish_stem_color(kind, original, c))
+        self._color_picker = picker
+        return picker
+
+    def _preview_stem_color(self, kind, color):
+        self.region_colors[kind] = color
+        self._last_status_drawn = None
+        if getattr(self, "_preview_after", None) is None:     # at most ~30 redraws/s while dragging
+            def redraw():
+                self._preview_after = None
+                self.render_waveform()
+            try:
+                self._preview_after = self.canvas.after(30, redraw)
+            except tk.TclError:
+                self._preview_after = None
+
+    def _finish_stem_color(self, kind, original, color):
+        self._color_picker = None
+        if color:
+            self.set_stem_color(kind, color)
+        else:
+            self.region_colors = stem_colors()                # Cancel: back to the saved colors
+            self.region_colors[kind] = stem_colors().get(kind, original)
+            self._last_status_drawn = None
+            self.render_waveform()
+
+    def set_stem_color(self, kind, color):
+        saved = dict(get_preference("stem_colors", {}) or {})
+        saved[kind] = color.lower()
+        set_preference("stem_colors", saved)
+        self.region_colors = stem_colors()
+        self._last_status_drawn = None
+        self.render_waveform()
+
+    def reset_stem_colors(self):
+        set_preference("stem_colors", {})
+        self.region_colors = stem_colors()
+        self._last_status_drawn = None
+        self.render_waveform()
+
+    def stem_region_counts(self):
+        return aa.region_counts(self.regions) if self.regions else {}
+
+    def _fill_stems_menu(self):
+        """Rebuilt each time the Stems \u25be menu opens."""
+        menu = self.stems_menu
+        try:
+            menu.delete(0, "end")
+        except tk.TclError:
+            pass
+        counts = self.stem_region_counts()
+        kinds = [k for k in aa.KINDS if counts.get(k)]
+        if not kinds:
+            menu.add_command(label="No stem regions yet \u2013 run Stems first", state="disabled")
+        else:
+            here = self._region_at(self.cursor_position() or 0.0)
+            if here is not None:
+                name = self.STEM_TRACK_NAMES.get(here["kind"], here["kind"])
+                menu.add_command(
+                    label=f"New range from the stem at @cursor ({name} "
+                          f"{th.format_time_ms(here['start'])}\u2013{th.format_time_ms(here['end'])})",
+                    command=self.range_from_current_stem)
+                menu.add_separator()
+            menu.add_command(label="New timing track from:", state="disabled")
+            for kind in kinds:
+                menu.add_command(label=f"   {self.STEM_TRACK_NAMES[kind]} ({counts[kind]} regions)",
+                                 command=lambda k=kind: self.create_stem_tracks([k]))
+            for name, combo, _color_kind in self.STEM_COMBOS:
+                n = len(aa.regions_for_kinds(self.regions, combo, self._merge_var.get()))
+                menu.add_command(label=f"   {name} ({n} ranges)", state="normal" if n else "disabled",
+                                 command=lambda nm=name, cb=combo: self.create_combined_stem_track(nm, cb))
+            menu.add_checkbutton(label="   Merge touching regions of different stems",
+                                 variable=self._merge_var, command=self._on_merge_toggled)
+            menu.add_separator()
+            menu.add_command(label=f"All non-empty stems ({len(kinds)} tracks)",
+                             command=lambda: self.create_stem_tracks(kinds))
+        menu.add_separator()
+        menu.add_command(label="Re-run separation", state="disabled" if self._analysis_busy else "normal",
+                         command=lambda: self.run_stem_analysis(force=True))
+        menu.add_command(label="Reset stem colors", command=self.reset_stem_colors)
+
+    def _region_at(self, t):
+        if not self.regions:
+            return None
+        i = bisect.bisect_right(self._region_starts, t) - 1
+        return self.regions[i] if 0 <= i < len(self.regions) else None
+
+    def range_from_current_stem(self):
+        """A new (unassigned) range spanning the stem region under the
+        @cursor; it's selected so it can be dragged into a track."""
+        region = self._region_at(self.cursor_position() or 0.0)
+        if region is None:
+            return None
+        mark = self._add_mark("range", region["start"], region["end"])
+        self.selected = ("mark", mark["id"])
+        self.render_waveform()
+        return mark
+
+    def _on_merge_toggled(self):
+        set_preference("stem_track_merge", bool(self._merge_var.get()))
+
+    def create_combined_stem_track(self, name, kinds, merge=None):
+        """One track from several stem kinds (e.g. vocal or mixed). With
+        merge (the menu's checkbox), touching regions become one range."""
+        if merge is None:
+            merge = bool(self._merge_var.get())
+        spans = aa.regions_for_kinds(self.regions, set(kinds), merge)
+        if not spans:
+            return None
+        color_kind = next((ck for nm, _k, ck in self.STEM_COMBOS if nm == name), kinds[0])
+        track = self._new_track(name, color=self.region_colors.get(color_kind), source="stems",
+                                record_history=False)
+        for start, end in spans:
+            self._add_mark("range", start, end, track_id=track["id"], source="stems", record_history=False)
+        self._mark_changed()
+        self.selected = ("track", track["id"])
+        self.render_waveform()
+        self.append_info(f"{{green}}Created track from stems: {name} ({len(spans)} ranges)\n")
+        return track
+
+    def create_stem_tracks(self, kinds):
+        """One timing track per stem kind, with a range mark per region of
+        that kind, in the region's color. One undo step for the lot."""
+        created = []
+        for kind in kinds:
+            regions = [r for r in self.regions if r.get("kind") == kind]
+            if not regions:
+                continue
+            track = self._new_track(self.STEM_TRACK_NAMES.get(kind, kind), color=self.region_colors.get(kind),
+                                    source="stems", record_history=False)
+            for r in regions:
+                self._add_mark("range", r["start"], r["end"], track_id=track["id"], source="stems",
+                               record_history=False)
+            created.append(track)
+        if created:
+            self._mark_changed()      # a single undo step
+            self.selected = ("track", created[0]["id"])
+            self.render_waveform()
+            self.append_info("{green}Created track(s) from stems: "
+                             + ", ".join(f"{t['name']}" for t in created) + "\n")
+        return created
+
+    def run_genre_mood(self):
+        """Genre / mood estimate in the background; the result goes to the
+        text panel and is cached with the file."""
+        if self._analysis_busy or self.audio_duration is None:
+            return
+        if not aa.genre_mood_available():
+            messagebox.showinfo("Genre / mood", "This needs librosa (ISC license):\n\n  pip install librosa\n\n"
+                                                "then restart trackED.")
+            return
+        lyrics = " ".join(m.get("label", "") for m in self.marks if m.get("label"))
+        self._set_analysis_busy("mood")
+        self.append_info("\n{yellow}Estimating genre and mood in the background...\n")
+
+        def work(progress):
+            return aa.estimate_genre_mood(self.filepath, lyrics, progress)
+
+        def done(value, error, elapsed):
+            self._set_analysis_busy(None)
+            if error is not None:
+                self.analysis_status_var.set("Genre/mood failed")
+                self.append_info(f"{{red}}Genre/mood error: {error}\n")
+                return
+            th.update_cache(self.filepath, genre_mood=value)
+            self._report_genre_mood(value, elapsed)
+
+        self._run_in_thread(work, done)
+
+    def _report_genre_mood(self, value, elapsed=None):
+        self.genre_mood = value
+        self.analysis_status_var.set(f"{value['genre']} \u00b7 {value['mood']}")
+        alts = ", ".join(f"{g} ({c:.0%})" for g, c in value.get("alternatives", []))
+        palette = ", ".join(f"{name} {hexc}" for hexc, name in value.get("palette", []))
+        msg = (f"\n{{green}}Genre / mood estimate (rule-based guess)\n"
+               f"{{blue}}  genre: {{cyan}}{value['genre']} ({value['confidence']:.0%})\n")
+        if alts:
+            msg += f"{{blue}}  also possible: {{cyan}}{alts}\n"
+        msg += (f"{{blue}}  mood: {{cyan}}{value['mood']}  "
+                f"{{blue}}(energy {value['energy']:.2f}, brightness {value['valence']:.2f}, "
+                f"tempo ~{value['tempo']:.0f} BPM)\n"
+                f"{{blue}}  mood palette: {{cyan}}{palette}\n")
+        if elapsed is not None:
+            msg += f"{{blue}}  elapsed: {{cyan}}{elapsed:.1f}s\n"
+        self.append_info(msg)
+
+    def _auto_stems(self):
+        """On load: show cached regions, or start analysis if it can run
+        without user interaction (cached stems, or demucs installed) --
+        same as the old audio tab, which ran demucs automatically."""
+        self._update_legend()
+        cached_mood = th.load_cache(self.filepath).get("genre_mood")
+        if isinstance(cached_mood, dict) and cached_mood.get("genre"):
+            self._report_genre_mood(cached_mood)
+        if self.regions:
+            self.analysis_status_var.set("Stems ready (cached)")
+            self._report_regions()
+            return
+        if aa.stems_are_fresh(self.filepath) or aa.demucs_available():
+            self.canvas.after(200, self.run_stem_analysis)
+
+    # ------------------------------------------------------------------ transcription
+    def _model_choices(self):
+        auto = f"auto ({aa.default_whisper_model()})"
+        return [auto] + aa.WHISPER_MODELS
+
+    def _refresh_model_combo(self):
+        """(Re)build the Whisper model menu on the Transcribe \u25be button."""
+        choices = self._model_choices()
+        saved = get_preference("whisper_model", "auto")
+        self.model_var.set(saved if saved in aa.WHISPER_MODELS else choices[0])
+        menu = self.model_menu
+        try:
+            menu.delete(0, "end")
+        except tk.TclError:
+            pass
+        menu.add_command(label="Whisper model", state="disabled")
+        for choice in choices:
+            menu.add_radiobutton(label=choice, value=choice, variable=self.model_var,
+                                 command=self._on_model_changed)
+        tip = getattr(self, "_model_tip", None)
+        text = (f"Whisper model: {self.model_var.get()}\n'auto' picks the largest that fits in free RAM;\n"
+                "larger = more accurate but slower (downloaded on first use)")
+        if tip is None:
+            self._model_tip = _Tooltip(self.model_btn, text)
+        else:
+            tip.text = text
+
+    def _on_model_changed(self, event=None):
+        value = self.model_var.get()
+        set_preference("whisper_model", "auto" if value.startswith("auto") else value)
+        if value.startswith("auto"):
+            self._refresh_model_combo()  # re-evaluate free RAM
+
+    def _selected_model(self):
+        value = self.model_var.get()
+        return None if value.startswith("auto") else value
+
+    def transcribe_selected(self):
+        mark = self.mark_by_id(self.selected_mark_id())
+        if mark is None or mark["type"] != "range" or mark.get("end") is None:
+            if self.audio_duration and messagebox.askyesno(
+                    "Transcribe",
+                    "No range is selected.\n\nTranscribe the whole audio into a new \u201cTranscript\u201d "
+                    "track, one card per sung phrase (using Whisper's own timing)?"):
+                self.transcribe_whole()
+            return
+        self.transcribe_mark(mark["id"])
+
+    TRANSCRIPT_TRACK_NAME = "Transcript"
+
+    def transcribe_whole(self):
+        """Transcribe all of the audio; each Whisper phrase becomes a range
+        in a new "Transcript" track."""
+        if self._analysis_busy or self.audio_duration is None:
+            return
+        if not aa.whisper_backends():
+            self.transcribe_mark(None)       # shows the "install a backend" message
+            return
+        if not aa.stems_are_fresh(self.filepath) and aa.demucs_available() and not self.regions:
+            self.append_info("\n{yellow}Separating stems before transcribing...\n")
+            self.run_stem_analysis(force=False, then=lambda: self._transcribe_now(None, whole=True))
+            return
+        self._transcribe_now(None, whole=True)
+
+    def transcribe_mark(self, mark_id):
+        mark = self.mark_by_id(mark_id)
+        if not aa.whisper_backends():
+            messagebox.showinfo(
+                "Transcribe",
+                "No Whisper backend is installed.\n\nInstall one of:\n"
+                "  pip install faster-whisper   (recommended, MIT)\n"
+                "  pip install openai-whisper   (MIT)\n\nthen restart trackED.")
+            return
+        if mark is None or self._analysis_busy:
+            return
+        if mark.get("label") and not messagebox.askyesno(
+                "Transcribe", f"Replace the current text?\n\n\u201c{mark['label']}\u201d"):
+            return
+        # Use the vocal stem if it exists (or can be made) -- do that first.
+        if not aa.stems_are_fresh(self.filepath) and aa.demucs_available() and not self.regions:
+            self.append_info("\n{yellow}Separating stems before transcribing...\n")
+            self.run_stem_analysis(force=False, then=lambda: self._transcribe_now(mark_id))
+            return
+        self._transcribe_now(mark_id)
+
+    def _transcribe_now(self, mark_id, whole=False):
+        mark = self.mark_by_id(mark_id)
+        if (mark is None and not whole) or self._analysis_busy:
+            return
+        start, end = (0.0, self.audio_duration) if whole else (mark["start"], mark["end"])
+        model = self._selected_model()
+        regions = list(self.regions)
+        self._set_analysis_busy("transcribe")
+        self.append_info(f"\n{{yellow}}Transcribing {th.format_time_ms(start)} - {th.format_time_ms(end)} "
+                         f"(model: {model or 'auto'})...\n")
+
+        def work(progress):
+            return aa.transcribe_range(self.filepath, start, end, model_size=model,
+                                       regions=regions, progress_cb=progress)
+
+        def done(value, error, elapsed):
+            self._set_analysis_busy(None)
+            if error is not None:
+                self.analysis_status_var.set("Transcription failed")
+                self.append_info(f"{{red}}Transcription error: {error}\n")
+                debug(1, f"{{red}}waveform_tab transcribe failed: {error}")
+                return
+            target = self.mark_by_id(mark_id)
+            text = value.get("text", "")
+            if not text:
+                self.analysis_status_var.set("No vocals found in range")
+                self.append_info("{yellow}No vocals/words found in that range.\n")
+                return
+            detail = (f"{value.get('backend')} {value.get('model')}, {value.get('source')}, "
+                      f"{value.get('seconds_voiced', 0):.1f}s voiced, {elapsed:.1f}s")
+            self.append_info(f"{{green}}Transcribed ({detail}):\n{{cyan}}  {text}\n")
+            self.analysis_status_var.set("Transcribed")
+            if whole:
+                segments = value.get("segments") or [(start, end, text)]
+                track = self._new_track(self.TRANSCRIPT_TRACK_NAME, record_history=False)
+                for a, b, words in segments:
+                    a, b = max(0.0, a), min(self.audio_duration, b)
+                    if b - a >= th.MIN_RANGE:
+                        self._add_mark("range", a, b, label=words, track_id=track["id"], source="whisper",
+                                       record_history=False)
+                self._mark_changed()
+                self.selected = ("track", track["id"])
+                self.render_waveform()
+                return
+            if target is None:
+                self.append_info("{yellow}(the range was deleted meanwhile -- text not applied)\n")
+                return
+            target["label"] = text
+            self._mark_changed()
+            self.render_waveform()
+
+        self._run_in_thread(work, done)
+
     # ------------------------------------------------------------------ export
     _EXPORT_FILETYPES = [
         ("xLights Timing", "*.xtiming"),
@@ -802,14 +2143,36 @@ class WaveformController:
             messagebox.showerror("Export Timing", f"Could not export timing:\n{e}")
 
     # ------------------------------------------------------------------ playback
-    def playback_segment(self):
-        if self.selected and self.selected[0] == "mark":
-            mark = next((m for m in self.marks if m["id"] == self.selected[1]), None)
-            if mark is not None:
-                if mark["type"] == "range" and mark.get("end") is not None:
-                    return mark["start"], mark["end"]
-                return mark["start"], None
-        return 0.0, None
+    def _run_engine_from(self, t):
+        """Start the engine at t for the rest of the current segment."""
+        self._play_speed = self._play_speed_value()
+        duration = None
+        if self._play_seg_end is not None:
+            duration = max(0.0, self._play_seg_end - t)
+            if duration <= 0:
+                return False
+        if not self.engine.play_segment(t, duration, self._play_speed):
+            self._refresh_playback_availability()
+            if not th.PLAYBACK_MISSING:
+                self.play_status_var.set("Playback failed to start")
+            return False
+        self._play_state = "playing"
+        self._play_position = t
+        self._play_started_wall = time.monotonic()
+        return True
+
+    def _halt_engine(self):
+        self.engine.stop()
+        self._play_started_wall = None
+
+    def _restart_here(self):
+        """Re-start the engine at the current position (speed/volume change)."""
+        if self._play_state != "playing":
+            return
+        pos = self.current_play_position()
+        self._halt_engine()
+        self.cursor_time = pos
+        self._run_engine_from(pos)
 
     def _play_speed_value(self):
         return {"0.5x": 0.5, "1x": 1.0, "2x": 2.0}.get(self.play_speed_var.get(), 1.0)
@@ -819,84 +2182,193 @@ class WaveformController:
             return 0.0
         return (time.monotonic() - self._play_started_wall) * self._play_speed
 
+    def _on_play_btn_release(self, event):
+        self._shift_on_play = bool(event.state & SHIFT_MASK)
+
+    def _set_play_cursor(self, shift):
+        try:
+            self.play_btn.configure(cursor="exchange" if shift else "hand2")
+        except tk.TclError:
+            pass
+
+    def _bind_shift_keys(self):
+        """Update the Play button's loop cursor when Shift is pressed or
+        released while the pointer is already over it (no Motion event
+        then). Bound on the toplevel with add="+" so trackED's own
+        bindings are kept; handlers for closed tabs just no-op."""
+        def handler(event, down):
+            try:
+                if not self.play_btn.winfo_exists():
+                    return
+                x, y = self.play_btn.winfo_pointerxy()
+                under = self.play_btn.winfo_containing(x, y)
+                if under is self.play_btn:
+                    self._set_play_cursor(down)
+                elif under is not None and getattr(under, "_loop_hover", False):
+                    # a timing card's Play button (timing_panel marks them)
+                    under.configure(cursor="exchange" if down else "hand2")
+            except (tk.TclError, KeyError):
+                pass
+        try:
+            top = self.canvas.winfo_toplevel()
+            for key in ("Shift_L", "Shift_R"):
+                top.bind(f"<KeyPress-{key}>", lambda e: handler(e, True), add="+")
+                top.bind(f"<KeyRelease-{key}>", lambda e: handler(e, False), add="+")
+        except tk.TclError:
+            pass
+
     def toggle_play(self):
-        if self._play_state == "playing":
+        """Main Play/Pause button. Shift+click: (re)start as a loop."""
+        loop = self._shift_on_play
+        self._shift_on_play = False
+        if loop:
+            if self._play_state == "playing":
+                self._halt_engine()
+                self._play_state = "stopped"
+            self.start_play(loop=True)
+        elif self._play_state == "playing":
             self.pause_play()
         else:
-            self.start_play()
+            self.start_play(loop=None if self._play_state == "paused" else False)
 
-    def start_play(self):
-        if self.audio_duration is None or not self.filepath:
+    def loop_segment(self):
+        """Shift+Play: loop from the @cursor to the end of the selected range
+        if the cursor is inside it; else loop the selected mark from its
+        start (to its end, or the end of the audio for a point); with
+        nothing selected, from the @cursor to the end of the audio."""
+        mark = self.mark_by_id(self.selected_mark_id())
+        cur = self.cursor_time
+        if mark is not None:
+            is_range = mark["type"] == "range" and mark.get("end") is not None
+            if is_range and mark["start"] <= cur < mark["end"] - 0.01:
+                return cur, mark["end"]
+            return mark["start"], (mark["end"] if is_range else None)
+        if self.audio_duration and cur >= self.audio_duration - 0.05:
+            cur = 0.0
+        return cur, None
+
+    def start_play(self, loop=None, segment=None, mark_id=None):
+        """Start (or resume) playback from the @cursor.
+
+        - From stopped: plays [cursor, end of audio] -- or, with loop=True,
+          loop_segment(); or an explicit `segment` (a card's mark). The
+          position Play started from is remembered for Reset.
+        - From paused (loop=None): resumes from the @cursor (which the skip
+          buttons / Ctrl+click may have moved while paused)."""
+        if self.audio_duration is None or not self.filepath or self._play_state == "playing":
             return
-        if self._play_state == "paused":
-            start_at = self._play_position
+        resuming = self._play_state == "paused" and loop is None and segment is None
+        if not resuming:
+            self._loop = bool(loop)
+            self._play_mark_id = mark_id
+            if segment is not None:
+                seg_start, seg_end = segment
+            elif self._loop:
+                seg_start, seg_end = self.loop_segment()
+            else:
+                seg_start = self.cursor_time
+                if seg_start >= self.audio_duration - 0.05:
+                    seg_start = 0.0          # at the very end: play from the top
+                seg_end = None
+            self._play_seg_start, self._play_seg_end = seg_start, seg_end
+            self.cursor_time = seg_start
+            self._play_origin = seg_start    # Reset returns here
         else:
-            self._play_seg_start, self._play_seg_end = self.playback_segment()
-            start_at = self._play_seg_start
-        self._play_speed = self._play_speed_value()
-        duration = None
-        if self._play_seg_end is not None:
-            duration = max(0.0, self._play_seg_end - start_at)
-            if duration <= 0:
-                return
-        ok = self.engine.play_segment(start_at, duration, self._play_speed)
-        if not ok:
-            self._refresh_playback_availability()
-            if not th.PLAYBACK_MISSING:
-                self.play_status_var.set("Playback failed to start")
+            # The cursor may have been moved while paused.
+            t = self.cursor_time
+            seg_end = self._play_seg_end if self._play_seg_end is not None else self.audio_duration
+            if self._loop:
+                t = max(self._play_seg_start, min(seg_end, t))
+            elif self._play_seg_end is not None and t >= self._play_seg_end - 0.01:
+                self._play_seg_end = None    # moved past the segment: play on to the end
+            self.cursor_time = t
+        if not self._run_engine_from(self.cursor_time):
             return
-        self._play_state = "playing"
-        self._play_position = start_at
-        self._play_started_wall = time.monotonic()
         self._update_play_controls()
         self._poll_playback()
 
     def pause_play(self):
+        """Freeze the @cursor where playback is now."""
         if self._play_state != "playing":
             return
-        self._play_position = min(
-            self._play_seg_end if self._play_seg_end is not None else self.audio_duration or 0.0,
-            self._play_position + self._elapsed_play_time(),
-        )
-        self.engine.stop()
-        self._play_started_wall = None
+        pos = self.current_play_position()
+        self._halt_engine()
+        self.cursor_time = pos
         self._play_state = "paused"
         self._update_play_controls()
         self.render_waveform()
 
     def stop_play(self):
-        self.engine.stop()
-        self._play_started_wall = None
+        """Reset: stop, and put the @cursor back where Play started."""
+        if self._play_state != "stopped":
+            self._halt_engine()
+            self.cursor_time = self._play_origin
         self._play_state = "stopped"
-        self._play_position = self._play_seg_start
+        self._loop = False
+        self._play_mark_id = None
         self._update_play_controls()
         self.render_waveform()
 
-    def skip_play(self, delta):
+    def region_boundary(self, t, direction):
+        """Start (direction -1) or end (+1) of the stem region containing t;
+        if t is already on that boundary, the next one out. None without
+        stem regions."""
+        if not self.regions:
+            return None
+        bounds = sorted({r["start"] for r in self.regions} | {r["end"] for r in self.regions})
+        if direction < 0:
+            before = [b for b in bounds if b < t - 1e-6]
+            return before[-1] if before else 0.0
+        after = [b for b in bounds if b > t + 1e-6]
+        return after[0] if after else (self.audio_duration or t)
+
+    def seek_to(self, t):
+        """Move the @cursor to t. While playing, playback continues from
+        there (a loop keeps its bounds); paused/stopped just move it."""
         if self.audio_duration is None:
             return
-        was_playing = self._play_state == "playing"
-        if was_playing:
-            self._play_position = self._play_position + self._elapsed_play_time()
-            self.engine.stop()
-            self._play_started_wall = None
-        seg_end = self._play_seg_end if self._play_seg_end is not None else self.audio_duration
-        self._play_position = max(self._play_seg_start, min(seg_end, self._play_position + delta))
-        if was_playing:
-            self._play_state = "paused"
-            self.start_play()
-        else:
-            self._play_state = "paused"
+        t = max(0.0, min(self.audio_duration, t))
+        if self._play_state == "playing":
+            self._halt_engine()
+            if self._loop:
+                seg_end = self._play_seg_end if self._play_seg_end is not None else self.audio_duration
+                t = max(self._play_seg_start, min(seg_end, t))
+            elif self._play_seg_end is not None and t >= self._play_seg_end - 0.01:
+                self._play_seg_end = None
+            self.cursor_time = t
+            self._run_engine_from(t)
             self._update_play_controls()
-            self._follow_playhead(self._play_position)
-            self.render_waveform()
+        else:
+            self.cursor_time = t
+            self._follow_playhead(t)
+        self.render_waveform()
+
+    def skip_play(self, delta):
+        """◀◀ / ▶▶: move the @cursor by delta seconds (within the audio);
+        with Shift, to the start/end of the stem region it's in (the audio
+        start/end without stems); with Ctrl, to the start/end of the audio."""
+        if self.audio_duration is None:
+            return
+        mods = getattr(self, "_skip_mods", 0) or 0
+        self._skip_mods = 0
+        here = self.cursor_position() or 0.0
+        direction = -1 if delta < 0 else 1
+        if mods & CONTROL_MASK:
+            target = 0.0 if direction < 0 else self.audio_duration
+        elif mods & SHIFT_MASK:
+            target = self.region_boundary(here, direction)
+            if target is None:
+                target = 0.0 if direction < 0 else self.audio_duration
+        else:
+            target = here + delta
+        self.seek_to(target)
 
     def current_play_position(self):
-        if self._play_state == "stopped":
+        """The moving playback position while playing, else None (when not
+        playing, the position is simply the @cursor)."""
+        if self._play_state != "playing":
             return None
-        pos = self._play_position
-        if self._play_state == "playing":
-            pos += self._elapsed_play_time()
+        pos = self._play_position + self._elapsed_play_time()
         seg_end = self._play_seg_end if self._play_seg_end is not None else self.audio_duration
         if seg_end is not None:
             pos = min(pos, seg_end)
@@ -915,40 +2387,177 @@ class WaveformController:
         if abs(new_start - self.view_start) < 1e-9:
             return False
         self.view_start, self.view_end = new_start, new_start + span
-        if self.full_peaks:
-            self.peaks = th.rebucket_peaks(
-                self.full_peaks, self.view_start / self.audio_duration, self.view_end / self.audio_duration, 2000,
-            )
+        self._refresh_view_from_cache(render=False)  # caller renders
         return True
 
     def _poll_playback(self):
-        """Watch for the engine's segment finishing on its own so the
-        controls reset without the user pressing Stop, and drive the
-        moving playhead while playing."""
+        """While playing: move the @cursor with playback; when the engine
+        finishes on its own, loop again or stop (the cursor returns to
+        where Play started, so Play replays it)."""
         if self._play_state != "playing":
             return
         if not self.engine.is_active():
-            self._play_state = "stopped"
-            self._play_position = self._play_seg_start
+            if self._loop:
+                start = self._play_seg_start
+                if self._run_engine_from(start):
+                    self.cursor_time = start
+                    self.canvas.after(50, self._poll_playback)
+                    return
             self._play_started_wall = None
+            self._play_state = "stopped"
+            self._loop = False
+            self.cursor_time = self._play_origin
+            self._play_mark_id = None
             self._update_play_controls()
             self.render_waveform()
             return
+        pos = self.current_play_position()
+        self.cursor_time = pos
         self._update_play_controls()
-        self._follow_playhead(self.current_play_position())
+        self._follow_playhead(pos)
         self.render_waveform()
-        self.canvas.after(100, self._poll_playback)
+        # Poll faster near the end of a looped segment so the gap between
+        # repeats stays short.
+        interval = 100
+        if self._loop:
+            seg_end = self._play_seg_end if self._play_seg_end is not None else self.audio_duration
+            if seg_end is not None and pos is not None and seg_end - pos < 0.25 * max(self._play_speed, 0.5):
+                interval = 20
+        self.canvas.after(interval, self._poll_playback)
 
     def _on_play_speed_changed(self, event=None):
-        if self._play_state == "playing":
-            self._play_position = self._play_position + self._elapsed_play_time()
-            self.engine.stop()
-            self._play_started_wall = None
-            self._play_state = "paused"
-            self.start_play()
+        try:
+            self.speed_btn.configure(text=f"{self.play_speed_var.get()} \u25be")
+        except (tk.TclError, AttributeError):
+            pass
+        self._restart_here()
+
+    VOLUME_STEP = 0.1
+    MAX_VOLUME = 2.0
+
+    def _saved_volume(self):
+        try:
+            return max(0.0, min(self.MAX_VOLUME, float(get_preference("playback_volume", 1.0))))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _update_volume_label(self):
+        try:
+            self.vol_label.configure(text=f"vol {round(self.volume * 100):d}%")
+            self.vol_down_btn.configure(state="normal" if self.volume > 1e-6 else "disabled")
+            self.vol_up_btn.configure(state="normal" if self.volume < self.MAX_VOLUME - 1e-6 else "disabled")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def change_volume(self, delta):
+        """Volume -/+ (0-200%, remembered as the "playback_volume"
+        preference). Takes effect immediately, also mid-playback."""
+        new = round(max(0.0, min(self.MAX_VOLUME, self.volume + delta)), 2)
+        if abs(new - self.volume) < 1e-9:
+            return
+        self.volume = new
+        self.engine.set_volume(new)
+        set_preference("playback_volume", new)
+        self._update_volume_label()
+        self._restart_here()   # heard immediately if playing
+
+    NAV_WIDTH = 150
+
+    def _update_time_readout(self, force=False):
+        pos = self.cursor_position() or 0.0
+        total = th.format_time_ms(self.audio_duration or 0.0)
+        self.time_var.set(f"{th.format_time_ms(pos):>9} / {total}")
+        try:
+            if force or self.pos_entry.focus_get() is not self.pos_entry:   # don't fight the user's typing
+                text = th.format_time_ms(pos)
+                if self.pos_entry.get() != text:
+                    self.pos_entry.delete(0, "end")
+                    self.pos_entry.insert(0, text)
+            self.total_label.configure(text=f"/ {total}")
+        except (tk.TclError, KeyError, AttributeError):
+            pass
+        self.view_var.set(f"{th.format_time_ms(self.view_start)} \u2013 {th.format_time_ms(self.view_end)}")
+        self._draw_nav()
+
+    def _on_pos_entered(self, event=None):
+        t = th.parse_time(self.pos_entry.get())
+        if t is None or self.audio_duration is None:
+            self.canvas.bell()
+            self._update_time_readout(force=True)
+            return "break"
+        self.seek_to(t)          # clamps to the audio; seeks if playing
+        self.canvas.focus_set()
+        self._update_time_readout(force=True)
+        return "break"
+
+    def _nav_geometry(self):
+        try:
+            w = max(20, int(self.nav.winfo_width()))
+        except (tk.TclError, TypeError, ValueError):
+            w = self.NAV_WIDTH
+        if w <= 20:
+            w = self.NAV_WIDTH
+        total = max(self.audio_duration or 0.0, self.view_end, 1e-9)
+        x0 = w * self.view_start / total
+        x1 = max(x0 + 6, w * min(self.view_end, total) / total)
+        return w, x0, min(w, x1)
+
+    def _draw_nav(self):
+        if self.audio_duration is None or not hasattr(self, "nav"):
+            return
+        c = self.nav
+        try:
+            c.delete("all")
+            w, x0, x1 = self._nav_geometry()
+            c.create_rectangle(0, 3, w, 9, fill="#3a3a3d", outline="", tags=("nav_track",))
+            c.create_rectangle(x0, 1, x1, 11, fill="#8a8a90", outline="", tags=("nav_thumb",))
+            pos = self.cursor_position() or 0.0
+            total = max(self.audio_duration, self.view_end)
+            xc = w * pos / total if total else 0
+            c.create_line(xc, 0, xc, 12, fill=CURSOR_COLOR, tags=("nav_cursor",))
+        except tk.TclError:
+            pass
+
+    def _on_nav_press(self, event):
+        w, x0, x1 = self._nav_geometry()
+        if x0 <= event.x <= x1:
+            self._nav_grab = event.x - x0          # drag the thumb from where it was grabbed
+        else:
+            self._nav_grab = (x1 - x0) / 2         # click beside it: center the view there
+            self._nav_scroll_to(event.x - self._nav_grab)
+        return "break"
+
+    def _on_nav_drag(self, event):
+        self._nav_scroll_to(event.x - getattr(self, "_nav_grab", 0))
+        return "break"
+
+    def _nav_scroll_to(self, thumb_x):
+        if self.audio_duration is None:
+            return
+        w, _x0, _x1 = self._nav_geometry()
+        span = self.view_end - self.view_start
+        total = max(self.audio_duration, self.view_end)
+        start = max(0.0, min(max(0.0, self.audio_duration - span), thumb_x / w * total))
+        if abs(start - self.view_start) < 1e-9:
+            return
+        self.view_start, self.view_end = start, start + span
+        self._refresh_view_from_cache()
 
     def _update_play_controls(self):
-        self.play_btn.configure(text="\u23f8" if self._play_state == "playing" else "\u25b6")
+        # U+275A heavy bars: available in far more fonts than U+23F8.
+        self.play_btn.configure(text="\u275a\u275a" if self._play_state == "playing" else "\u25b6",
+                                fg=TB_LOOP if self._loop else TB_ACCENT)
+        # Stop (reset) is only offered while paused.
+        try:
+            if self._play_state == "paused":
+                if not getattr(self.play_stop_btn, "_shown", False):
+                    self.play_stop_btn.pack(side="left", padx=(0, 2), after=self.play_btn)
+                    self.play_stop_btn._shown = True
+            elif getattr(self.play_stop_btn, "_shown", True):
+                self.play_stop_btn.pack_forget()
+                self.play_stop_btn._shown = False
+        except tk.TclError:
+            pass
         if self._play_state == "stopped":
             if not th.PLAYBACK_MISSING:
                 self.play_status_var.set("")
@@ -956,7 +2565,9 @@ class WaveformController:
         pos = self._play_position + (self._elapsed_play_time() if self._play_state == "playing" else 0.0)
         seg_end = self._play_seg_end if self._play_seg_end is not None else self.audio_duration
         label = "Playing" if self._play_state == "playing" else "Paused"
-        self.play_status_var.set(f"{label} {th.format_time_ms(pos)} / {th.format_time_ms(seg_end)}")
+        if self._loop:
+            label = "Looping" if self._play_state == "playing" else "Paused (loop)"
+        self.play_status_var.set(f"{label} \u00b7 segment ends {th.format_time_ms(seg_end)}")
 
     def stop_and_release(self):
         """Called when the tab/file is going away -- stop playback and
@@ -968,18 +2579,26 @@ class WaveformController:
     def _time_at_x(self, x):
         w = self._canvas_size()[0]
         frac = max(0.0, min(1.0, x / w))
-        return self.view_start + frac * (self.view_end - self.view_start)
+        t = self.view_start + frac * (self.view_end - self.view_start)
+        if self.audio_duration is not None:
+            t = min(t, self.audio_duration)  # the view may extend past the end; marks can't
+        return t
 
     def _track_layout(self):
+        """Canvas rows, top to bottom: waveform (work area), the combined
+        status / new-track drop row, then the named track bands."""
         total_h = self._canvas_size()[1]
-        reserved = (len(self.tracks) + 1) * self.TRACK_HEIGHT
+        reserved = self.STATUS_ROW_HEIGHT + len(self.tracks) * self.TRACK_HEIGHT
         work_height = max(60, total_h - reserved)
-        return {"total_h": total_h, "work_height": work_height, "track_top": work_height}
+        return {"total_h": total_h, "work_height": work_height,
+                "row_top": work_height, "track_top": work_height + self.STATUS_ROW_HEIGHT}
 
     def _track_zone_at_y(self, y):
         layout = self._track_layout()
         if y < layout["work_height"]:
             return "work", None
+        if y < layout["track_top"]:
+            return "new_track", None          # the status row doubles as the drop target
         idx = int((y - layout["track_top"]) // self.TRACK_HEIGHT)
         if 0 <= idx < len(self.tracks):
             return "track", self.tracks[idx]["id"]
@@ -1029,7 +2648,9 @@ class WaveformController:
             return "left_side"
         if edge == "end":
             return "right_side"
-        return "sb_h_double_arrow"
+        # Whole-mark move: 4-way arrow, since a mark can also be dragged
+        # vertically (into/out of/between track bands).
+        return "fleur"
 
     def _selected_work_mark_at(self, x, y):
         if not self.selected or self.selected[0] != "mark":
@@ -1057,6 +2678,9 @@ class WaveformController:
     # ------------------------------------------------------------------ mouse/keyboard
     def _on_waveform_motion(self, event):
         if self._move_drag or self._press_info or self._track_drag:
+            return
+        if self._legend_kind_at(event.x, event.y) is not None:
+            self.canvas.configure(cursor="hand2")
             return
         cursor = ""
         hit = None
@@ -1099,6 +2723,10 @@ class WaveformController:
         self._move_drag = None
         self._press_info = None
         self._track_drag = None
+        kind = self._legend_kind_at(event.x, event.y)
+        if kind is not None:           # the stem color key: pick a new color
+            self.pick_stem_color(kind)
+            return
 
         zone, target = self._track_zone_at_y(event.y)
 
@@ -1264,20 +2892,33 @@ class WaveformController:
             if end_t - start_t > 0.01:
                 new_mark = self._add_mark("range", start_t, end_t)
                 self.selected = ("mark", new_mark["id"])
+                self._last_click_mark_id = None
             self._preview_range = None
         else:
             clicked_time = self._press_info["time"]
-            work_marks = [m for m in self.marks if m.get("track_id") is None]
-            if self._press_info["shift"] and work_marks:
-                last = work_marks[-1]
-                anchor = last["start"]
-                label = last.get("label", "")
-                if last["type"] == "point":
+            if self._press_info["shift"]:
+                # Shift+click extends the point the previous click just made
+                # into a range; with no such click, it runs from the @cursor.
+                last = self.mark_by_id(self._last_click_mark_id)
+                if last is not None and last["type"] == "point" and last.get("track_id") is None:
+                    anchor, label = last["start"], last.get("label", "")
                     self.marks.remove(last)
-                new_mark = self._add_mark("range", min(anchor, clicked_time), max(anchor, clicked_time), label=label)
+                else:
+                    anchor, label = self.cursor_time, ""
+                lo, hi = min(anchor, clicked_time), max(anchor, clicked_time)
+                if hi - lo >= th.MIN_RANGE:
+                    new_mark = self._add_mark("range", lo, hi, label=label)
+                else:
+                    new_mark = self._add_mark("point", clicked_time, None, label=label)
                 prompt_for_label = False
+                self._last_click_mark_id = None
             else:
-                new_mark = self._add_mark("point", clicked_time, None)
+                # A plain click just moves the @cursor (seeks while playing).
+                self._last_click_mark_id = None
+                self._press_info = None
+                self.seek_to(clicked_time)
+                self._on_waveform_motion(event)
+                return
             self.selected = ("mark", new_mark["id"])
         self._press_info = None
         self.render_waveform()
@@ -1420,8 +3061,7 @@ class WaveformController:
             return
         new_start = max(0.0, min(duration - span, mark["start"] - span / 2))
         self.view_start, self.view_end = new_start, new_start + span
-        if self.full_peaks:
-            self.peaks = th.rebucket_peaks(self.full_peaks, self.view_start / duration, self.view_end / duration, 2000)
+        self._refresh_view_from_cache(render=False)  # caller renders
 
     def _on_waveform_wheel(self, event):
         if self.audio_duration is None:
@@ -1436,6 +3076,17 @@ class WaveformController:
             return
         self.zoom_waveform(direction)
         return "break"
+
+    def add_point_at(self, t, label=""):
+        """A new point mark at t (double-click on empty waveform, or M)."""
+        if self.audio_duration is None:
+            return None
+        t = max(0.0, min(self.audio_duration, t))
+        mark = self._add_mark("point", t, None, label=label)
+        self._last_click_mark_id = mark["id"]     # a following Shift+click extends it
+        self.selected = ("mark", mark["id"])
+        self.render_waveform()
+        return mark
 
     def _on_waveform_double_click(self, event):
         for tr in self.tracks:
@@ -1456,7 +3107,108 @@ class WaveformController:
                 mark = next((m for m in self.marks if m["id"] == hit_id), None)
         if mark is not None:
             self._edit_mark_label(mark)
+        elif self._track_zone_at_y(event.y)[0] == "work" and self.audio_duration is not None:
+            # empty waveform: a new point mark here (the first click already moved the @cursor)
+            new_mark = self.add_point_at(self._time_at_x(event.x))
+            if new_mark is not None:
+                self._edit_mark_label(new_mark)
         return "break"
+
+    TEXT_IMPORT_EXTS = {".txt", ".lrc", ".lab", ".srt", ".labels"}
+
+    def import_text_track(self, path):
+        """New timing track from a text file: LRC / Audacity labels / SRT
+        timestamps become one card each; plain lyrics become one card
+        spanning the whole audio (use Split \u25be > Split into words)."""
+        if self.audio_duration is None:
+            return None
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                text = f.read()
+        except OSError as exc:
+            messagebox.showerror("Import", f"Couldn't read {path}:\n{exc}")
+            return None
+        fmt, items = th.parse_timed_text(text, self.audio_duration)
+        track = self._new_track(Path(path).stem, record_history=False)
+        count = 0
+        if items:
+            for a, b, label in items:
+                if a >= self.audio_duration:
+                    continue
+                b = min(self.audio_duration, b) if b is not None else None
+                kind = "range" if b is not None and b - a >= th.MIN_RANGE else "point"
+                self._add_mark(kind, a, b if kind == "range" else None, label=label, track_id=track["id"],
+                               source="import", record_history=False)
+                count += 1
+        else:
+            lyrics = "\n".join(line.rstrip() for line in text.strip().splitlines())
+            if lyrics:
+                self._add_mark("range", 0.0, self.audio_duration, label=lyrics, track_id=track["id"],
+                               source="import", record_history=False)
+                count = 1
+        self._mark_changed()
+        self.selected = ("track", track["id"])
+        self.render_waveform()
+        what = {"lrc": "LRC", "audacity": "Audacity labels", "srt": "SRT", "plain": "plain text"}[fmt]
+        self.append_info(f"{{green}}Imported {Path(path).name} ({what}): {count} card(s) in track "
+                         f"\u201c{track['name']}\u201d\n")
+        return track
+
+    def _import_text_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Import lyrics / labels as a timing track",
+            filetypes=[("Lyrics and labels", "*.txt *.lrc *.srt *.lab *.labels"), ("All files", "*.*")])
+        if path:
+            self.import_text_track(path)
+
+    def _setup_file_drop(self):
+        """With tkinterdnd2 (MIT; the app's optional drag-and-drop), a text
+        file dropped on the status / new-track row becomes a timing track.
+        Other drops on the waveform are passed to the app (open as a tab)."""
+        c = self.canvas
+        try:
+            from tkinterdnd2 import DND_FILES
+            c.drop_target_register(DND_FILES)
+        except Exception:
+            return False
+        c.dnd_bind("<<DropPosition>>", self._on_drop_position)
+        c.dnd_bind("<<DropLeave>>", lambda e: self._set_drop_hover(False))
+        c.dnd_bind("<<Drop>>", self._on_file_drop)
+        return True
+
+    def _drop_in_row(self, event):
+        try:
+            y = int(event.y_root) - self.canvas.winfo_rooty()
+        except (tk.TclError, TypeError, ValueError, AttributeError):
+            return False
+        return self._track_zone_at_y(y)[0] == "new_track"
+
+    def _set_drop_hover(self, on):
+        if getattr(self, "_drop_hover", False) != on:
+            self._drop_hover = on
+            self.render_waveform()
+
+    def _on_drop_position(self, event):
+        self._set_drop_hover(self._drop_in_row(event))
+        return getattr(event, "action", "copy")
+
+    def _on_file_drop(self, event):
+        self._set_drop_hover(False)
+        try:
+            paths = [p.strip("{}") for p in self.canvas.tk.splitlist(event.data)]
+        except Exception:
+            paths = [str(event.data).strip("{}")]
+        if self._drop_in_row(event):
+            texts = [p for p in paths if Path(p).suffix.lower() in self.TEXT_IMPORT_EXTS and Path(p).is_file()]
+            for p in texts:
+                self.import_text_track(p)
+            if texts:
+                return getattr(event, "action", "copy")
+        app = self.canvas.winfo_toplevel()
+        handler = getattr(app, "_on_drop", None)
+        if callable(handler):
+            handler(event)                 # not a lyrics drop: open it in a tab as usual
+        return getattr(event, "action", "copy")
 
     def _on_waveform_right_click(self, event):
         for tr in self.tracks:
@@ -1464,7 +3216,21 @@ class WaveformController:
                 self._show_track_menu(tr, event)
                 return
 
+        if self.audio_duration is not None and self._track_zone_at_y(event.y)[0] == "new_track":
+            menu = tk.Menu(self.canvas, tearoff=False)
+            menu.add_command(label="Import lyrics / labels file as a new track...", command=self._import_text_dialog)
+            menu.add_command(label="(or drag a .txt / .lrc / .srt / Audacity labels file here)", state="disabled")
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return
         mark = self._selected_work_mark_at(event.x, event.y)
+        if mark is None:
+            zone, target = self._track_zone_at_y(event.y)
+            if zone == "track":
+                pool = [m for m in self.marks if m.get("track_id") == target]
+                mark, _edge = self._mark_and_edge_at_x(event.x, pool=pool)
         if mark is None:
             hit_id = None
             for mark_id, bbox in self._mark_hit_regions.items():
@@ -1479,8 +3245,28 @@ class WaveformController:
             mark = next((m for m in self.marks if m["id"] == hit_id), None)
             if mark is None:
                 return
+        if self.selected != ("mark", mark["id"]):
+            self.selected = ("mark", mark["id"])
+            self.render_waveform()
+
+        is_range = mark["type"] == "range" and mark.get("end") is not None
+        cur = self.cursor_position()
+        can_split = th.plan_split(mark, at_time=cur) is not None
+        prev_m = th.neighbor_mark(self.marks, mark, -1)
+        next_m = th.neighbor_mark(self.marks, mark, 1)
 
         menu = tk.Menu(self.canvas, tearoff=False)
+        cursor_inside = is_range and cur is not None and mark["start"] < cur < mark["end"]
+        menu.add_command(label="Split at Cursor" if cursor_inside else "Split at Middle",
+                         state="normal" if can_split else "disabled",
+                         command=lambda: self.split_mark_by_id(mark["id"]))
+        menu.add_command(label="Merge with Previous", state="normal" if prev_m else "disabled",
+                         command=lambda: self.merge_mark_by_id(mark["id"], -1))
+        menu.add_command(label="Merge with Next", state="normal" if next_m else "disabled",
+                         command=lambda: self.merge_mark_by_id(mark["id"], 1))
+        menu.add_command(label="Transcribe Range", state="normal" if is_range and not self._analysis_busy
+                         else "disabled", command=lambda: self.transcribe_mark(mark["id"]))
+        menu.add_separator()
         if mark["label"]:
             menu.add_command(label="Edit Label...", command=lambda: self._edit_mark_label(mark))
             menu.add_command(label="Delete Label", command=lambda: self._clear_mark_label(mark))
@@ -1564,9 +3350,7 @@ class WaveformController:
         span = self.view_end - self.view_start
 
         if self.audio_duration is not None:
-            self.duration_label.configure(
-                text=f"{self._duration_text_base}    View: {th.format_time_ms(self.view_start)} - {th.format_time_ms(self.view_end)}"
-            )
+            self._update_time_readout()
 
         def x_of(t):
             if span <= 0:
@@ -1596,20 +3380,36 @@ class WaveformController:
         if n == 0:
             c.create_text(w // 2, mid_y, text="(no waveform data)", fill="#888888")
         else:
+            use_regions = bool(self.regions) and span > 0
+            p0, p1 = getattr(self, "_peaks_span", None) or (self.view_start, self.view_end)
+            pspan = max(1e-9, p1 - p0)
             for i, (mn, mx) in enumerate(self.peaks):
-                x = int(i * w / n)
+                t = p0 + (i + 0.5) / n * pspan
+                x = int(x_of(p0 + i / n * pspan))
                 y1 = mid_y - mx * amplitude_px
                 y2 = mid_y - mn * amplitude_px
-                c.create_line(x, y1, x, y2, fill="#4fc3f7")
+                color = WAVE_COLOR
+                if use_regions:
+                    color = self.region_colors.get(self._region_kind_at(t), WAVE_COLOR)
+                c.create_line(x, y1, x, y2, fill=color)
+        if self.audio_duration is not None and self.view_end > self.audio_duration:
+            # shade the part of the view past the end of the audio
+            x_end = x_of(self.audio_duration)
+            c.create_rectangle(x_end, 0, w, h, fill="#141414", outline="", tags=("past_end",))
+            c.create_line(x_end, 0, x_end, h, fill="#5a5a5a")
 
-        c.create_text(4, h - 4, text=th.format_time_ms(self.view_start), fill="#cccccc", anchor="sw")
-        c.create_text(w - 4, h - 4, text=th.format_time_ms(self.view_end), fill="#cccccc", anchor="se")
 
         self._render_marks(x_of, w, h, visible_work, work_lanes, work_lane_count)
         self._render_tracks(x_of, w, layout)
         self._render_drag_preview(w, layout)
+        self._render_cursor(x_of, layout)
         self._render_playhead(x_of, layout)
         self._render_time_readout(w)
+        if self.panel is not None:
+            try:
+                self.panel.sync()
+            except tk.TclError:
+                pass
 
     def _render_marks(self, x_of, w, h, visible, lanes, lane_count):
         self._mark_hit_regions = {}
@@ -1649,7 +3449,7 @@ class WaveformController:
                           font=("TkDefaultFont", 7, "bold"), tags=(tag, text_tag))
             if m["label"]:
                 allotted = max(20, label_width_limit(m) - (x1 + 3))
-                c.create_text(x1 + 3, y0 + 13, text=m["label"], fill="#ffffff", anchor="nw",
+                c.create_text(x1 + 3, y0 + 13, text=m["label"].replace("\n", " / "), fill="#ffffff", anchor="nw",
                               width=allotted, font=("TkDefaultFont", 7), tags=(tag, text_tag))
             self._mark_hit_regions[m["id"]] = c.bbox(text_tag)
 
@@ -1711,16 +3511,52 @@ class WaveformController:
                     c.create_line(x1, sub_y0, x1, sub_y1, fill=this_mark_color, width=3 if mark_selected else 2,
                                   tags=(tag,))
                     ts_text = th.format_time_ms(m["start"])
-                label = m["label"] or ts_text
+                label = (m["label"] or ts_text).replace("\n", " / ")
                 c.create_text(x1 + 3, sub_mid, text=label, fill="#ffffff", anchor="w",
                               font=("TkDefaultFont", 7), tags=(tag, text_tag))
                 self._mark_hit_regions[m["id"]] = c.bbox(text_tag)
 
-        blank_y0 = track_top + len(self.tracks) * self.TRACK_HEIGHT
-        blank_y1 = blank_y0 + self.TRACK_HEIGHT
-        c.create_rectangle(0, blank_y0, w, blank_y1, fill="", outline="#3a3a3a", dash=(3, 2))
-        c.create_text(w // 2, (blank_y0 + blank_y1) // 2, text="Drop a mark here to create a new track",
-                      fill="#5a5a5a", font=("TkDefaultFont", 7))
+        self._render_status_row(w, layout)
+
+    def _render_status_row(self, w, layout):
+        """One row right under the waveform: playback / view / analysis
+        status on the left, the stem color key on the right, and it's the
+        drop target for creating a new track (hint shown while dragging a
+        mark, or while there are no tracks yet)."""
+        c = self.canvas
+        y0, y1 = layout["row_top"], layout["track_top"]
+        mid = (y0 + y1) // 2
+        font = ("TkDefaultFont", 8)
+        c.create_rectangle(0, y0, w, y1, fill=TB_BG, outline="")
+        c.create_line(0, y0, w, y0, fill="#000000")
+
+        status = self._status_text()
+        self._last_status_drawn = status
+        if status:
+            c.create_text(6, mid, text=status, fill=TB_DIM, anchor="w", font=font, tags=("status_text",))
+
+        right = w - 6
+        self._legend_hits = []    # (x0, x1, kind): click a chip or its name to change that color
+        if self.regions:
+            for kind in reversed(("vocal", "novocal", "mixed", "silent")):
+                tid = c.create_text(right, mid, text=STEM_LABELS[kind], fill=TB_DIM, anchor="e", font=font,
+                                    tags=("legend", f"legend_{kind}"))
+                bbox = c.bbox(tid) or (right - 30, 0, right, 0)
+                x_chip = bbox[0] - 4
+                c.create_rectangle(x_chip - 9, mid - 4, x_chip - 1, mid + 4, fill=self.region_colors[kind],
+                                   outline="", tags=("legend", f"legend_{kind}"))
+                self._legend_hits.append((x_chip - 10, right + 2, kind))
+                right = x_chip - 14
+
+        dragging_mark = bool(self._move_drag) and self._move_drag.get("edge") is None
+        file_hover = getattr(self, "_drop_hover", False)
+        if file_hover:
+            c.create_rectangle(1, y0 + 1, w - 1, y1 - 1, outline=TB_ACCENT, width=2, dash=(4, 2))
+            c.create_text(w // 2, mid, text="drop to import as a new timing track", fill=TB_ACCENT, font=font,
+                          tags=("drop_hint",))
+        elif dragging_mark or not self.tracks:
+            c.create_text(w // 2, mid, text="drop a mark (or a lyrics / labels file) here for a new track",
+                          fill=TB_ACCENT if dragging_mark else "#6a6a6a", font=font, tags=("drop_hint",))
 
     def _render_drag_preview(self, w, layout):
         if not self._move_drag or self._move_drag.get("edge") is not None:
@@ -1742,18 +3578,33 @@ class WaveformController:
             y0 = layout["track_top"] + idx * self.TRACK_HEIGHT
             y1 = y0 + self.TRACK_HEIGHT
         else:
-            y0 = layout["track_top"] + len(self.tracks) * self.TRACK_HEIGHT
-            y1 = y0 + self.TRACK_HEIGHT
+            y0, y1 = layout["row_top"], layout["track_top"]
         c.create_rectangle(1, y0 + 1, w - 1, y1 - 1, outline=self.SELECTION_COLOR, width=2, dash=(4, 2))
 
+    def _render_cursor(self, x_of, layout):
+        """The @cursor -- always shown. It is the playback position: solid
+        while playing, dashed otherwise, with an "@" tag in the status row
+        (the position the cards' @ buttons and Split use)."""
+        if self.audio_duration is None:
+            return
+        t = self.cursor_position() or 0.0
+        if not (self.view_start <= t <= self.view_end):
+            return
+        x = x_of(t)
+        c = self.canvas
+        if self._play_state == "playing":
+            c.create_line(x, 0, x, layout["total_h"], fill=CURSOR_PLAY_COLOR, width=2, tags=("cursor_line",))
+        else:
+            c.create_line(x, 0, x, layout["total_h"], fill=CURSOR_COLOR, dash=(2, 3), tags=("cursor_line",))
+        y0, y1 = layout["row_top"], layout["track_top"]
+        tx = max(8, min(self._canvas_size()[0] - 8, x))   # keep the tag on screen at 0:00 / the end
+        c.create_rectangle(tx - 7, y0 + 3, tx + 7, y1 - 3, fill=CURSOR_COLOR, outline="", tags=("cursor_at",))
+        c.create_text(tx, (y0 + y1) // 2, text="@", fill="#1e1e1e", font=("TkDefaultFont", 8, "bold"),
+                      tags=("cursor_at",))
+
     def _render_playhead(self, x_of, layout):
-        pos = self.current_play_position()
-        if pos is None or self.audio_duration is None:
-            return
-        if not (self.view_start <= pos <= self.view_end):
-            return
-        x = x_of(pos)
-        self.canvas.create_line(x, 0, x, layout["total_h"], fill="#ff2222", width=2)
+        """(Merged into the @cursor -- see _render_cursor.)"""
+        return
 
     def _render_time_readout(self, w):
         text = xy = None
@@ -1803,6 +3654,12 @@ def onload(filepath: str, canvas=None, text=None, tab=None):
     backend = th.waveform_backend_for(str(p.resolve()))
     if backend:
         descr += f"\n{{blue}}Waveform decoder: {{cyan}}{backend}\n"
+        if backend == "miniaudio":
+            descr += ("{yellow}  Note: miniaudio decodes the whole file for each deep-zoom redraw, so "
+                      "zooming in past the overview will be slower (ffmpeg or soundfile avoid this).\n")
+        elif "miniaudio" in backend:
+            descr += ("{yellow}  Note: if soundfile can't read this file, miniaudio is used instead and "
+                      "deep-zoom redraws will be slower.\n")
     else:
         descr += f"\n{{red}}Waveform decoder: none available \u2013 {_decoder_hint(filepath)}\n"
     engine_name = "sounddevice (trackED's own)" if th.ACTIVE_ENGINE == "sounddevice" else "ffplay (Sequence Editor's original)"
@@ -1818,11 +3675,35 @@ def onload(filepath: str, canvas=None, text=None, tab=None):
     else:
         descr += "\n{green}All recommended packages are present.\n"
 
+    # Optional analysis features (not in the Install button: torch alone is
+    # a multi-GB download, so these are left as an explicit choice).
+    whisper = aa.whisper_backends()
     descr += (
-        "\n{blue}Mouse: {cyan}click{blue}=new point mark  {cyan}drag{blue}=new range  "
-        "{cyan}shift+click{blue}=extend last mark into a range\n"
+        f"{{blue}}Stem separation: "
+        + ("{cyan}demucs\n" if aa.demucs_available() else "{yellow}not installed (pip install demucs)\n")
+        + "{blue}Transcription: "
+        + (f"{{cyan}}{', '.join(whisper)}  (auto model: {aa.default_whisper_model()}, "
+           f"{aa.available_ram_gb():.1f} GB free)\n" if whisper
+           else "{yellow}not installed (pip install faster-whisper)\n")
+    )
+
+    descr += (
+        "\n{blue}Mouse: {cyan}click{blue}=move the @cursor  {cyan}double-click{blue} or {cyan}M{blue}=new point mark  "
+        "{cyan}drag{blue}=new range\n"
+        "{blue}      {cyan}shift+click{blue}=range from the @cursor (or a just-made point) to here\n"
+        "{blue}Keys:  {cyan}M{blue}=point mark at the @cursor  {cyan}Delete{blue}=delete selection  "
+        "{cyan}Ctrl+Z/Y{blue}=undo/redo\n"
+        "{blue}      type a time in the position box + Enter to move the @cursor; drag the slider to scroll\n"
+        "{blue}Lyrics: drag a .txt/.lrc/.srt/labels file onto the row under the waveform (or right-click it)"
+        " for a new track;\n{blue}      a card's {cyan}Split \u25be{blue} splits at the cursor, a selected phrase, "
+        "or into words (timed by syllables)\n"
         "{blue}      {cyan}drag a mark{blue}=move/resize  {cyan}drag into a track band{blue}=assign it\n"
-        "{blue}      {cyan}double-click{blue}=edit label  {cyan}right-click{blue}=mark/track menu\n"
+        "{blue}      {cyan}double-click{blue}=edit label  {cyan}right-click{blue}=mark/track menu "
+        "(split / merge / transcribe)\n"
+        "{blue}      {cyan}Ctrl+click{blue}=move the @cursor (= playhead)  {cyan}Shift+Play{blue}=loop\n"
+        "{blue}      {cyan}\u25c0\u25c0 / \u25b6\u25b6{blue}: click=5 s, Shift+click=stem region edge, "
+        "Ctrl+click=start/end of the audio\n"
+        "{blue}      {cyan}select a track or one of its marks{blue}=edit its marks here in the text panel\n"
         "{blue}Keys:  {cyan}Up/Down{blue}=move selection between tracks  {cyan}Left/Right{blue}=nudge by one grid step\n"
         "{blue}       {cyan}Tab/Shift+Tab{blue}=select next/prev mark  {cyan}Delete{blue}=delete selection\n"
         "{blue}       {cyan}Ctrl+Z/Ctrl+Y{blue}=undo/redo marks (while the waveform has focus)\n"
@@ -1854,8 +3735,20 @@ def onload(filepath: str, canvas=None, text=None, tab=None):
         if tab is not None:
             tab.min_sash = controller.min_panel_height
             tab.preferred_sash = controller.preferred_panel_height
+            # The text panel shows info/marks for an audio file; never let
+            # File > Save write that text over the audio.
+            tab.protect_file = True
+            # Undo/redo in this tab means timing marks, wherever the focus
+            # is (Edit menu, text panel, card fields, waveform).
+            tab.undo_hook = controller.undo_marks
+            tab.redo_hook = controller.redo_marks
+            tab.save_hook = controller.save_marks_now
+            tab.before_close_hook = controller.before_close
+            _bind_undo_keys(tab, text)
+        controller.set_info_text(descr)
 
     if text is not None:
+        text.configure(state="normal")
         text.delete("1.0", "end")
         insert_styled_text(text, descr)
 

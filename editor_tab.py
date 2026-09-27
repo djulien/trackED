@@ -6,13 +6,14 @@ Horizontal sash is user-draggable; position remembered per file.
 
 from __future__ import annotations
 
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
 from typing import Callable, Optional
 
 from utils import (
-    abbreviated_name, get_sash_pos, set_sash_pos,
+    abbreviated_name, get_sash_pos, set_sash_pos, get_autosave_seconds,
     get_cursor_pos, set_cursor_pos, DEFAULT_SASH_POS,
     is_probably_text_file, file_meta_summary, run_onload_plugins,
 )
@@ -23,6 +24,71 @@ from logview_tab import debug
 #        msg += str(arg) + " "
 #    print(msg)
 #    return args[-1]  #for inlining last arg
+
+DIRTY_MARKER_COLOR = "#d0021b"
+DIAL_FRAMES = 16          # auto-save dial animation steps
+DIAL_EMPTY = "#f3c4c8"    # the part of the dial still to go
+_dial_imgs = {}
+
+
+def _autosave_dial(master, fraction: float):
+    """A small red dial for an unsaved tab: the red wedge grows clockwise
+    from 12 o'clock as auto-save approaches (full = saving now). Frames
+    are drawn once per Tk interpreter; None if images can't be made."""
+    import math
+    key = str(master.winfo_toplevel()) if hasattr(master, "winfo_toplevel") else "default"
+    frames = _dial_imgs.get(key)
+    if frames is None:
+        frames = []
+        try:
+            size, gap = 11, 3
+            c = (size - 1) / 2.0
+            for f in range(DIAL_FRAMES + 1):
+                img = tk.PhotoImage(master=master, width=size + gap, height=size)
+                limit = 2 * math.pi * f / DIAL_FRAMES
+                for y in range(size):
+                    for x in range(size):
+                        dx, dy = x - c, y - c
+                        r = math.hypot(dx, dy)
+                        if r > c + 0.5:
+                            continue
+                        if r >= c - 0.6:
+                            img.put(DIRTY_MARKER_COLOR, (x, y))          # rim
+                            continue
+                        ang = math.atan2(dx, -dy) % (2 * math.pi)       # 0 at 12 o'clock, clockwise
+                        img.put(DIRTY_MARKER_COLOR if ang <= limit else DIAL_EMPTY, (x, y))
+                frames.append(img)
+        except (tk.TclError, TypeError, AttributeError):
+            frames = []
+        _dial_imgs[key] = frames
+    if not frames:
+        return None
+    return frames[max(0, min(DIAL_FRAMES, int(round(fraction * DIAL_FRAMES))))]
+_dirty_marker_img = {}
+
+
+def _dirty_marker(master):
+    """A small red asterisk image for unsaved tabs (created once per Tk
+    interpreter; None if it can't be made)."""
+    key = str(master.winfo_toplevel()) if hasattr(master, "winfo_toplevel") else "default"
+    if key in _dirty_marker_img:
+        return _dirty_marker_img[key]
+    img = None
+    try:
+        size = 9
+        img = tk.PhotoImage(master=master, width=size + 3, height=size)   # 3 px gap before the name
+        c = size // 2
+        for i in range(size):
+            for x, y in ((c, i), (i, c), (i, i), (size - 1 - i, i)):   # |  -  \  /
+                if abs(x - c) + abs(y - c) <= c + 1:
+                    img.put(DIRTY_MARKER_COLOR, (x, y))
+        for x, y in ((c - 1, c), (c + 1, c), (c, c - 1), (c, c + 1)):    # thicken the center
+            img.put(DIRTY_MARKER_COLOR, (x, y))
+    except (tk.TclError, TypeError, AttributeError):
+        img = None
+    _dirty_marker_img[key] = img
+    return img
+
 
 class EditorTab:
     """One tab containing a vertical PanedWindow:
@@ -194,6 +260,11 @@ class EditorTab:
 
         # Optional override: list of original line numbers (e.g. log filter)
         orig = getattr(self, "_gutter_orig_nums", None)
+        # Optional per-line vertical offsets (line -> px from the line's
+        # top) for lines much taller than text, e.g. timing-panel cards
+        # embedded in the Text: the number then sits beside the card's
+        # first row instead of floating in the middle of it.
+        offsets = getattr(self, "gutter_offsets", None) or {}
 
         width = 40
         if orig:
@@ -217,7 +288,7 @@ class EditorTab:
             label = str(orig[logical - 1]) if orig and logical <= len(orig) else str(logical)
             self.linenumbers.create_text(
                 width - 4,
-                y + h // 2,
+                y + offsets[logical] if logical in offsets else y + h // 2,
                 anchor="e",
                 text=label,
                 fill="#666666",
@@ -225,7 +296,28 @@ class EditorTab:
             )
 
     # ------------------------------------------------------------------ Sash / cursor
-    def _restore_sash(self) -> None:
+    def _restore_sash(self, attempt: int = 0) -> None:
+        """Apply the saved (or plugin-preferred) sash position -- but only
+        once the pane really has its size. A tab that isn't visible yet (or
+        a window still being laid out) reports ~1px, and a sash set then is
+        clamped and lost; so retry briefly, and otherwise apply it when the
+        pane is first shown (<Map>). Until applied, nothing is saved back
+        (see _on_sash_released), so an unshown tab can't overwrite the
+        stored position with a bogus one."""
+        try:
+            height = self.paned.winfo_height()
+            want = max(get_sash_pos(self.filepath, default=self._sash_hint("preferred_sash")),
+                       self._sash_hint("min_sash") or 0)
+            if height < want + 40:
+                if attempt < 20:
+                    self.frame.after(50, lambda: self._restore_sash(attempt + 1))
+                elif not getattr(self, "_sash_map_bound", False):
+                    self._sash_map_bound = True
+                    self.paned.bind("<Map>", lambda e: self._restore_sash(0) if not self._sash_ready else None,
+                                    add="+")
+                return
+        except tk.TclError:
+            return
         try:
             # A plugin's onload() may set tab.preferred_sash (used when this
             # file has no saved position yet) and tab.min_sash (a floor, so
@@ -256,6 +348,8 @@ class EditorTab:
         if not self._sash_ready:
             return
         try:
+            if not self.paned.winfo_ismapped() or self.paned.winfo_height() <= 1:
+                return  # hidden tab: its sash reading would be meaningless
             pos = self.paned.sashpos(0)
             set_sash_pos(self.filepath, pos)
             debug(3, f"{{blue}}Saved sash {pos}px for {self.filepath or 'Untitled'}")
@@ -346,20 +440,37 @@ class EditorTab:
         name = abbreviated_name(self.filepath)
         return f"{'*' if self.dirty else ''}{name}"
 
-    def update_tab_label(self) -> None:
+    def update_tab_label(self, autosave_fraction: Optional[float] = None) -> None:
+        """Unsaved changes: a red marker in front of the name -- an
+        auto-save countdown dial that fills as the save approaches (or a
+        red asterisk when auto-save is off). ttk.Notebook can't color one
+        tab's text, but each tab can carry its own image; the plain-text
+        "*" is the fallback if images fail."""
+        name = abbreviated_name(self.filepath)
         try:
-            self.notebook.tab(self.frame, text=self._label_text())
-#            self.label.configure(text=self._label_text())
+            img = None
+            if self.dirty:
+                if autosave_fraction is None:
+                    autosave_fraction = self._autosave_fraction()
+                if autosave_fraction is not None:
+                    img = _autosave_dial(self.notebook, autosave_fraction)
+                if img is None:
+                    img = _dirty_marker(self.notebook)
+            if img is not None:
+                self.notebook.tab(self.frame, text=name, image=img, compound="left")
+            else:
+                self.notebook.tab(self.frame, text=self._label_text(), image="")
         except tk.TclError:
             pass
 
     def _on_text_modified(self, event=None) -> None:
-        if self._loading:
+        if self._loading or getattr(self, "protect_file", False):
             self.text.edit_modified(False)
             return
         if self.text.edit_modified():
             if not self.dirty:
                 self.dirty = True
+                self.dirty_since = time.monotonic()   # auto-save counts from here
                 self.update_tab_label()
                 if self.on_modified:
                     self.on_modified(self)
@@ -385,6 +496,15 @@ class EditorTab:
                 child.destroy()
         except tk.TclError:
             pass
+        # ...and any toolbars a plugin packed beside the canvas (in its
+        # parent frame), e.g. image_tab's zoom bar or waveform_tab's rows.
+        for attr in ("_plugin_toolbars", "_waveform_toolbars"):
+            for w in getattr(self.canvas, attr, None) or []:
+                try:
+                    w.destroy()
+                except tk.TclError:
+                    pass
+            setattr(self.canvas, attr, [])
 
         # Stop a previous plugin poll timer if any
         if getattr(self, "_plugin_after_id", None) is not None:
@@ -397,6 +517,28 @@ class EditorTab:
         # Panel-size hints belong to whichever plugin claims *this* load
         self.preferred_sash = None
         self.min_sash = None
+        self._sash_ready = False   # re-applied (and only then saved) for the new file
+        # A plugin sets this when the text panel is only a view of a
+        # binary file (e.g. audio): its text must never be saved over it.
+        self.protect_file = False
+        # A plugin can route Edit > Undo/Redo (and Ctrl+Z/Ctrl+Y in the text
+        # panel) to its own history, e.g. waveform_tab's timing marks.
+        self.undo_hook = None
+        self.redo_hook = None
+        self.gutter_offsets = None
+        # save_hook: a plugin's own save for files whose changes live
+        # elsewhere (waveform_tab saves marks to the sidecar cache, never
+        # the audio). title_detail: extra text for the window title, e.g.
+        # the audio duration.
+        self.save_hook = None
+        self.title_detail = None
+        # before_close_hook: a plugin's last question before the tab/app
+        # closes; returns False to cancel the close.
+        self.before_close_hook = None
+        try:
+            self.text.configure(state="normal", undo=True)
+        except tk.TclError:
+            pass
 
         claimed = run_onload_plugins(
             path, canvas=self.canvas, text=self.text, tab=self
@@ -535,8 +677,33 @@ class EditorTab:
                     text.tag_add(tg, a, b)
             line_start = text.index(f"{line_start}+1l")
 
+    def _autosave_fraction(self) -> Optional[float]:
+        """0..1 of the way to this tab's auto-save, or None if off."""
+        interval = get_autosave_seconds()
+        since = getattr(self, "dirty_since", None)
+        if interval <= 0 or since is None:
+            return None
+        return max(0.0, min(1.0, (time.monotonic() - since) / interval))
+
+    def mark_dirty(self) -> None:
+        """For plugin views whose edits aren't in the Text widget (e.g.
+        timing marks): flag unsaved changes the same way text edits do."""
+        if not self.dirty:
+            self.dirty = True
+            self.dirty_since = time.monotonic()   # auto-save counts from here
+            self.update_tab_label()
+        if self.on_modified:
+            self.on_modified(self)
+
+    def refresh_title(self) -> None:
+        """Ask the app to redraw the window title (e.g. after a plugin set
+        title_detail once its file finished loading)."""
+        if self.on_modified:
+            self.on_modified(self)
+
     def mark_clean(self) -> None:
         self.dirty = False
+        self.dirty_since = None
         self.text.edit_modified(False)
         self.update_tab_label()
 

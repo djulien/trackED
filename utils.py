@@ -26,6 +26,16 @@ CONFIG_DIR = Path.home() / f".{clean_name}"
 SESSION_FILE = CONFIG_DIR / "session.json"
 MAX_RECENT = 10
 
+# Factory default for the persistent "debug_level" preference (0 = off,
+# 1 = high-level only ... 99 = everything). See get_default_debug_level().
+DEFAULT_DEBUG_LEVEL = 10
+
+# Factory default for the "autosave_seconds" preference (0 = off).
+DEFAULT_AUTOSAVE_SECONDS = 10
+
+# Stem regions shorter than this (seconds) are merged into their neighbors.
+DEFAULT_STEM_MIN_SECONDS = 1.0
+
 # Default sash position (pixels from top) when no saved value exists
 DEFAULT_SASH_POS = 60  #small default height
 
@@ -43,6 +53,9 @@ def _default_session() -> Dict[str, Any]:
         "cursor_positions": {},   # path -> {"index": "line.col", "yview": float}
         "preferences": {
             "max_recent": 10,
+            "debug_level": DEFAULT_DEBUG_LEVEL,
+            "autosave_seconds": DEFAULT_AUTOSAVE_SECONDS,
+            "stem_min_seconds": DEFAULT_STEM_MIN_SECONDS,
 #            "debug_wrap": False,
 #            "debug_filter": "",
         },
@@ -59,6 +72,39 @@ def set_preference(key: str, value: Any) -> None:
     data = load_session_data()
     data.setdefault("preferences", {})[key] = value
     save_session_data(data)
+
+
+def get_default_debug_level() -> int:
+    """Debug level used when the command line doesn't give one (the
+    persistent "debug_level" preference; DEFAULT_DEBUG_LEVEL if unset)."""
+    try:
+        return max(0, min(99, int(get_preference("debug_level", DEFAULT_DEBUG_LEVEL))))
+    except (TypeError, ValueError):
+        return DEFAULT_DEBUG_LEVEL
+
+
+def set_default_debug_level(level: Optional[int]) -> int:
+    """Store a new default debug level; None resets it to the factory
+    DEFAULT_DEBUG_LEVEL. Returns the stored value."""
+    value = DEFAULT_DEBUG_LEVEL if level is None else max(0, min(99, int(level)))
+    set_preference("debug_level", value)
+    return value
+
+
+def get_autosave_seconds() -> int:
+    """Auto-save interval in seconds from Preferences (0 = off)."""
+    try:
+        return max(0, min(3600, int(get_preference("autosave_seconds", DEFAULT_AUTOSAVE_SECONDS))))
+    except (TypeError, ValueError):
+        return DEFAULT_AUTOSAVE_SECONDS
+
+
+def get_stem_min_seconds() -> float:
+    """Shortest stem region kept (Preferences); shorter ones are merged."""
+    try:
+        return max(0.0, min(30.0, float(get_preference("stem_min_seconds", DEFAULT_STEM_MIN_SECONDS))))
+    except (TypeError, ValueError):
+        return DEFAULT_STEM_MIN_SECONDS
 
 
 def get_max_recent() -> int:

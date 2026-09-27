@@ -9,12 +9,11 @@ Nothing here imports tkinter or touches a GUI widget, so it can be used
 
 Covers:
   - time formatting (format_time, format_time_ms)
-  - waveform peak decoding via ffmpeg, plus a per-file JSON cache
-  - marks/tracks persistence (a "<mediafile>-marks.json" sidecar, matching
-    the sash/cursor sidecar-free convention trackED's own utils.py uses for
-    its *centralized* session.json -- marks/tracks use a per-file sidecar
-    instead, same as the waveform cache below, so they travel with the
-    media file rather than living in one growing session file)
+  - waveform peak decoding via ffmpeg (or soundfile/miniaudio)
+  - one combined per-file JSON cache, "<stem>-cache.json" next to the
+    media file: waveform peaks, stem regions, marks and tracks (see
+    load_cache/update_cache) -- it travels with the media file rather
+    than living in trackED's central session.json
   - overlap-lane assignment for drawing overlapping marks side by side
   - external timing-format exporters: xLights (.xtiming), LRC (.lrc),
     Audacity labels (.txt)
@@ -41,7 +40,9 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
+import threading
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -109,6 +110,258 @@ _SOUNDFILE_EXTS = {".wav", ".flac", ".ogg", ".aiff", ".aif", ".mp3"}
 _MINIAUDIO_EXTS = {".wav", ".flac", ".ogg", ".mp3"}
 
 
+# ---------------------------------------------------------------------------
+# Built-in tag readers -- ported verbatim from the Sequence Editor's
+# media_utils.py (this project's own code). Used when tinytag isn't
+# installed or can't read a file.
+# ---------------------------------------------------------------------------
+
+ID3V1_GENRES = [
+    "Blues", "Classic Rock", "Country", "Dance", "Disco", "Funk", "Grunge",
+    "Hip-Hop", "Jazz", "Metal", "New Age", "Oldies", "Other", "Pop", "R&B",
+    "Rap", "Reggae", "Rock", "Techno", "Industrial", "Alternative", "Ska",
+    "Death Metal", "Pranks", "Soundtrack", "Euro-Techno", "Ambient",
+    "Trip-Hop", "Vocal", "Jazz+Funk", "Fusion", "Trance", "Classical",
+    "Instrumental", "Acid", "House", "Game", "Sound Clip", "Gospel",
+    "Noise", "AlternRock", "Bass", "Soul", "Punk", "Space", "Meditative",
+    "Instrumental Pop", "Instrumental Rock", "Ethnic", "Gothic", "Darkwave",
+    "Techno-Industrial", "Electronic", "Pop-Folk", "Eurodance", "Dream",
+    "Southern Rock", "Comedy", "Cult", "Gangsta", "Top 40", "Christian Rap",
+    "Pop/Funk", "Jungle", "Native American", "Cabaret", "New Wave",
+    "Psychedelic", "Rave", "Showtunes", "Trailer", "Lo-Fi", "Tribal",
+    "Acid Punk", "Acid Jazz", "Polka", "Retro", "Musical", "Rock & Roll",
+    "Hard Rock",
+]
+
+
+def _synchsafe_to_int(b):
+    return (b[0] << 21) | (b[1] << 14) | (b[2] << 7) | b[3]
+
+
+def _decode_id3_text(data):
+    if not data:
+        return ""
+    enc = data[0]
+    body = data[1:]
+    try:
+        if enc == 0:
+            text = body.decode("latin-1", errors="replace")
+        elif enc == 1:
+            text = body.decode("utf-16", errors="replace")
+        elif enc == 2:
+            text = body.decode("utf-16-be", errors="replace")
+        elif enc == 3:
+            text = body.decode("utf-8", errors="replace")
+        else:
+            text = body.decode("latin-1", errors="replace")
+    except Exception:
+        text = ""
+    return text.replace("\x00", "").strip()
+
+
+def _parse_id3v2(path):
+    """Parse ID3v2.3/2.4 tag frames from an MP3 file. Returns a dict of the
+    common human-readable fields found; unrecognized frames are ignored."""
+    tags = {}
+    with open(path, "rb") as f:
+        header = f.read(10)
+        if len(header) < 10 or header[:3] != b"ID3":
+            return tags
+        version_major = header[3]
+        tag_size = _synchsafe_to_int(header[6:10])
+        body = f.read(tag_size)
+
+    frame_map = {
+        "TIT2": "title", "TPE1": "artist", "TALB": "album",
+        "TYER": "year", "TDRC": "year", "TCON": "genre",
+        "TRCK": "track_number", "COMM": "comment",
+        "TPE2": "album_artist", "TCOM": "composer", "TPOS": "disc_number",
+    }
+
+    pos = 0
+    while pos < len(body) - 10:
+        frame_id = body[pos:pos + 4]
+        if frame_id == b"\x00\x00\x00\x00":
+            break
+        try:
+            frame_id_str = frame_id.decode("ascii")
+        except UnicodeDecodeError:
+            break
+        if not frame_id_str.isalnum():
+            break
+
+        if version_major >= 4:
+            frame_size = _synchsafe_to_int(body[pos + 4:pos + 8])
+        else:
+            frame_size = struct.unpack(">I", body[pos + 4:pos + 8])[0]
+
+        frame_data = body[pos + 10:pos + 10 + frame_size]
+        pos += 10 + frame_size
+        if frame_size <= 0:
+            continue
+
+        key = frame_map.get(frame_id_str)
+        if not key:
+            continue
+
+        if frame_id_str == "COMM" and len(frame_data) > 4:
+            # encoding(1) + language(3) + short description + text; we skip
+            # the language code and just decode encoding byte + remainder.
+            value = _decode_id3_text(bytes([frame_data[0]]) + frame_data[4:])
+        else:
+            value = _decode_id3_text(frame_data)
+
+        if value:
+            tags[key] = value
+
+    return tags
+
+
+def _parse_id3v1(path):
+    """Parse the legacy 128-byte ID3v1 tag at the end of an MP3 file, if any."""
+    tags = {}
+    size = os.path.getsize(path)
+    if size < 128:
+        return tags
+    with open(path, "rb") as f:
+        f.seek(size - 128)
+        tag = f.read(128)
+    if tag[:3] != b"TAG":
+        return tags
+
+    def field(b):
+        return b.split(b"\x00")[0].decode("latin-1", errors="replace").strip()
+
+    tags["title"] = field(tag[3:33])
+    tags["artist"] = field(tag[33:63])
+    tags["album"] = field(tag[63:93])
+    tags["year"] = field(tag[93:97])
+    tags["comment"] = field(tag[97:127])
+    genre_code = tag[127]
+    if genre_code < len(ID3V1_GENRES):
+        tags["genre"] = ID3V1_GENRES[genre_code]
+    return {k: v for k, v in tags.items() if v}
+
+
+def extract_mp3_metadata(path):
+    tags = {}
+    try:
+        tags.update(_parse_id3v1(path))  # baseline, may be overwritten below
+        tags.update(_parse_id3v2(path))  # richer/preferred, takes priority
+    except Exception as e:
+        tags["error"] = str(e)
+    tags["_file_size_bytes"] = os.path.getsize(path)
+    return tags
+
+
+def _read_atoms(f, end):
+    """Read a sequence of MP4/QuickTime atoms (boxes) up to byte offset `end`.
+    Returns a list of (type, start_offset, total_size, header_length)."""
+    atoms = []
+    while f.tell() < end:
+        pos = f.tell()
+        size_bytes = f.read(4)
+        if len(size_bytes) < 4:
+            break
+        size = struct.unpack(">I", size_bytes)[0]
+        atype_bytes = f.read(4)
+        if len(atype_bytes) < 4:
+            break
+        atype = atype_bytes.decode("latin-1", errors="replace")
+        header_len = 8
+        if size == 1:
+            large = f.read(8)
+            if len(large) < 8:
+                break
+            size = struct.unpack(">Q", large)[0]
+            header_len = 16
+        elif size == 0:
+            size = end - pos
+        if size < header_len:
+            break
+        atoms.append((atype, pos, size, header_len))
+        f.seek(pos + size)
+    return atoms
+
+
+_MP4_FIELD_MAP = {
+    "\xa9nam": "title", "\xa9ART": "artist", "\xa9alb": "album",
+    "\xa9day": "year", "\xa9gen": "genre", "\xa9too": "encoder",
+    "\xa9wrt": "composer", "trkn": "track_number",
+}
+
+
+def extract_mp4_metadata(path):
+    tags = {}
+    try:
+        with open(path, "rb") as f:
+            file_size = os.path.getsize(path)
+            top_atoms = _read_atoms(f, file_size)
+            moov = next((a for a in top_atoms if a[0] == "moov"), None)
+            if moov:
+                _, mpos, msize, mhlen = moov
+                f.seek(mpos + mhlen)
+                moov_atoms = _read_atoms(f, mpos + msize)
+
+                mvhd = next((a for a in moov_atoms if a[0] == "mvhd"), None)
+                if mvhd:
+                    _, vpos, vsize, vhlen = mvhd
+                    f.seek(vpos + vhlen)
+                    data = f.read(vsize - vhlen)
+                    if data and data[0] == 1 and len(data) >= 32:
+                        timescale = struct.unpack(">I", data[20:24])[0]
+                        duration = struct.unpack(">Q", data[24:32])[0]
+                    elif len(data) >= 20:
+                        timescale = struct.unpack(">I", data[12:16])[0]
+                        duration = struct.unpack(">I", data[16:20])[0]
+                    else:
+                        timescale = 0
+                        duration = 0
+                    if timescale:
+                        tags["duration_seconds"] = round(duration / timescale, 2)
+
+                udta = next((a for a in moov_atoms if a[0] == "udta"), None)
+                if udta:
+                    _, upos, usize, uhlen = udta
+                    f.seek(upos + uhlen)
+                    udta_atoms = _read_atoms(f, upos + usize)
+                    meta = next((a for a in udta_atoms if a[0] == "meta"), None)
+                    if meta:
+                        _, mepos, mesize, mehlen = meta
+                        f.seek(mepos + mehlen + 4)  # meta is a "full box": +4 version/flags
+                        ilst = next(
+                            (a for a in _read_atoms(f, mepos + mesize) if a[0] == "ilst"), None
+                        )
+                        if ilst:
+                            _, ipos, isize, ihlen = ilst
+                            f.seek(ipos + ihlen)
+                            for atype, ap, asize, ahlen in _read_atoms(f, ipos + isize):
+                                f.seek(ap + ahlen)
+                                data_atom = next(
+                                    (a for a in _read_atoms(f, ap + asize) if a[0] == "data"), None
+                                )
+                                if not data_atom:
+                                    continue
+                                _, dp, dsize, dhlen = data_atom
+                                f.seek(dp + dhlen)
+                                raw = f.read(dsize - dhlen)
+                                if len(raw) < 8:
+                                    continue
+                                type_indicator = struct.unpack(">I", raw[0:4])[0]
+                                payload = raw[8:]
+                                key = _MP4_FIELD_MAP.get(atype, atype)
+                                if type_indicator == 1:  # UTF-8 text
+                                    tags[key] = payload.decode("utf-8", errors="replace").strip("\x00")
+                                elif type_indicator in (13, 14):  # embedded cover art
+                                    tags[key] = f"<embedded image, {len(payload)} bytes>"
+                                elif key == "track_number" and len(payload) >= 4:
+                                    tags[key] = str(struct.unpack(">H", payload[2:4])[0])
+    except Exception as e:
+        tags["error"] = str(e)
+    tags["_file_size_bytes"] = os.path.getsize(path)
+    return tags
+
+
 def installable_missing() -> Dict[str, str]:
     """Everything worth offering to pip install: playback packages plus
     the optional metadata/decode ones."""
@@ -118,24 +371,41 @@ def installable_missing() -> Dict[str, str]:
 
 
 def read_metadata(path: str) -> Optional[Dict[str, Any]]:
-    """Tag/stream info via TinyTag (same fields the old audio_tab.py
-    showed), or None if tinytag isn't installed or can't read the file.
-    Raises nothing; on a read error returns {"error": "..."}."""
-    if not HAS_TINYTAG:
-        return None
+    """Tag/stream info for the text panel: TinyTag when installed (same
+    fields the old audio_tab.py showed), else the built-in ID3/MP4 readers
+    above (tags only -- no sample rate/bitrate, and duration only for MP4).
+    Always returns a dict; "source" says which reader produced it, and
+    "error" is set if neither could read the file."""
+    tinytag_error = None
+    if HAS_TINYTAG:
+        try:
+            tag = TinyTag.get(path)
+            return {
+                "source": "tinytag",
+                "title": getattr(tag, "title", None),
+                "artist": getattr(tag, "artist", None),
+                "album": getattr(tag, "album", None),
+                "duration": getattr(tag, "duration", None),
+                "samplerate": getattr(tag, "samplerate", None),
+                "channels": getattr(tag, "channels", None),
+                "bitrate": getattr(tag, "bitrate", None),
+            }
+        except Exception as exc:
+            tinytag_error = str(exc)
+    ext = os.path.splitext(path)[1].lower()
     try:
-        tag = TinyTag.get(path)
+        tags = extract_mp4_metadata(path) if ext in (".mp4", ".m4a") else extract_mp3_metadata(path)
     except Exception as exc:
-        return {"error": str(exc)}
-    return {
-        "title": getattr(tag, "title", None),
-        "artist": getattr(tag, "artist", None),
-        "album": getattr(tag, "album", None),
-        "duration": getattr(tag, "duration", None),
-        "samplerate": getattr(tag, "samplerate", None),
-        "channels": getattr(tag, "channels", None),
-        "bitrate": getattr(tag, "bitrate", None),
-    }
+        tags = {"error": str(exc)}
+    out = {"source": "built-in"}
+    for key in ("title", "artist", "album", "year", "genre", "track_number", "composer", "comment"):
+        if tags.get(key):
+            out[key] = tags[key]
+    if tags.get("duration_seconds"):
+        out["duration"] = float(tags["duration_seconds"])
+    if tags.get("error") or tinytag_error:
+        out["error"] = tags.get("error") or f"tinytag: {tinytag_error}"
+    return out
 
 
 def waveform_backend_for(path: str) -> Optional[str]:
@@ -186,6 +456,305 @@ def format_time_ms(seconds: Optional[float]) -> str:
     m, rem_ms = divmod(rem_ms, 60000)
     s, ms = divmod(rem_ms, 1000)
     return f"{h}:{m:02d}:{s:02d}.{ms:03d}" if h else f"{m}:{s:02d}.{ms:03d}"
+
+
+def parse_time(text: str) -> Optional[float]:
+    """Parse "ss", "ss.mmm", "m:ss.mmm" or "h:mm:ss.mmm" (the formats
+    format_time_ms produces, plus plain seconds). None if unparseable."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        parts = [float(p) for p in text.split(":")]
+    except ValueError:
+        return None
+    if len(parts) > 3 or any(p < 0 for p in parts):
+        return None
+    total = 0.0
+    for p in parts:
+        total = total * 60 + p
+    return total
+
+
+# ---------------------------------------------------------------------------
+# Split / merge of timing marks (pure data -- used by waveform_tab.py and
+# its timing panel; marks are the usual {"id","type","start","end",
+# "label","track_id","source"} dicts)
+# ---------------------------------------------------------------------------
+
+MIN_RANGE = 0.01  # seconds; smallest range a split may produce
+
+
+# ---------------------------------------------------------------------------
+# How long words take to say/sing: a syllable-count heuristic (no
+# dictionary download, no extra dependency). Used to split a range's time
+# across its words in proportion to how long each takes, with short gaps
+# after punctuation and at runs of whitespace / line breaks.
+# ---------------------------------------------------------------------------
+
+_VOWEL_GROUPS = re.compile(r"[aeiouy]+")
+WORD_BASE_WEIGHT = 0.3        # every word takes some time (onset, consonants)
+GAP_SENTENCE = 0.6            # after . ! ? (in syllable units)
+GAP_CLAUSE = 0.35             # after , ; : and dashes
+GAP_WHITESPACE = 0.35         # a run of 2+ spaces or a line break between words
+
+
+def syllable_count(word: str) -> int:
+    """English syllable estimate from vowel groups, with the usual fixes:
+    silent final "e", "-le" endings, "-ed"/"-es" endings, and a few
+    common diphthong splits. Non-English or odd tokens still get >= 1."""
+    w = re.sub(r"[^a-z]", "", word.lower())
+    if not w:
+        return 1 if re.search(r"\d", word) else 0
+    if len(w) <= 3:
+        return 1
+    count = len(_VOWEL_GROUPS.findall(w))
+    if w.endswith("e") and not w.endswith(("le", "ee", "ye")) and count > 1:
+        count -= 1                                  # silent e: "time", "love"
+    elif w.endswith("le") and len(w) > 2 and w[-3] not in "aeiouy":
+        pass                                        # "little", "table": the "-le" is its own syllable
+    if w.endswith(("ed", "es")) and not w.endswith(("ted", "ded", "ses", "zes", "ches", "shes", "ges", "ces")) \
+            and count > 1:
+        count -= 1                                  # "played", "loves" (but "wanted", "kisses")
+    count += len(re.findall(r"(ia|io|ua|eo|ium|iu)(?![aeiou])", w)) // 1 if count < 4 else 0
+    return max(1, count)
+
+
+def word_weight(word: str) -> float:
+    """Relative time to sing a word (syllables plus a small base)."""
+    syl = syllable_count(word)
+    if syl == 0:           # a bare symbol like "&" or "-"
+        return WORD_BASE_WEIGHT
+    return WORD_BASE_WEIGHT + syl
+
+
+def text_weight(text: str) -> float:
+    """How much time a piece of lyric text is assumed to take: the sum of
+    its word weights (spaces and punctuation don't count here)."""
+    return sum(word_weight(w) for w in text.split())
+
+
+def gap_weight(before: str, between: str) -> float:
+    """Pause between two pieces: from punctuation at the end of `before`
+    and the whitespace `between` them (2+ spaces or a line break)."""
+    tail = before.rstrip()
+    gap = 0.0
+    if tail.endswith((".", "!", "?", "\u2026")):
+        gap += GAP_SENTENCE
+    elif tail.endswith((",", ";", ":", "-", "\u2013", "\u2014")):
+        gap += GAP_CLAUSE
+    if "\n" in between or len(between) >= 2:
+        gap += GAP_WHITESPACE
+    return gap
+
+
+def split_text_at_fraction(text: str, frac: float) -> Tuple[str, str]:
+    """Split text at the word boundary whose (syllable) weight share is
+    closest to frac (0..1). Returns (left, right); either may be "" if the
+    text has only one word."""
+    words = text.split()
+    if len(words) < 2:
+        return (text.strip(), "") if frac >= 0.5 else ("", text.strip())
+    weights = [word_weight(w) for w in words]
+    total = sum(weights) or 1.0
+    best_i, best_err, acc = 1, None, 0.0
+    for i in range(1, len(words)):
+        acc += weights[i - 1]
+        err = abs(acc / total - frac)
+        if best_err is None or err < best_err:
+            best_i, best_err = i, err
+    return " ".join(words[:best_i]), " ".join(words[best_i:])
+
+
+def word_spans(text: str) -> List[Tuple[int, int]]:
+    """(start, end) character spans of the words in text; punctuation
+    stays attached to its word ("love," "don't")."""
+    return [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
+
+
+def plan_pieces(mark: Dict[str, Any], spans: List[Tuple[int, int]]) -> Optional[List[Tuple[float, Optional[float], str]]]:
+    """Split a mark's label into the given character spans (in order,
+    non-overlapping) and give each piece a share of the mark's time in
+    proportion to its word weights, leaving short gaps after punctuation
+    and at 2+ spaces / line breaks. Returns [(start, end, text), ...]
+    (end None for a point mark: all pieces keep its time), or None if it
+    can't be done (fewer than 2 pieces, or pieces too short)."""
+    label = mark.get("label") or ""
+    pieces = []
+    for i, (a, b) in enumerate(spans):
+        text = label[a:b].strip()
+        if not text:
+            continue
+        pieces.append([text, text_weight(text) or WORD_BASE_WEIGHT, a, b])
+    if len(pieces) < 2:
+        return None
+    start = float(mark["start"])
+    is_range = mark.get("type") == "range" and mark.get("end") is not None and mark["end"] > start
+    if not is_range:
+        return [(start, None, p[0]) for p in pieces]
+    end = float(mark["end"])
+    gaps = [gap_weight(label[p[2]:p[3]], label[p[3]:nxt[2]]) for p, nxt in zip(pieces, pieces[1:])] + [0.0]
+    total = sum(p[1] for p in pieces) + sum(gaps)
+    unit = (end - start) / total
+    out, t = [], start
+    for (text, weight, _a, _b), gap in zip(pieces, gaps):
+        s0, s1 = t, t + weight * unit
+        out.append((s0, s1, text))
+        t = s1 + gap * unit
+    out[-1] = (out[-1][0], end, out[-1][2])      # absorb rounding
+    if any(e - s < MIN_RANGE for s, e, _ in out):
+        return None
+    return out
+
+
+def plan_split(mark: Dict[str, Any], at_time: Optional[float] = None,
+               text_index: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Work out how to split one mark into two. Returns
+    {"left": (start, end, label), "right": (start, end, label)} or None if
+    it can't be split sensibly.
+
+    - text_index strictly inside the label: split the text there, and for
+      a range divide the time proportionally to each half's text_weight.
+    - else at_time strictly inside a range: split the time there and the
+      text proportionally (at the nearest word boundary).
+    - else a range: split at the middle word boundary (by text weight),
+      time proportional; with no text, split the time in half.
+    Point marks (start == end) can only be split by text; both halves
+    keep the same time."""
+    label = mark.get("label") or ""
+    start = float(mark["start"])
+    is_range = mark.get("type") == "range" and mark.get("end") is not None and mark["end"] > start
+    end = float(mark["end"]) if is_range else start
+
+    left_text = right_text = None
+    if text_index is not None and 0 < text_index < len(label):
+        left_text, right_text = label[:text_index].strip(), label[text_index:].strip()
+        if not left_text or not right_text:
+            left_text = right_text = None
+    if left_text is not None:
+        if not is_range:
+            return {"left": (start, None, left_text), "right": (start, None, right_text)}
+        pieces = plan_pieces(mark, [(0, text_index), (text_index, len(label))])
+        if pieces is None:
+            return None
+        (ls, le, lt), (rs, re_, rt) = pieces
+        return {"left": (ls, le, lt), "right": (rs, re_, rt)}
+    elif not is_range:
+        return None
+    elif at_time is not None and start + MIN_RANGE <= at_time <= end - MIN_RANGE:
+        t = float(at_time)
+        left_text, right_text = split_text_at_fraction(label, (t - start) / (end - start)) if label else ("", "")
+    else:
+        if label and len(label.split()) >= 2:
+            left_text, right_text = split_text_at_fraction(label, 0.5)
+            wl, wr = text_weight(left_text), text_weight(right_text)
+            t = start + (end - start) * wl / (wl + wr)
+        else:
+            left_text, right_text = label.strip(), ""
+            t = (start + end) / 2
+    if t - start < MIN_RANGE or end - t < MIN_RANGE:
+        return None
+    return {"left": (start, t, left_text), "right": (t, end, right_text)}
+
+
+def neighbor_mark(marks: List[Dict[str, Any]], mark: Dict[str, Any], direction: int) -> Optional[Dict[str, Any]]:
+    """The mark just before (-1) / after (+1) `mark` among marks with the
+    same track_id, in time order."""
+    group = sorted((m for m in marks if m.get("track_id") == mark.get("track_id")),
+                   key=lambda m: (m["start"], m.get("end") or m["start"], m["id"]))
+    ids = [m["id"] for m in group]
+    if mark["id"] not in ids:
+        return None
+    j = ids.index(mark["id"]) + direction
+    return group[j] if 0 <= j < len(group) else None
+
+
+def merged_fields(a: Dict[str, Any], b: Dict[str, Any]) -> Tuple[float, float, str]:
+    """(start, end, label) for merging two marks into one range: it spans
+    both, and the labels are joined in time order."""
+    first, second = (a, b) if (a["start"], a.get("end") or a["start"]) <= (b["start"], b.get("end") or b["start"]) else (b, a)
+    start = min(first["start"], second["start"])
+    end = max(first.get("end") or first["start"], second.get("end") or second["start"])
+    label = " ".join(t for t in ((first.get("label") or "").strip(), (second.get("label") or "").strip()) if t)
+    return start, end, label
+
+
+# ---------------------------------------------------------------------------
+# Importing timed text: LRC, Audacity labels, SRT -- or plain lyrics
+# ---------------------------------------------------------------------------
+
+_LRC_STAMP = re.compile(r"\[(\d+):(\d{1,2}(?:[.:]\d{1,3})?)\]")
+_LRC_WORD_STAMP = re.compile(r"<\d+:\d{1,2}(?:[.:]\d{1,3})?>")
+_SRT_TIME = re.compile(r"(\d+):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d+):(\d{2}):(\d{2})[,.](\d{1,3})")
+
+
+def _lrc_seconds(m, s):
+    return int(m) * 60 + float(s.replace(":", "."))
+
+
+def parse_timed_text(text: str, duration: Optional[float] = None) -> Tuple[str, List[Tuple[float, Optional[float], str]]]:
+    """Recognize LRC ("[mm:ss.xx]line"), Audacity labels ("start<TAB>end<TAB>label")
+    or SRT subtitles, and return (format, [(start, end, text), ...]).
+    LRC lines run until the next stamp (the last one to `duration`);
+    blank LRC lines just end the previous line. Anything else is
+    ("plain", []) -- the caller keeps it as one block of lyrics."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    # Audacity labels (spectral-selection lines starting with "\\" are skipped)
+    aud = []
+    for line in lines:
+        if not line.strip() or line.startswith("\\"):
+            continue
+        parts = line.split("\t")
+        try:
+            a, b = float(parts[0]), float(parts[1])
+        except (ValueError, IndexError):
+            aud = None
+            break
+        aud.append((a, b if b > a else None, parts[2].strip() if len(parts) > 2 else ""))
+    if aud:
+        return "audacity", aud
+
+    # SRT
+    blocks, cur = [], None
+    for line in lines:
+        m = _SRT_TIME.search(line)
+        if m:
+            g = [int(x) for x in m.groups()[:3]] + [m.group(4)] + [int(x) for x in m.groups()[4:7]] + [m.group(8)]
+            a = g[0] * 3600 + g[1] * 60 + g[2] + float("0." + g[3])
+            b = g[4] * 3600 + g[5] * 60 + g[6] + float("0." + g[7])
+            cur = [a, b, []]
+            blocks.append(cur)
+        elif cur is not None and line.strip() and not line.strip().isdigit():
+            cur[2].append(line.strip())
+    if blocks:
+        return "srt", [(a, b, " ".join(t)) for a, b, t in blocks if t]
+
+    # LRC
+    offset = 0.0
+    stamped = []
+    for line in lines:
+        mo = re.match(r"^\s*\[offset:\s*([+-]?\d+)\s*\]", line, re.I)
+        if mo:
+            offset = int(mo.group(1)) / 1000.0
+            continue
+        stamps = list(_LRC_STAMP.finditer(line))
+        if not stamps or stamps[0].start() != len(line) - len(line.lstrip()):
+            continue
+        body = _LRC_WORD_STAMP.sub("", line[stamps[-1].end():]).strip()
+        for st in stamps:
+            stamped.append((max(0.0, _lrc_seconds(st.group(1), st.group(2)) - offset), body))
+    if stamped:
+        stamped.sort(key=lambda x: x[0])
+        out = []
+        for i, (t, body) in enumerate(stamped):
+            if not body:
+                continue
+            nxt = stamped[i + 1][0] if i + 1 < len(stamped) else duration
+            end = nxt if nxt is not None and nxt > t + MIN_RANGE else None
+            out.append((t, end, body))
+        return "lrc", out
+    return "plain", []
 
 
 def blend_color(hex_color: str, alpha: float, bg: str = "#1e1e1e") -> str:
@@ -570,102 +1139,184 @@ def rebucket_peaks(full_peaks: List[Tuple[float, float]], start_frac: float,
 # Per-file sidecar helpers (waveform cache, marks/tracks)
 # ---------------------------------------------------------------------------
 
-def _sidecar_path(media_path: str, suffix: str) -> str:
-    """Where a "<mediafile><suffix>" sidecar should live: next to the
+def _sidecar_path(media_path: str, suffix: str, use_stem: bool = False) -> str:
+    """Where a sidecar file for this media file should live: next to the
     media file if that directory is writable, else a fallback dir under
     the home directory (using a flattened/escaped absolute path so files
-    from different directories can't collide)."""
+    from different directories can't collide). use_stem=True names it
+    "<stem><suffix>" ("song-cache.json"), else "<basename><suffix>"
+    ("song.mp3-marks.json" -- the old, pre-combined naming)."""
     directory = os.path.dirname(media_path) or "."
     base = os.path.basename(media_path)
+    name = os.path.splitext(base)[0] if use_stem else base
     if os.access(directory, os.W_OK):
-        return os.path.join(directory, f"{base}{suffix}")
+        return os.path.join(directory, f"{name}{suffix}")
     os.makedirs(_FALLBACK_DIR, exist_ok=True)
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.abspath(media_path))
+    abs_name = os.path.abspath(media_path)
+    if use_stem:
+        abs_name = os.path.splitext(abs_name)[0]
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", abs_name)
     return os.path.join(_FALLBACK_DIR, f"{safe}{suffix}")
 
 
-def load_waveform_cache(media_path: str) -> Optional[Dict[str, Any]]:
-    """Return {"duration":..., "peaks":[...]} if a valid, up-to-date cache
-    exists for this media file, else None. Invalidated if the media
-    file's mtime/size no longer match what was cached."""
-    cache_path = _sidecar_path(media_path, "-waveform-cache.json")
+# ---------------------------------------------------------------------------
+# Combined per-file cache: "<stem>-cache.json" next to the media file.
+#
+#   {
+#     "format": 2,
+#     "source_mtime": ..., "source_size": ...,   # media file identity
+#     "duration": ..., "peaks": [...],           # derived -- dropped if the media changes
+#     "regions": [...],                          # derived (stem analysis) -- ditto
+#     "marks": [...], "tracks": [...]            # user data -- ALWAYS kept
+#   }
+#
+# Marks/tracks are deliberately NOT invalidated when the media file's
+# mtime/size change (the old separate -marks.json was): they're the
+# user's own work, and re-copying/restoring an audio file shouldn't make
+# them silently disappear. Only the derived waveform/regions data is
+# recomputed.
+#
+# Replaces the older "<file>-waveform-cache.json" + "<file>-marks.json"
+# pair; those are migrated on first load and then removed.
+# ---------------------------------------------------------------------------
+
+CACHE_SUFFIX = "-cache.json"
+WAVEFORM_CACHE_RESOLUTION = 4000  # buckets in the cached full-file overview (as in media_utils.py)
+CACHE_FORMAT = 2
+_DERIVED_KEYS = ("duration", "peaks", "regions", "genre_mood")
+_cache_lock = threading.RLock()
+
+
+def cache_path(media_path: str) -> str:
+    return _sidecar_path(media_path, CACHE_SUFFIX, use_stem=True)
+
+
+def _source_identity(media_path: str) -> Dict[str, Any]:
     try:
-        if not os.path.exists(cache_path):
-            return None
-        with open(cache_path, "r", encoding="utf-8") as f:
+        return {"source_mtime": os.path.getmtime(media_path), "source_size": os.path.getsize(media_path)}
+    except OSError:
+        return {"source_mtime": None, "source_size": None}
+
+
+def _read_json(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if data.get("source_mtime") != os.path.getmtime(media_path):
-            return None
-        if data.get("source_size") != os.path.getsize(media_path):
-            return None
-        peaks = [tuple(p) for p in data.get("peaks", [])]
-        duration = data.get("duration")
-        if not peaks or not duration:
-            return None
-        return {"duration": duration, "peaks": peaks}
+        return data if isinstance(data, dict) else None
     except Exception:
         return None
+
+
+def _write_json_atomic(path: str, data: Dict[str, Any]) -> bool:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = f"{path}.tmp{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def _migrate_old_sidecars(media_path: str) -> Optional[Dict[str, Any]]:
+    """Build a combined cache from the older two-file layout, if present.
+    Returns the new dict (already written) or None if nothing to migrate."""
+    old_wave = _sidecar_path(media_path, "-waveform-cache.json")
+    old_marks = _sidecar_path(media_path, "-marks.json")
+    wave = _read_json(old_wave) if os.path.exists(old_wave) else None
+    marks = _read_json(old_marks) if os.path.exists(old_marks) else None
+    if wave is None and marks is None:
+        return None
+    ident = _source_identity(media_path)
+    data: Dict[str, Any] = {"format": CACHE_FORMAT, **ident, "marks": [], "tracks": []}
+    if wave and wave.get("source_mtime") == ident["source_mtime"] \
+            and wave.get("source_size") == ident["source_size"]:
+        data["duration"] = wave.get("duration")
+        data["peaks"] = wave.get("peaks", [])
+    if marks:
+        # Keep marks even if the old file thought they were stale.
+        data["marks"] = marks.get("marks", [])
+        data["tracks"] = marks.get("tracks", [])
+    if not _write_json_atomic(cache_path(media_path), data):
+        return data  # couldn't write the new file: leave the old ones alone
+    for old in (old_wave, old_marks):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return data
+
+
+def load_cache(media_path: str) -> Dict[str, Any]:
+    """The whole combined cache for this media file ({} if none), with
+    derived sections stripped if the media file changed since they were
+    computed. Migrates the old two-file layout on first use."""
+    with _cache_lock:
+        path = cache_path(media_path)
+        data = _read_json(path) if os.path.exists(path) else None
+        if data is None:
+            data = _migrate_old_sidecars(media_path) or {}
+        data = dict(data)
+        ident = _source_identity(media_path)
+        if data and (data.get("source_mtime") != ident["source_mtime"]
+                     or data.get("source_size") != ident["source_size"]):
+            for key in _DERIVED_KEYS:
+                data.pop(key, None)
+        return data
+
+
+def update_cache(media_path: str, **sections: Any) -> bool:
+    """Read-modify-write the combined cache, replacing just the given
+    top-level sections (e.g. marks=..., tracks=... or peaks=...). Safe to
+    call from the loader/analysis threads and the UI thread."""
+    with _cache_lock:
+        path = cache_path(media_path)
+        data = (_read_json(path) if os.path.exists(path) else None) \
+            or _migrate_old_sidecars(media_path) or {}
+        ident = _source_identity(media_path)
+        if data.get("source_mtime") != ident["source_mtime"] or data.get("source_size") != ident["source_size"]:
+            for key in _DERIVED_KEYS:
+                data.pop(key, None)
+        data.update(ident)
+        data["format"] = CACHE_FORMAT
+        data.update(sections)
+        return _write_json_atomic(path, data)
+
+
+def load_waveform_cache(media_path: str) -> Optional[Dict[str, Any]]:
+    """{"duration":..., "peaks":[...]} if cached and current, else None."""
+    data = load_cache(media_path)
+    peaks = [tuple(p) for p in data.get("peaks", [])]
+    duration = data.get("duration")
+    if not peaks or not duration:
+        return None
+    return {"duration": duration, "peaks": peaks}
 
 
 def save_waveform_cache(media_path: str, duration: float, peaks: List[Tuple[float, float]]) -> None:
-    cache_path = _sidecar_path(media_path, "-waveform-cache.json")
-    try:
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        data = {
-            "source_mtime": os.path.getmtime(media_path),
-            "source_size": os.path.getsize(media_path),
-            "duration": duration,
-            "peaks": peaks,
-        }
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception:
-        pass  # caching is best-effort
+    update_cache(media_path, duration=duration, peaks=[list(p) for p in peaks])
+
+
+def load_regions(media_path: str) -> List[Dict[str, Any]]:
+    return list(load_cache(media_path).get("regions", []))
+
+
+def save_regions(media_path: str, regions: List[Dict[str, Any]]) -> None:
+    update_cache(media_path, regions=regions)
 
 
 def load_marks(media_path: str) -> List[Dict[str, Any]]:
-    """Return the persisted marks list for this media file, or [] if none
-    exist or the file has changed since they were saved."""
-    data = _load_marks_file(media_path)
-    return data.get("marks", []) if data else []
+    return list(load_cache(media_path).get("marks", []))
 
 
 def load_tracks(media_path: str) -> List[Dict[str, Any]]:
-    data = _load_marks_file(media_path)
-    return data.get("tracks", []) if data else []
-
-
-def _load_marks_file(media_path: str) -> Optional[Dict[str, Any]]:
-    path = _sidecar_path(media_path, "-marks.json")
-    try:
-        if not os.path.exists(path):
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if data.get("source_mtime") != os.path.getmtime(media_path):
-            return None
-        if data.get("source_size") != os.path.getsize(media_path):
-            return None
-        return data
-    except Exception:
-        return None
+    return list(load_cache(media_path).get("tracks", []))
 
 
 def save_marks(media_path: str, marks: List[Dict[str, Any]],
-                tracks: Optional[List[Dict[str, Any]]] = None) -> None:
-    path = _sidecar_path(media_path, "-marks.json")
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        data = {
-            "source_mtime": os.path.getmtime(media_path),
-            "source_size": os.path.getsize(media_path),
-            "marks": marks,
-            "tracks": tracks or [],
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception:
-        pass  # best-effort, same as the waveform cache
+               tracks: Optional[List[Dict[str, Any]]] = None) -> None:
+    update_cache(media_path, marks=marks, tracks=tracks or [])
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +1502,11 @@ def export_timing_tracks(path: str, tracks_with_marks: List[Tuple[str, List[Dict
 class PlaybackEngine:
     """Common interface both playback backends implement."""
 
+    volume = 1.0  # 1.0 = as recorded; applied to the next play_segment()
+
+    def set_volume(self, volume: float) -> None:
+        self.volume = max(0.0, min(2.0, float(volume)))
+
     def load(self, media_path: str) -> bool:
         """Called once when a new file is opened/selected. Returns True
         if this engine is able to play the file at all."""
@@ -935,6 +1591,8 @@ class SoundDevicePlaybackEngine(PlaybackEngine):
             new_len = max(1, int(len(chunk) / speed))
             idx = np.linspace(0, len(chunk) - 1, new_len).astype(int)
             chunk = chunk[idx]
+        if abs(self.volume - 1.0) > 1e-3 and HAS_NUMPY:
+            chunk = np.clip(chunk * self.volume, -1.0, 1.0).astype(np.float32)
         try:
             sd.stop()
             sd.play(chunk, sr, blocking=False)
@@ -996,8 +1654,13 @@ class FfplayPlaybackEngine(PlaybackEngine):
             cmd += ["-ss", f"{start:.3f}"]
         if duration is not None:
             cmd += ["-t", f"{duration:.3f}"]
+        filters = []
         if abs(speed - 1.0) > 1e-6:
-            cmd += ["-af", f"atempo={speed:.4f}"]
+            filters.append(f"atempo={speed:.4f}")
+        if abs(self.volume - 1.0) > 1e-3:
+            filters.append(f"volume={self.volume:.2f}")
+        if filters:
+            cmd += ["-af", ",".join(filters)]
         cmd.append(self._media_path)
         try:
             self._process = subprocess.Popen(

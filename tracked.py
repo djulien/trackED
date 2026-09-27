@@ -25,10 +25,16 @@ python main.py
 # Start completely clean (ignore previous session)
 python main.py -fresh
 
-# Enable debug log (level 1) in its own tab
-python main.py -debug
+# Debug log: by default uses the "debug_level" preference (factory
+# default 10; also settable in Edit > Preferences). For this run only:
+python main.py -debug          # level 1
 python main.py -debug 5
 python main.py -debug=20
+python main.py -nodebug        # off (same as -debug 0)
+# Change the stored default (and use it now):
+python main.py -debug-default 3
+python main.py -debug-default=0
+python main.py -debug-default  # reset to the factory default (10)
 
 # Open specific files (and still restore session unless -fresh is also given)
 python main.py notes.txt todo.md
@@ -45,7 +51,9 @@ rm -r __pycache__
 
 from __future__ import annotations
 
+import re
 import sys
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import webbrowser
@@ -73,6 +81,7 @@ from utils import (
     load_recent, add_recent, load_session_data, save_session_data,
     about_text, documentation_url, abbreviated_name,
     get_max_recent, set_preference, get_preference,
+    get_default_debug_level, set_default_debug_level, get_autosave_seconds, get_stem_min_seconds,
 #    find_create_tab_plugin,
 )
 #TODO: remove find_create_tab_plugin if main no longer uses create_tab for logs.
@@ -90,6 +99,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Custom notebook with a red close (✕) element on every tab
 # ---------------------------------------------------------------------------
+
+TAB_ROW_BG = "#b4b4b4"       # empty area of the tab row
+TAB_BG = "#d6d6d6"
+TAB_ACTIVE_BG = "#e2e2e2"
+TAB_SELECTED_BG = "#f2f2f2"
+
 
 class CustomNotebook(ttk.Notebook):
     """ttk.Notebook with a red close element on every tab."""
@@ -127,14 +142,14 @@ class CustomNotebook(ttk.Notebook):
         #    ):
         #        self._img_close.put("#c0392b", (x, y))
 
-        # Programmatic 12×12 red X (no external image file needed)
+        # Programmatic 12×12 red X, 2-3 px thick (no external image file needed)
         self._img_close = tk.PhotoImage(width=12, height=12)
-        red = "#c0392b"
-        for x, y in (
-            (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9),
-            (9, 2), (8, 3), (7, 4), (6, 5), (5, 6), (4, 7), (3, 8), (2, 9),
-        ):
-            self._img_close.put(red, (x, y))
+        red = "#d0021b"
+        for i in range(2, 10):
+            for x, y in ((i, i), (i + 1, i), (i, i + 1),                    # "\\" stroke
+                         (11 - i, i), (10 - i, i), (11 - i, i + 1)):       # "/" stroke
+                if 0 <= x < 12 and 0 <= y < 12:
+                    self._img_close.put(red, (x, y))
         self._img_closepressed = self._img_close
         self._img_closeactive = self._img_close
 
@@ -149,6 +164,12 @@ class CustomNotebook(ttk.Notebook):
             pass  # element already exists from a previous instance
 
         style.layout("CustomNotebook", [("CustomNotebook.client", {"sticky": "nswe"})])
+        # A slightly darker strip behind the tabs, so the empty part of the
+        # tab row recedes; tabs stay light, the selected one lightest.
+        # (Some native themes, e.g. Windows "vista", ignore these colors.)
+        style.configure("CustomNotebook", background=TAB_ROW_BG)
+        style.configure("CustomNotebook.Tab", background=TAB_BG)
+        style.map("CustomNotebook.Tab", background=[("selected", TAB_SELECTED_BG), ("active", TAB_ACTIVE_BG)])
         style.layout("CustomNotebook.Tab", [
             ("CustomNotebook.tab", {
                 "sticky": "nswe",
@@ -231,12 +252,12 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         self,
         files_to_open: Optional[List[str]] = None,
         fresh: bool = False,
-        debug_level: int = 0,
+        debug_level: Optional[int] = None,
     ):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1000x700")
         self.minsize(400, 300)
+        self._restore_window_geometry()
 
 #        self.tabs: List[Union[EditorTab, DebugTab]] = []
         self.tabs: List[EditorTab] = []
@@ -246,6 +267,8 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         self._debug_tab: Optional[EditorTab] = None
         self._last_tab = None
 
+        if debug_level is None:
+            debug_level = get_default_debug_level()   # persistent preference
         set_debug_level(debug_level)   # truncates/creates debug.log, stores level
         if debug_level > 0:
             debug(1, f"{{pink}}Starting {APP_NAME} v{VERSION}  debug_level={debug_level}")
@@ -265,6 +288,10 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         # Restore previous session (unless -fresh) then open any CLI files
         self.after(50, self._startup_open)
         self.protocol("WM_DELETE_WINDOW", self.on_quit)
+        # Auto-save: checked every second so a changed interval in
+        # Preferences takes effect right away.
+        self._last_autosave = time.monotonic()
+        self.after(1000, self._autosave_tick)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -687,11 +714,44 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         For editable tab load, path B will strip file’s {red} markers after load.
         To keep them editable, run a highlighter over existing text instead of stripping on insert.
         """
-        tab = self.current_tab()
+        return self._save_tab(self.current_tab(), interactive=True)
+
+    def _save_tab(self, tab, interactive: bool = True) -> bool:
+        """The one save path, used by File > Save, the close/quit prompts
+        and auto-save.
+          - tab.save_hook (plugin views such as audio): the plugin saves its
+            own changes (timing marks -> the sidecar cache); the media file
+            itself is never written.
+          - tab.protect_file with no hook (e.g. images): the text panel is
+            just a description -- nothing to save, never written over the file.
+          - otherwise: write the text to the file.
+        interactive=False (auto-save) never shows dialogs and skips
+        untitled tabs."""
         if not isinstance(tab, EditorTab):
             return False
+        hook = getattr(tab, "save_hook", None)
+        if hook is not None:
+            try:
+                ok = bool(hook())
+            except Exception as e:
+                ok = False
+                if interactive:
+                    messagebox.showerror("Save Error", str(e))
+                debug(1, f"Save failed: {e}")
+            if ok:
+                tab.mark_clean()
+                self.status.configure(text=f"Saved changes for {abbreviated_name(tab.filepath)}")
+                self._update_title()
+            return ok
+        if getattr(tab, "protect_file", False):
+            # The text panel is a generated view; writing it to tab.filepath
+            # would destroy the file.
+            if interactive:
+                messagebox.showinfo("Save", "This file is shown through a plugin view and has "
+                                            "nothing to save as text.")
+            return False
         if not tab.filepath:
-            return self.save_file_as()
+            return self.save_file_as() if interactive else False
         try:
             Path(tab.filepath).write_text(tab.get_content(), encoding="utf-8")
             tab.mark_clean()
@@ -702,9 +762,79 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             debug(1, f"Saved {tab.filepath}")
             return True
         except Exception as e:
-            messagebox.showerror("Save Error", str(e))
+            if interactive:
+                messagebox.showerror("Save Error", str(e))
             debug(1, f"Save failed: {e}")
             return False
+
+    # ------------------------------------------------------------------ window size
+    def _restore_window_geometry(self) -> None:
+        """Last session's window size/position (kept on screen), and
+        maximized state; 1000x700 the first time."""
+        geom = get_preference("window_geometry", None)
+        m = re.match(r"^(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)$", geom or "")
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            x, y = int(m.group(3)), int(m.group(4))
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            w, h = max(400, min(w, sw)), max(300, min(h, sh))
+            x = max(0, min(x, sw - 100))
+            y = max(0, min(y, sh - 100))
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        else:
+            self.geometry("1000x700")
+        if get_preference("window_maximized", False):
+            try:
+                self.state("zoomed")               # Windows / macOS
+            except tk.TclError:
+                try:
+                    self.attributes("-zoomed", True)   # X11
+                except tk.TclError:
+                    pass
+
+    def _save_window_geometry(self) -> None:
+        try:
+            maximized = self.state() == "zoomed"
+            if not maximized:
+                try:
+                    maximized = bool(self.attributes("-zoomed"))
+                except tk.TclError:
+                    pass
+            set_preference("window_maximized", maximized)
+            if not maximized:   # keep the normal size for when it's un-maximized
+                set_preference("window_geometry", self.geometry())
+        except tk.TclError:
+            pass
+
+    def _autosave_tick(self) -> None:
+        """Every second: save each dirty tab whose FIRST unsaved change is
+        at least the Preferences interval old (tab.dirty_since) -- so the
+        delay always runs from the change, per tab, not from a global
+        timer. Same path as File > Save; plugin views like audio save only
+        their sidecar data."""
+        try:
+            interval = get_autosave_seconds()
+            now = time.monotonic()
+            saved = []
+            if interval > 0:
+                for tab in list(self.tabs):
+                    if not (isinstance(tab, EditorTab) and tab.dirty and tab is not self._debug_tab
+                            and (tab.filepath or getattr(tab, "save_hook", None))):
+                        continue
+                    since = getattr(tab, "dirty_since", None)
+                    if since is None:          # dirty without a timestamp: start counting now
+                        tab.dirty_since = now
+                        continue
+                    if now - since >= interval and self._save_tab(tab, interactive=False):
+                        saved.append(tab)
+                    elif hasattr(tab, "update_tab_label"):
+                        tab.update_tab_label((now - since) / interval)   # advance the countdown dial
+            if saved:
+                names = ", ".join(abbreviated_name(t.filepath) for t in saved)
+                self.status.configure(text=f"Auto-saved {names}")
+                debug(2, f"Auto-saved {names}")
+        finally:
+            self.after(1000, self._autosave_tick)
 
     def save_file_as(self) -> bool:
         tab = self.current_tab()
@@ -717,6 +847,15 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         )
         if not path:
             return False
+        if getattr(tab, "protect_file", False):
+            # Export the panel text as a copy; the tab stays on its audio file.
+            try:
+                Path(path).write_text(tab.get_content(), encoding="utf-8")
+                self.status.configure(text=f"Saved text copy to {path}")
+                return True
+            except Exception as e:
+                messagebox.showerror("Save Error", str(e))
+                return False
         tab.set_filepath(path)
         return self.save_file()
 
@@ -725,6 +864,13 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             tab = self.current_tab()
         if not tab:
             return
+
+        hook = getattr(tab, "before_close_hook", None)
+        if callable(hook):
+            if isinstance(tab, EditorTab):
+                self.notebook.select(tab.frame)
+            if not hook():          # e.g. a question about unassigned timing marks; False = cancel
+                return
 
         if isinstance(tab, EditorTab) and tab.dirty:
             name = abbreviated_name(tab.filepath)
@@ -773,6 +919,9 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         tab = self.current_tab()
         if isinstance(tab, EditorTab) and tab.filepath:
             name = abbreviated_name(tab.filepath, 40)
+            detail = getattr(tab, "title_detail", None)
+            if detail:  # e.g. an audio file's total duration
+                name = f"{name} ({detail})"
             dirty = " *" if tab.dirty else ""
             self.title(f"{name}{dirty} – {APP_NAME}")
 #        elif isinstance(tab, DebugTab):
@@ -819,6 +968,29 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         spin = ttk.Spinbox(frm, from_=1, to=100, width=6, textvariable=max_var)
         spin.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=4)
 
+        ttk.Label(frm, text="Default debug level:").grid(row=1, column=0, sticky="w", pady=4)
+        dbg_var = tk.StringVar(value=str(get_default_debug_level()))
+        dbg_spin = ttk.Spinbox(frm, from_=0, to=99, width=6, textvariable=dbg_var)
+        dbg_spin.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
+        ttk.Label(frm, text="(0 = off; takes effect next start;\n -debug N on the command line overrides)",
+                  foreground="#666666").grid(row=2, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(frm, text="Auto-save every (seconds):").grid(row=3, column=0, sticky="w", pady=(10, 4))
+        auto_var = tk.StringVar(value=str(get_autosave_seconds()))
+        ttk.Spinbox(frm, from_=0, to=3600, width=6, textvariable=auto_var).grid(
+            row=3, column=1, sticky="w", padx=(8, 0), pady=(10, 4))
+        ttk.Label(frm, text="(0 = off. Text files are written; audio files only save\n"
+                            " their marks/tracks sidecar -- the audio is never touched)",
+                  foreground="#666666").grid(row=4, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(frm, text="Shortest stem region (seconds):").grid(row=5, column=0, sticky="w", pady=(10, 4))
+        stem_var = tk.StringVar(value=f"{get_stem_min_seconds():g}")
+        ttk.Spinbox(frm, from_=0, to=30, increment=0.25, width=6, textvariable=stem_var).grid(
+            row=5, column=1, sticky="w", padx=(8, 0), pady=(10, 4))
+        ttk.Label(frm, text="(shorter vocal / non-vocal changes are merged into their\n"
+                            " neighbors; applies to audio tabs right away)",
+                  foreground="#666666").grid(row=6, column=0, columnspan=2, sticky="w")
+
         def on_ok():
             try:
                 val = int(max_var.get())
@@ -826,6 +998,22 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             except ValueError:
                 val = 10
             set_preference("max_recent", val)
+            try:
+                set_default_debug_level(int(dbg_var.get()))
+            except ValueError:
+                pass
+            try:
+                set_preference("autosave_seconds", max(0, min(3600, int(auto_var.get()))))
+            except ValueError:
+                pass
+            try:
+                set_preference("stem_min_seconds", max(0.0, min(30.0, float(stem_var.get()))))
+                for t in self.tabs:          # re-smooth open audio tabs' stem regions
+                    ctl = getattr(getattr(t, "canvas", None), "_waveform_controller", None)
+                    if ctl is not None:
+                        ctl.resmooth_regions()
+            except ValueError:
+                pass
             from utils import save_recent
             save_recent(load_recent())
             self._rebuild_recent_menu()
@@ -836,7 +1024,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             win.destroy()
 
         btn_frm = ttk.Frame(frm)
-        btn_frm.grid(row=1, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        btn_frm.grid(row=7, column=0, columnspan=2, pady=(12, 0), sticky="e")
         ttk.Button(btn_frm, text="OK", command=on_ok).pack(side="right", padx=(4, 0))
         ttk.Button(btn_frm, text="Cancel", command=on_cancel).pack(side="right")
 
@@ -853,6 +1041,9 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
     def undo(self) -> None:
         tab = self.current_tab()
         if isinstance(tab, EditorTab):
+            if getattr(tab, "undo_hook", None):   # e.g. timing marks in an audio tab
+                tab.undo_hook()
+                return
             try:
                 tab.text.edit_undo()
             except tk.TclError:
@@ -861,6 +1052,9 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
     def redo(self) -> None:
         tab = self.current_tab()
         if isinstance(tab, EditorTab):
+            if getattr(tab, "redo_hook", None):
+                tab.redo_hook()
+                return
             try:
                 tab.text.edit_redo()
             except tk.TclError:
@@ -949,6 +1143,12 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
     def on_quit(self) -> None:
         # Ask about every dirty tab
         for tab in list(self.tabs):
+            hook = getattr(tab, "before_close_hook", None)
+            if callable(hook):
+                if isinstance(tab, EditorTab):
+                    self.notebook.select(tab.frame)
+                if not hook():
+                    return
             if isinstance(tab, EditorTab) and tab.dirty:
                 self.notebook.select(tab.frame)
                 name = abbreviated_name(tab.filepath)
@@ -967,21 +1167,41 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
                 tab.save_cursor_state()
 
         # Remember open files for next launch
+        self._save_window_geometry()
         save_session_data(self._collect_session())
         debug(1, "{{pink}}Session saved, exiting")
         self.destroy()
 
 
 def parse_args(argv: List[str]):
-    """Return (files, fresh, debug_level)."""
+    """Return (files, fresh, debug_level). debug_level is None when the
+    command line doesn't set one (use the stored preference). The
+    -debug-default option updates that stored preference as a side
+    effect (and is then used for this run too)."""
     fresh = False
-    debug_level = 0
+    debug_level: Optional[int] = None
     files = []
     i = 1
     while i < len(argv):
         arg = argv[i]
         if arg == "-fresh":
             fresh = True
+        elif arg == "-nodebug":
+            debug_level = 0
+        elif arg == "-debug-default" or arg.startswith("-debug-default="):
+            value: Optional[int] = None
+            if "=" in arg:
+                try:
+                    value = int(arg.split("=", 1)[1])
+                except ValueError:
+                    value = None
+            elif i + 1 < len(argv) and argv[i + 1].isdigit():
+                value = int(argv[i + 1])
+                i += 1
+            stored = set_default_debug_level(value)   # None -> factory reset
+            print(f"default debug level set to {stored}")
+            if debug_level is None:
+                debug_level = stored
         elif arg == "-debug":
             # next token may be the level
             if i + 1 < len(argv) and argv[i + 1].isdigit():
