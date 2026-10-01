@@ -19,7 +19,7 @@ Also (v1.1):
     shows its marks in the text panel with editable start/end/text,
     -/+/@ time buttons, Split (text-proportional) and Merge.
   - Ctrl+click places a time cursor; Shift+Play loops the selection.
-  - Everything per-file lives in one "<stem>-cache.json" (see
+  - Everything per-file lives in one "<stem>-tracked.json" (see
     timing_helpers.load_cache).
 
 Ported from the Sequence Editor project's tabs.py (an earlier, standalone
@@ -81,7 +81,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, colorchooser, filedialog
 
 from logview_tab import debug
-from utils import insert_styled_text, get_preference, set_preference, get_stem_min_seconds
+from utils import MOD_HINT_COLORS, current_modifiers, crumb
+from utils import (insert_styled_text, get_preference, set_preference, get_stem_min_seconds, get_autosave_seconds,
+                   get_edge_lead_in, register_modifier_button, register_modifier_listener)
 
 import timing_helpers as th
 import audio_analysis as aa
@@ -114,6 +116,7 @@ CURSOR_PLAY_COLOR = "#ffffff"   # the @cursor while playing (not red: red is a p
 SHIFT_MASK = 0x0001
 CONTROL_MASK = 0x0004
 AUDIO_EXTS = {".mp3", ".mp4", ".wav"}
+FILE_TYPES = [("Audio", " ".join(f"*{e}" for e in sorted(AUDIO_EXTS)))]   # File > Open (tracked.py)
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +483,7 @@ class WaveformController:
     TRACK_HEIGHT = 30
     STATUS_ROW_HEIGHT = 22  # combined status / new-track drop row under the waveform
     OVERSHOOT_FACTOR = 1.1  # zooming out past "fit" shows this much of the duration (10% past the end)
+    DRAG_SNAP_STEPS = 200   # dragging a mark snaps to a "nice" step of about 1/200 of the view (Shift: no snap)
     SEEK_CLICK_WINDOW = 0.6  # s: a skip click this soon after a double/triple-click seek repeats the seek
     TRACK_PALETTE = ["#3a86ff", "#ff6b6b", "#51cf66", "#ffb703"]
     SELECTION_COLOR = "#ffe066"
@@ -505,6 +509,9 @@ class WaveformController:
         # -- marks/tracks state --
         self.marks = th.load_marks(filepath)
         self.tracks = th.load_tracks(filepath)
+        # Voice names for this file; marks list theirs in mark["voices"].
+        self.voices = th.merge_voice_lists(th.load_voices(filepath),
+                                           *[m.get("voices") for m in self.marks])
         self.selected = None   # ("mark", id) | ("track", id) | None
         self._hover = None
         self._mark_hit_regions = {}
@@ -570,7 +577,7 @@ class WaveformController:
 
         # -- transport --
         self.play_back_btn = _tb_button(bar, "\u25c0\u25c0", lambda: self.skip_play(-5.0))
-        self.play_btn = _tb_button(bar, "\u25b6", self.toggle_play, width=2, fg=TB_ACCENT)
+        self.play_btn = _tb_button(bar, "\u25b6", self.toggle_play, width=2)
         self.play_stop_btn = _tb_button(bar, "\u25a0", self.stop_play)
         self.play_fwd_btn = _tb_button(bar, "\u25b6\u25b6", lambda: self.skip_play(5.0))
         for btn in (self.play_back_btn, self.play_btn, self.play_stop_btn, self.play_fwd_btn):
@@ -581,6 +588,7 @@ class WaveformController:
         # the class binding that invokes the command).
         for btn in (self.play_back_btn, self.play_fwd_btn):
             btn.bind("<ButtonRelease-1>", lambda e: setattr(self, "_skip_mods", e.state), add="+")
+            register_modifier_button(btn, ("control", "shift"))     # skip_play checks Ctrl first
         _Tooltip(self.play_btn, "Play / pause from the @cursor\n"
                                 "Shift+click: loop (from the @cursor to the end of the selected range,\n"
                                 "or the selected mark from its start) until Reset")
@@ -591,6 +599,7 @@ class WaveformController:
         # (widget bindings run before the class binding that invokes the
         # command), and show a loop cursor while Shift is held over it.
         self.play_btn.bind("<ButtonRelease-1>", self._on_play_btn_release, add="+")
+        register_modifier_button(self.play_btn, ("shift",))
         self.play_btn.bind("<Enter>", lambda e: self._set_play_cursor(bool(e.state & SHIFT_MASK)), add="+")
         self.play_btn.bind("<Motion>", lambda e: self._set_play_cursor(bool(e.state & SHIFT_MASK)), add="+")
         self.play_btn.bind("<Leave>", lambda e: self._set_play_cursor(False), add="+")
@@ -678,6 +687,7 @@ class WaveformController:
                                  "Shift+click to re-run even if cached.")
         self.stems_btn.bind("<ButtonRelease-1>",
                             lambda e: setattr(self, "_force_stems", bool(e.state & SHIFT_MASK)), add="+")
+        register_modifier_button(self.stems_btn, ("shift",))
         # Stems \u25be: turn the (non-empty) stem regions into timing tracks.
         self.stems_menu_btn, self.stems_menu = _tb_menubutton(right, "\u25be")
         self.stems_menu_btn.configure(padx=4)
@@ -688,12 +698,19 @@ class WaveformController:
         _Tooltip(self.stems_menu_btn, "Create timing tracks from the stem regions")
         self.mood_btn = _tb_button(right, "Mood", self.run_genre_mood)
         self.mood_btn.pack(side="left", padx=(0, 6))
+        self.mood_btn.bind("<ButtonRelease-1>",
+                           lambda e: setattr(self, "_force_mood", bool(e.state & SHIFT_MASK)), add="+")
+        register_modifier_button(self.mood_btn, ("shift",))
         _Tooltip(self.mood_btn, "Estimate the overall genre and mood (rule-based guess from tempo,\n"
-                                "loudness and spectrum; lyrics from Transcribe help). Needs librosa.")
+                                "loudness and spectrum; lyrics from Transcribe help). Needs librosa.\n"
+                                "The result is cached with the file until the audio file changes;\n"
+                                "Shift+click to re-run anyway (e.g. after adding lyrics).")
         self.transcribe_btn = _tb_button(right, "Transcribe", self.transcribe_selected)
         self.transcribe_btn.pack(side="left", padx=(0, 1))
-        _Tooltip(self.transcribe_btn, "Transcribe the vocal parts of the selected range with Whisper\n"
-                                      "and use the text as its label")
+        _Tooltip(self.transcribe_btn, "Transcribe with Whisper:\n"
+                                      "  a range selected \u2014 its vocals become the range's text (label)\n"
+                                      "  nothing selected \u2014 the whole song goes into a new \u201cTranscript\u201d\n"
+                                      "  timing track, one card per sung phrase")
         self.model_var = tk.StringVar()
         self._merge_var = tk.BooleanVar(value=bool(get_preference("stem_track_merge", True)))
         self.model_btn, self.model_menu = _tb_menubutton(right, "\u25be")
@@ -836,6 +853,7 @@ class WaveformController:
         # Ctrl+click / Ctrl+drag: place the time cursor (seek) without
         # creating a mark. More specific than <Button-1>, so Tk picks it.
         c.bind("<Control-Button-1>", self._on_ctrl_press)
+        register_modifier_listener(self._show_modifier_hint, c)
         c.bind("<Control-B1-Motion>", self._on_ctrl_drag)
         c.bind("<Control-ButtonRelease-1>", lambda e: "break")
         c.bind("<B1-Motion>", self._on_waveform_drag)
@@ -937,8 +955,11 @@ class WaveformController:
             refresh = getattr(self.tab, "refresh_title", None)
             if callable(refresh):
                 refresh()
+        view_restored = self.restore_view()      # zoom / scroll from last time
         self.render_waveform()
         self._set_zoom_controls_enabled(True)
+        self.restore_selection(reveal=not view_restored)   # the track / card selected last time
+        self._remembered_state = self._view_state()        # nothing new to save yet
         debug(2, f"{{green}}waveform_tab loaded {self.filepath}: {th.format_time_ms(duration)}")
         self._auto_stems()
 
@@ -1118,17 +1139,18 @@ class WaveformController:
 
     # ------------------------------------------------------------------ marks/tracks core
     def _mark_snapshot(self):
-        return (copy.deepcopy(self.marks), copy.deepcopy(self.tracks))
+        return (copy.deepcopy(self.marks), copy.deepcopy(self.tracks), list(self.voices))
 
     def _mark_changed(self, record_history=True):
         """Marks/tracks changed: flag the tab as having unsaved changes
         (tab label "*"). They're written to the media file's combined
-        "<stem>-cache.json" by File > Save, auto-save, or the close/quit
+        "<stem>-tracked.json" by File > Save, auto-save, or the close/quit
         prompt -- all through tab.save_hook = save_marks_now. The audio
         file itself is never written. Without a tab (standalone use) they
         are saved immediately, as before."""
         if record_history:
             self._push_mark_history()
+        self._sync_play_segment()
         mark_dirty = getattr(self.tab, "mark_dirty", None) if self.tab is not None else None
         if callable(mark_dirty):
             mark_dirty()
@@ -1136,9 +1158,92 @@ class WaveformController:
             self.save_marks_now()
 
     def save_marks_now(self):
-        """tab.save_hook: write marks/tracks to the sidecar cache."""
-        th.save_marks(self.filepath, self.marks, self.tracks)
+        """tab.save_hook: write marks/tracks to the sidecar cache -- after
+        applying whatever is typed in the cards but not yet committed."""
+        if self.panel is not None:
+            self.panel.commit_pending()
+        th.save_marks(self.filepath, self.marks, self.tracks, self.voices)
+        self.remember_selection()
+        if self.panel is not None and self.panel.has_pending():
+            # still typing a time in a card: keep the tab marked unsaved
+            # (tracked.py marks it clean right after this returns)
+            try:
+                self.canvas.after_idle(lambda: self._mark_tab_dirty())
+            except tk.TclError:
+                pass
         return True
+
+    def _mark_tab_dirty(self):
+        mark_dirty = getattr(self.tab, "mark_dirty", None) if self.tab is not None else None
+        if callable(mark_dirty):
+            mark_dirty()
+
+    def show_time(self, t):
+        """Scroll (not zoom) so time t is in view, if it isn't."""
+        if t is None or self.audio_duration is None:
+            return False
+        span = self.view_end - self.view_start
+        if self.view_start <= t <= self.view_end or span <= 0:
+            return False
+        new_start = max(0.0, min(self.audio_duration * self.OVERSHOOT_FACTOR - span, t - span * 0.05))
+        self.view_start, self.view_end = new_start, new_start + span
+        self._refresh_view_from_cache(render=False)
+        return True
+
+    def mark_at_playhead(self, track_id, pos, marks=None):
+        """The mark of this track the playhead is in: a range while
+        start <= pos < end; a point from its time until the next mark
+        starts. None in a gap."""
+        if pos is None:
+            return None
+        marks = self.track_marks(track_id) if marks is None else marks
+        current = None
+        for m in marks:
+            if m["start"] > pos + 1e-9:
+                break
+            if m["type"] == "range" and m.get("end") is not None:
+                current = m if pos < m["end"] else None
+            else:
+                current = m
+        return current["id"] if current else None
+
+    def _update_play_highlight(self, pos):
+        """While playing, light up the card the playhead is in (when the
+        text panel shows a track's cards)."""
+        panel = self.panel
+        if panel is None or getattr(panel, "mode", None) != "track" or not panel.track_id:
+            return
+        mid = None
+        if pos is not None and self._play_state == "playing":
+            mid = self.mark_at_playhead(panel.track_id, pos, panel.visible_marks(panel.track_id))
+        panel.set_playing_mark(mid)
+
+    def _sync_play_segment(self):
+        """A card's mark is playing (or looping, or paused) and its times
+        changed: play the new span -- the loop repeats the new start..end,
+        and a position now outside it jumps to the new start."""
+        mid = self._play_mark_id
+        if mid is None or self._play_state == "stopped":
+            return
+        mark = self.mark_by_id(mid)
+        if mark is None:
+            return
+        is_range = mark["type"] == "range" and mark.get("end") is not None
+        start, end = mark["start"], (mark["end"] if is_range else None)
+        if (start, end) == (self._play_seg_start, self._play_seg_end):
+            return
+        self._play_seg_start, self._play_seg_end = start, end
+        self._play_origin = start
+        if self._play_state == "playing":
+            pos = self.current_play_position() or start
+            if pos < start or (end is not None and pos >= end - 0.01):
+                pos = start
+            self._halt_engine()
+            self.cursor_time = pos
+            self._run_engine_from(pos)
+        else:                   # paused: keep the cursor inside the span
+            if self.cursor_time < start or (end is not None and self.cursor_time > end):
+                self.cursor_time = start
 
     def _push_mark_history(self):
         del self._mark_history[self._mark_history_index + 1:]
@@ -1158,7 +1263,7 @@ class WaveformController:
         if not self.can_undo_marks():
             return
         self._mark_history_index -= 1
-        self.marks, self.tracks = copy.deepcopy(self._mark_history[self._mark_history_index])
+        self.marks, self.tracks, self.voices = copy.deepcopy(self._mark_history[self._mark_history_index])
         self._keep_selection_if_present()
         self._hover = None
         self._mark_changed(record_history=False)
@@ -1182,7 +1287,7 @@ class WaveformController:
         if not self.can_redo_marks():
             return
         self._mark_history_index += 1
-        self.marks, self.tracks = copy.deepcopy(self._mark_history[self._mark_history_index])
+        self.marks, self.tracks, self.voices = copy.deepcopy(self._mark_history[self._mark_history_index])
         self._keep_selection_if_present()
         self._hover = None
         self._mark_changed(record_history=False)
@@ -1261,7 +1366,10 @@ class WaveformController:
     def before_close(self):
         """tab.before_close_hook: marks still in the work area (not in any
         track)? Offer to move them into a new track, delete them, or leave
-        them for next time. Returns False if the user cancels the close."""
+        them for next time. Returns False if the user cancels the close.
+        Also saves the selection if it changed since the last save."""
+        if self.selection_needs_saving():
+            self.remember_selection()
         loose = [m for m in self.marks if m.get("track_id") is None]
         if not loose:
             return True
@@ -1431,7 +1539,11 @@ class WaveformController:
 
     def select_mark(self, mark_id, from_panel=False):
         mark = self.mark_by_id(mark_id)
-        if mark is None or self.selected == ("mark", mark_id):
+        if mark is None:
+            return
+        if self.selected == ("mark", mark_id):
+            if from_panel:              # focus moved within the card, or back to it
+                self.reveal_mark(mark_id)
             return
         self.selected = ("mark", mark_id)
         self._ensure_mark_visible(mark)
@@ -1474,17 +1586,26 @@ class WaveformController:
         return self._play_state
 
     # ------------------------------------------------------------------ edits used by the panel / menus
+    def max_mark_time(self):
+        """How far past the end of the audio a mark may reach: 10% (the
+        same as zooming out past "fit"), e.g. to line up ranges without
+        changing their durations."""
+        if self.audio_duration is None:
+            return float("inf")
+        return self.audio_duration * self.OVERSHOOT_FACTOR
+
     def set_mark_times(self, mark_id, start, end):
         """Set a mark's start and end (end None -> point). Returns False
-        (and changes nothing) if the values are out of range."""
+        (and changes nothing) if the values are out of range (marks may
+        reach up to 10% past the end of the audio, see max_mark_time)."""
         mark = self.mark_by_id(mark_id)
         if mark is None:
             return False
-        duration = self.audio_duration or float("inf")
-        if start is None or start < 0 or start > duration:
+        limit = self.max_mark_time()
+        if start is None or start < 0 or start > limit:
             return False
         if end is not None:
-            if end > duration + 1e-6 or end - start < th.MIN_RANGE - 1e-9:
+            if end > limit + 1e-6 or end - start < th.MIN_RANGE - 1e-9:
                 return False
             mark["type"], mark["start"], mark["end"] = "range", float(start), float(end)
         else:
@@ -1493,11 +1614,182 @@ class WaveformController:
         self.render_waveform()
         return True
 
+    REST_GAP_TOLERANCE = 0.001      # marks closer than this count as touching
+
+    def previous_in_track(self, mark_id):
+        mark = self.mark_by_id(mark_id)
+        if mark is None or mark.get("track_id") is None:
+            return None
+        in_track = self.track_marks(mark["track_id"])
+        i = in_track.index(mark)
+        return in_track[i - 1] if i > 0 else None
+
+    def set_mark_start_joined(self, mark_id, start, mode="all"):
+        """Set a mark's Start and make the previous mark in its track end
+        right there (the card's <Join button) -- one undo step. mode
+        "group": only if the two marks were touching; "all": always (a
+        gap closes). The previous mark must keep at least the minimum
+        length. False (nothing changed) if a time is invalid."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None or start is None:
+            return False
+        prev = self.previous_in_track(mark_id)
+        if mode == "group" and prev is not None:
+            prev_end = prev["end"] if prev["type"] == "range" and prev.get("end") is not None else prev["start"]
+            if abs(mark["start"] - prev_end) > self.REST_GAP_TOLERANCE:
+                is_range = mark["type"] == "range" and mark.get("end") is not None
+                return self.set_mark_times(mark_id, start, mark["end"] if is_range else None)
+        is_range = mark["type"] == "range" and mark.get("end") is not None
+        start = float(start)
+        if start < 0 or start > self.max_mark_time() or (is_range and mark["end"] - start < th.MIN_RANGE - 1e-9):
+            return False
+        if prev is not None and start - prev["start"] < th.MIN_RANGE - 1e-9:
+            return False
+        mark["start"] = start
+        if prev is not None:
+            prev["type"], prev["end"] = "range", start
+        self._mark_changed()
+        self.render_waveform()
+        return True
+
+    def rest_followers(self, mark_id, mode="all"):
+        """The marks that move with this one's End: "all" -> every later
+        mark in the track; "group" -> only the ones that follow on without a
+        gap (each starts where the one before ends, or earlier)."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None or mark.get("track_id") is None:
+            return []
+        in_track = self.track_marks(mark["track_id"])
+        followers = in_track[in_track.index(mark) + 1:]
+        if mode not in ("group", "gap"):
+            return followers
+        edge = mark["end"] if mark["type"] == "range" and mark.get("end") is not None else mark["start"]
+        chain = []
+        for m in followers:
+            if m["start"] - edge > self.REST_GAP_TOLERANCE:
+                break
+            chain.append(m)
+            edge = max(edge, m.get("end") or m["start"])
+        return chain
+
+    def set_mark_end_shifting(self, mark_id, end, mode="all"):
+        """Set a mark's End and move the following marks by the same
+        amount (the card's rest button: mode "all" = every later mark in
+        the track, "group" = up to the first gap) -- one undo step.
+        In "group" mode the moving block stops where it touches the next
+        mark (a further step then carries that one along too). Marks may
+        be pushed up to 10% past the end of the audio (max_mark_time);
+        beyond that they're squeezed against the limit (the End still
+        changes). False (nothing changed) if End is invalid."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None or end is None:
+            return False
+        followers = self.rest_followers(mark_id, mode)
+        old_end = mark["end"] if mark["type"] == "range" and mark.get("end") is not None else mark["start"]
+        limit = self.max_mark_time()
+        end = min(float(end), limit)
+        delta = end - old_end
+        if followers and delta > 0 and mode in ("group", "gap"):
+            in_track = self.track_marks(mark["track_id"])
+            after = in_track[in_track.index(followers[-1]) + 1:]
+            if after:
+                block_end = max((m.get("end") or m["start"]) for m in followers)
+                delta = min(delta, max(0.0, after[0]["start"] - block_end))
+        if followers and delta < 0:
+            delta = max(delta, -min(m["start"] for m in followers))
+        end = old_end + delta
+        if end - mark["start"] < th.MIN_RANGE - 1e-9:
+            return False
+        if abs(delta) < 1e-9:
+            return True
+        mark["type"], mark["end"] = "range", float(end)
+        for m in followers:
+            m["start"] = float(m["start"]) + delta
+            if m.get("end") is not None:
+                m["end"] = float(m["end"]) + delta
+        if delta > 0 and limit != float("inf"):
+            # squeeze anything pushed past the limit against it
+            for m in sorted(followers, key=lambda x: x["start"], reverse=True):
+                if m.get("end") is not None:
+                    m["end"] = min(m["end"], limit)
+                    m["start"] = min(m["start"], m["end"] - th.MIN_RANGE)
+                    limit = min(limit, m["end"])
+                else:
+                    m["start"] = min(m["start"], limit)
+        self._mark_changed()
+        self.render_waveform()
+        return True
+
+    # ------------------------------------------------------------------ audio edges
+    def edge_source(self, use_vocals=True):
+        """The audio to look for edges in: the vocals stem (the default --
+        cards are usually lyrics) when it's been separated and is current,
+        else (or with use_vocals=False, Shift+click) the full mix."""
+        if use_vocals and aa.stems_are_fresh(self.filepath):
+            return str(aa.stem_paths(self.filepath)[0])
+        return self.filepath
+
+    def rise_time(self, t, use_vocals=True, direction=1):
+        """Where a card's Start goes for the next/previous rising edge: the
+        edge found by edge_time, minus the lead-in (Preferences, default
+        0.15 s -- the sound usually starts a little before the detected
+        foot). The search starts from t + lead-in, so repeated clicks step
+        on to the next edge instead of finding the same one again."""
+        lead = get_edge_lead_in()
+        edge = self.edge_time(t + lead, "rise", use_vocals=use_vocals, direction=direction)
+        return None if edge is None else max(0.0, edge - lead)
+
+    def edge_time(self, t, kind, use_vocals=True, direction=1):
+        """Time of the next (direction 1) or previous (-1) audio edge
+        from t: kind "rise" = foot of a rising edge (an onset), "fall" =
+        bottom of a falling edge. Looks at a few seconds at a time, up to
+        ~20 s away. None if there's none (or the audio can't be read)."""
+        if self.audio_duration is None:
+            return None
+        path = self.edge_source(use_vocals)
+        buckets = int(round(th.EDGE_WINDOW_SEC / th.EDGE_BUCKET_SEC))
+        step = th.EDGE_WINDOW_SEC - th.EDGE_CONTEXT_SEC
+        if direction > 0:
+            start = max(0.0, t - th.EDGE_CONTEXT_SEC)
+        else:
+            start = max(0.0, t + th.EDGE_CONTEXT_SEC - th.EDGE_WINDOW_SEC)
+        for _ in range(th.EDGE_MAX_LOOKS):
+            if start >= self.audio_duration:
+                break
+            length = min(th.EDGE_WINDOW_SEC, self.audio_duration - start)
+            try:
+                peaks = th.decode_waveform_peaks(path, start, length,
+                                                 max(20, int(buckets * length / th.EDGE_WINDOW_SEC)))
+            except Exception as exc:
+                debug(2, f"{{red}}edge search: {exc}")
+                return None
+            if not peaks:
+                return None
+            env, bucket = th.edge_envelope(peaks), length / len(peaks)
+            if direction > 0:
+                found = th.find_edge(env, start, bucket, t, kind)
+            else:
+                found = th.find_prev_edge(env, start, bucket, t, kind)
+            if found is not None:
+                return max(0.0, min(found, self.audio_duration))
+            if direction > 0:
+                start += step
+            else:
+                if start <= 0.0:
+                    break
+                start = max(0.0, start - step)
+        return None
+
     def set_mark_label(self, mark_id, label):
+        """Set a card's text. Lyrics entirely in parentheses on a card with
+        no voice yet get the parentheses voice (see paren_voice_for)."""
         mark = self.mark_by_id(mark_id)
         if mark is None:
             return False
         mark["label"] = label.strip()
+        if mark["label"] and not mark.get("voices") and \
+                th.in_parentheses(mark["label"], (0, len(mark["label"]))):
+            mark["voices"] = [self.paren_voice_for(mark)]
         self._mark_changed()
         self.render_waveform()
         return True
@@ -1515,6 +1807,9 @@ class WaveformController:
         if plan is None:
             return False
         (ls, le, ltext), (rs, re_, rtext) = plan["left"], plan["right"]
+        label = mark.get("label") or ""
+        lv = self._voices_for_piece(mark, label, th.find_span(label, ltext, 0))
+        rv = self._voices_for_piece(mark, label, th.find_span(label, rtext, len(ltext)))
         mark["start"], mark["end"], mark["label"] = ls, le, ltext
         mark["type"] = "range" if le is not None else "point"
         new = {
@@ -1522,6 +1817,11 @@ class WaveformController:
             "start": rs, "end": re_, "label": rtext, "track_id": mark.get("track_id"),
             "source": mark.get("source", "user"),
         }
+        for m_, v_ in ((mark, lv), (new, rv)):
+            if v_:
+                m_["voices"] = v_
+            else:
+                m_.pop("voices", None)
         self.marks.append(new)
         self._mark_changed()
         self.render_waveform()
@@ -1538,15 +1838,27 @@ class WaveformController:
         plan = th.plan_pieces(mark, spans)
         if not plan:
             return False
+        label = mark.get("label") or ""
+        piece_spans = [(a, b) for a, b in spans if label[a:b].strip()]
+        voices = [self._voices_for_piece(mark, label, sp) for sp in piece_spans]
+        if len(voices) != len(plan):
+            voices = [list(mark.get("voices") or [])] * len(plan)
         (s0, e0, t0), rest = plan[0], plan[1:]
         mark["start"], mark["end"], mark["label"] = s0, e0, t0
         mark["type"] = "range" if e0 is not None else "point"
-        for s1, e1, t1 in rest:
-            self.marks.append({
+        if voices[0]:
+            mark["voices"] = voices[0]
+        else:
+            mark.pop("voices", None)
+        for (s1, e1, t1), v1 in zip(rest, voices[1:]):
+            piece = {
                 "id": uuid.uuid4().hex[:8], "type": "range" if e1 is not None else "point",
                 "start": s1, "end": e1, "label": t1, "track_id": mark.get("track_id"),
                 "source": mark.get("source", "user"),
-            })
+            }
+            if v1:
+                piece["voices"] = v1
+            self.marks.append(piece)
         self.selected = ("mark", mark_id)
         self._mark_changed()
         self.render_waveform()
@@ -1565,11 +1877,167 @@ class WaveformController:
         if end - start < th.MIN_RANGE:
             return False
         mark["start"], mark["end"], mark["label"], mark["type"] = start, end, label, "range"
+        voices = th.merge_voice_lists(mark.get("voices"), other.get("voices"))
+        if voices:
+            mark["voices"] = voices
         self.marks = [m for m in self.marks if m["id"] != other["id"]]
         self.selected = ("mark", mark["id"])
         self._mark_changed()
         self.render_waveform()
         return True
+
+    # ------------------------------------------------------------------ voices
+    def paren_voice_for(self, mark):
+        """The voice for a card's lyrics in parentheses (backing vocals):
+        the voice numbered one past the card's own "voice N" (a card with
+        no numbered voice counts as voice 1 -> "voice 2")."""
+        name = th.paren_voice_name(mark.get("voices"))
+        if name not in self.voices:
+            self.voices.append(name)
+        return name
+
+    def _voices_for_piece(self, mark, label, span):
+        """Voices for a piece of a split card: its lyrics all in
+        parentheses -> the parentheses voice (paren_voice_for), else the
+        card's own voices."""
+        if span is not None and th.in_parentheses(label, span):
+            return [self.paren_voice_for(mark)]
+        return list(mark.get("voices") or [])
+
+    def mark_voices(self, mark_id):
+        mark = self.mark_by_id(mark_id)
+        return list(mark.get("voices") or []) if mark else []
+
+    def set_mark_voices(self, mark_id, voices):
+        """Assign exactly these voices to a mark (one undo step)."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None:
+            return False
+        voices = th.merge_voice_lists(voices)
+        if voices == (mark.get("voices") or []):
+            return True
+        for v in voices:
+            if v not in self.voices:
+                self.voices.append(v)
+        if voices:
+            mark["voices"] = voices
+        else:
+            mark.pop("voices", None)
+        self._mark_changed()
+        self.render_waveform()
+        return True
+
+    def toggle_mark_voice(self, mark_id, voice):
+        current = self.mark_voices(mark_id)
+        if voice in current:
+            current.remove(voice)
+        else:
+            current.append(voice)
+        # keep the file's voice order, so cards list their voices consistently
+        return self.set_mark_voices(mark_id, [v for v in self.voices if v in current]
+                                    + [v for v in current if v not in self.voices])
+
+    def default_voice_name(self):
+        return th.next_voice_name(self.voices)
+
+    def add_voice(self, name=None, mark_id=None):
+        """Create a voice ("voice N" unless a name is given) and, with
+        mark_id, assign it to that mark -- together one undo step. An
+        existing name is simply reused. Returns the name."""
+        name = (name or "").strip() or self.default_voice_name()
+        if name not in self.voices:
+            self.voices.append(name)
+        mark = self.mark_by_id(mark_id) if mark_id else None
+        if mark is not None and name not in (mark.get("voices") or []):
+            mark["voices"] = (mark.get("voices") or []) + [name]
+        self._mark_changed()
+        self.render_waveform()
+        return name
+
+    def ask_new_voice(self, mark_id=None):
+        """New voice on the fly: a name prompt prefilled with "voice N"
+        (just press Enter to take it, or type another name)."""
+        default = self.default_voice_name()
+        try:
+            name = simpledialog.askstring("New Voice", "Voice name:", initialvalue=default,
+                                          parent=self.canvas.winfo_toplevel())
+        except tk.TclError:
+            name = None
+        if name is None:
+            return None
+        return self.add_voice(name.strip() or default, mark_id=mark_id)
+
+    def rename_voice(self, old, new):
+        new = (new or "").strip()
+        if not new or old not in self.voices or new == old:
+            return False
+        if new in self.voices:          # renaming onto another voice merges them
+            self.voices.remove(old)
+        else:
+            self.voices[self.voices.index(old)] = new
+        for m in self.marks:
+            if old in (m.get("voices") or []):
+                m["voices"] = th.merge_voice_lists([new if v == old else v for v in m["voices"]])
+        self._mark_changed()
+        self.render_waveform()
+        return True
+
+    def ask_rename_voice(self, old):
+        try:
+            new = simpledialog.askstring("Rename Voice", f"New name for \u201c{old}\u201d:", initialvalue=old,
+                                         parent=self.canvas.winfo_toplevel())
+        except tk.TclError:
+            new = None
+        return self.rename_voice(old, new) if new else False
+
+    def delete_voice(self, name):
+        """Remove a voice name and take it off every mark."""
+        if name not in self.voices:
+            return False
+        self.voices.remove(name)
+        for m in self.marks:
+            if name in (m.get("voices") or []):
+                rest = [v for v in m["voices"] if v != name]
+                if rest:
+                    m["voices"] = rest
+                else:
+                    m.pop("voices", None)
+        self._mark_changed()
+        self.render_waveform()
+        return True
+
+    def voice_usage(self, name):
+        return sum(1 for m in self.marks if name in (m.get("voices") or []))
+
+    def fill_voice_menu(self, menu, mark_id):
+        """The voices of one mark as check items, then New / Rename /
+        Delete voice. Shared by the waveform's right-click menu and the
+        card's Voice \u25be button."""
+        try:
+            menu.delete(0, "end")
+        except tk.TclError:
+            pass
+        current = self.mark_voices(mark_id)
+        self._voice_vars = {}
+        for v in self.voices:
+            var = tk.BooleanVar(value=v in current)
+            self._voice_vars[v] = var
+            menu.add_checkbutton(label=v, variable=var, onvalue=True, offvalue=False,
+                                 command=lambda name=v: self.toggle_mark_voice(mark_id, name))
+        if self.voices:
+            menu.add_separator()
+        menu.add_command(label=f"New voice ({self.default_voice_name()} or a name)...",
+                         command=lambda: self.ask_new_voice(mark_id))
+        if self.voices:
+            rename = tk.Menu(menu, tearoff=False, bg="#ffffff", fg="#1e1e1e")
+            delete = tk.Menu(menu, tearoff=False, bg="#ffffff", fg="#1e1e1e")
+            for v in self.voices:
+                rename.add_command(label=v, command=lambda name=v: self.ask_rename_voice(name))
+                n = self.voice_usage(v)
+                delete.add_command(label=f"{v}  ({n} mark{'s' if n != 1 else ''})",
+                                   command=lambda name=v: self.delete_voice(name))
+            menu.add_cascade(label="Rename voice", menu=rename)
+            menu.add_cascade(label="Delete voice", menu=delete)
 
     # ------------------------------------------------------------------ info text (text panel)
     def set_info_text(self, styled):
@@ -1895,11 +2363,21 @@ class WaveformController:
                              + ", ".join(f"{t['name']}" for t in created) + "\n")
         return created
 
-    def run_genre_mood(self):
+    def run_genre_mood(self, force=None):
         """Genre / mood estimate in the background; the result goes to the
-        text panel and is cached with the file."""
+        text panel and is cached with the file. A cached result is reused
+        (just shown again) until the audio file's timestamp changes, unless
+        forced (Shift+click on Mood)."""
+        if force is None:
+            force = getattr(self, "_force_mood", False)
+            self._force_mood = False
         if self._analysis_busy or self.audio_duration is None:
             return
+        if not force:
+            cached = th.load_genre_mood(self.filepath)
+            if cached is not None:
+                self._report_genre_mood(cached, cached=True)
+                return
         if not aa.genre_mood_available():
             messagebox.showinfo("Genre / mood", "This needs librosa (ISC license):\n\n  pip install librosa\n\n"
                                                 "then restart trackED.")
@@ -1917,12 +2395,12 @@ class WaveformController:
                 self.analysis_status_var.set("Genre/mood failed")
                 self.append_info(f"{{red}}Genre/mood error: {error}\n")
                 return
-            th.update_cache(self.filepath, genre_mood=value)
+            th.save_genre_mood(self.filepath, value)
             self._report_genre_mood(value, elapsed)
 
         self._run_in_thread(work, done)
 
-    def _report_genre_mood(self, value, elapsed=None):
+    def _report_genre_mood(self, value, elapsed=None, cached=False):
         self.genre_mood = value
         self.analysis_status_var.set(f"{value['genre']} \u00b7 {value['mood']}")
         alts = ", ".join(f"{g} ({c:.0%})" for g, c in value.get("alternatives", []))
@@ -1937,6 +2415,8 @@ class WaveformController:
                 f"{{blue}}  mood palette: {{cyan}}{palette}\n")
         if elapsed is not None:
             msg += f"{{blue}}  elapsed: {{cyan}}{elapsed:.1f}s\n"
+        if cached:
+            msg += "{blue}  (cached result -- Shift+click Mood to re-run)\n"
         self.append_info(msg)
 
     def _auto_stems(self):
@@ -1944,9 +2424,9 @@ class WaveformController:
         without user interaction (cached stems, or demucs installed) --
         same as the old audio tab, which ran demucs automatically."""
         self._update_legend()
-        cached_mood = th.load_cache(self.filepath).get("genre_mood")
-        if isinstance(cached_mood, dict) and cached_mood.get("genre"):
-            self._report_genre_mood(cached_mood)
+        cached_mood = th.load_genre_mood(self.filepath)
+        if cached_mood is not None:
+            self._report_genre_mood(cached_mood, cached=True)
         if self.regions:
             self.analysis_status_var.set("Stems ready (cached)")
             self._report_regions()
@@ -2306,6 +2786,7 @@ class WaveformController:
         self._play_state = "stopped"
         self._loop = False
         self._play_mark_id = None
+        self._update_play_highlight(None)
         self._update_play_controls()
         self.render_waveform()
 
@@ -2401,13 +2882,18 @@ class WaveformController:
                 start = self._play_seg_start
                 if self._run_engine_from(start):
                     self.cursor_time = start
+                    self.show_time(start)
                     self.canvas.after(50, self._poll_playback)
                     return
+            was_card = self._play_mark_id is not None
             self._play_started_wall = None
             self._play_state = "stopped"
             self._loop = False
             self.cursor_time = self._play_origin
+            if was_card:
+                self.show_time(self._play_origin)      # back at the card's start: bring it into view
             self._play_mark_id = None
+            self._update_play_highlight(None)
             self._update_play_controls()
             self.render_waveform()
             return
@@ -2415,6 +2901,7 @@ class WaveformController:
         self.cursor_time = pos
         self._update_play_controls()
         self._follow_playhead(pos)
+        self._update_play_highlight(pos)
         self.render_waveform()
         # Poll faster near the end of a looped segment so the gap between
         # repeats stays short.
@@ -2545,8 +3032,13 @@ class WaveformController:
 
     def _update_play_controls(self):
         # U+275A heavy bars: available in far more fonts than U+23F8.
+        # Plain color like the other buttons (amber while Shift is held, the
+        # loop color while looping).
+        normal = TB_LOOP if self._loop else TB_FG
+        self.play_btn._mod_normal_fg = normal
+        fg = MOD_HINT_COLORS["shift"] if "shift" in current_modifiers() else normal
         self.play_btn.configure(text="\u275a\u275a" if self._play_state == "playing" else "\u25b6",
-                                fg=TB_LOOP if self._loop else TB_ACCENT)
+                                fg=fg, activeforeground=fg)
         # Stop (reset) is only offered while paused.
         try:
             if self._play_state == "paused":
@@ -2718,6 +3210,7 @@ class WaveformController:
             self.render_waveform()
 
     def _on_waveform_press(self, event):
+        crumb(f"waveform press y={event.y}")
         if self.audio_duration is None or self.view_end <= self.view_start:
             return
         self._move_drag = None
@@ -2753,7 +3246,9 @@ class WaveformController:
             return
 
         if zone == "new_track":
-            self._deselect()
+            # like a click on the waveform: just move the @cursor (a
+            # selected track stays selected)
+            self.seek_to(self._time_at_x(event.x))
             return
 
         if event.y >= self.LABEL_ZONE_HEIGHT:
@@ -2798,9 +3293,13 @@ class WaveformController:
         return round(t / interval) * interval if interval > 0 else t
 
     def _snap_delta(self, delta, event):
+        """Moving/resizing a mark by dragging: snap to a fine "nice" step
+        (about 1/200 of the view -- the grid lines' spacing made the mark
+        stay put until the pointer had moved half a grid square); Shift:
+        no snapping."""
         if event.state & 0x0001:
             return delta
-        interval = th.time_grid_interval(self.view_end - self.view_start)
+        interval = th.time_grid_interval(self.view_end - self.view_start, target_lines=self.DRAG_SNAP_STEPS)
         if interval <= 0:
             return delta
         return round(delta / interval) * interval
@@ -2844,7 +3343,7 @@ class WaveformController:
                 else:
                     span = self._move_drag["end_orig"] - self._move_drag["start_orig"]
                     new_start = self._move_drag["start_orig"] + delta
-                    new_start = max(0.0, min(duration - span, new_start))
+                    new_start = max(0.0, min(self.max_mark_time() - span, new_start))
                     mark["start"] = new_start
                     mark["end"] = new_start + span
             elif edge == "start":
@@ -2853,7 +3352,7 @@ class WaveformController:
                 mark["start"] = new_start
             else:
                 new_end = self._move_drag["end_orig"] + delta
-                new_end = min(duration, max(self._move_drag["start_orig"] + min_span, new_end))
+                new_end = min(self.max_mark_time(), max(self._move_drag["start_orig"] + min_span, new_end))
                 mark["end"] = new_end
             self.canvas.configure(cursor=self._cursor_for_edge(edge))
         if edge is None:
@@ -3050,18 +3549,47 @@ class WaveformController:
         self._ensure_mark_visible(mark)
         self.render_waveform()
 
+    def mark_play_position(self, mark):
+        """Where the card's Play would start: the paused position if this
+        mark is paused inside its span, else its start."""
+        if self._play_mark_id == mark["id"] and self._play_state == "paused":
+            end = mark.get("end") if mark["type"] == "range" else None
+            if mark["start"] <= self.cursor_time and (end is None or self.cursor_time <= end):
+                return self.cursor_time
+        return mark["start"]
+
     def _ensure_mark_visible(self, mark):
+        """Scroll (not zoom) the waveform so the card's next play position
+        is visible -- and, if the whole card fits at this zoom, its end
+        too. Returns True if the view moved (the caller renders)."""
         if self.audio_duration is None:
-            return
-        if self.view_start <= mark["start"] <= self.view_end:
-            return
-        duration = self.audio_duration
+            return False
         span = self.view_end - self.view_start
         if span <= 0:
-            return
-        new_start = max(0.0, min(duration - span, mark["start"] - span / 2))
+            return False
+        margin = span * 0.05
+        pos = self.mark_play_position(mark)
+        end = mark["end"] if mark["type"] == "range" and mark.get("end") is not None else pos
+        new_start = self.view_start
+        if end - pos <= span - 2 * margin:            # the rest of the card fits: show pos..end
+            if pos < self.view_start + (margin if self.view_start > 0 else 0):
+                new_start = pos - margin
+            elif end > self.view_end - margin:
+                new_start = end + margin - span
+        elif not (self.view_start <= pos <= self.view_end - margin):
+            new_start = pos - margin
+        new_start = max(0.0, min(self.audio_duration * self.OVERSHOOT_FACTOR - span, new_start))
+        if abs(new_start - self.view_start) < 1e-9:
+            return False
         self.view_start, self.view_end = new_start, new_start + span
         self._refresh_view_from_cache(render=False)  # caller renders
+        return True
+
+    def reveal_mark(self, mark_id):
+        """A card got focus: show it in the waveform (see _ensure_mark_visible)."""
+        mark = self.mark_by_id(mark_id)
+        if mark is not None and self._ensure_mark_visible(mark):
+            self.render_waveform()
 
     def _on_waveform_wheel(self, event):
         if self.audio_duration is None:
@@ -3267,6 +3795,12 @@ class WaveformController:
         menu.add_command(label="Transcribe Range", state="normal" if is_range and not self._analysis_busy
                          else "disabled", command=lambda: self.transcribe_mark(mark["id"]))
         menu.add_separator()
+        voices_now = mark.get("voices") or []
+        voice_menu = tk.Menu(menu, tearoff=False, bg="#ffffff", fg="#1e1e1e")
+        self.fill_voice_menu(voice_menu, mark["id"])
+        menu.add_cascade(label="Voices: " + (", ".join(voices_now) if voices_now else "(none)"), menu=voice_menu)
+        self._last_voice_menu = voice_menu
+        menu.add_separator()
         if mark["label"]:
             menu.add_command(label="Edit Label...", command=lambda: self._edit_mark_label(mark))
             menu.add_command(label="Delete Label", command=lambda: self._clear_mark_label(mark))
@@ -3339,7 +3873,151 @@ class WaveformController:
         lane_count = (max(lanes.values()) + 1) if lanes else 1
         return visible, lanes, lane_count
 
+    def _view_state(self):
+        """What's remembered between sessions: the selection and the
+        waveform's zoom/scroll (rounded to the millisecond)."""
+        return (self.selected, round(self.view_start, 3), round(self.view_end, 3))
+
+    def _remember_selection_later(self):
+        """Selection or zoom/scroll changed: it's saved to the sidecar
+        (keys "selection" and "view") with the next save -- File > Save or
+        auto-save -- or on its own once the auto-save interval has passed,
+        and when the tab/app closes; so reopening the file comes back to
+        the same track or card, zoom and position. This alone doesn't mark
+        the tab unsaved."""
+        if self.audio_duration is None:
+            return                       # still loading: nothing to remember yet
+        state = self._view_state()
+        if state == getattr(self, "_remembered_state", None):
+            return
+        self._remembered_state = state
+        if getattr(self, "_remember_after", None) is not None:
+            return                       # already scheduled: it saves whatever is current then
+        interval = get_autosave_seconds()
+        if interval > 0:
+            try:
+                self._remember_after = self.canvas.after(int(interval * 1000), self.remember_selection)
+            except tk.TclError:
+                pass
+        else:
+            self._selection_unsaved = True      # saved with the next explicit save / on close
+
+    def _cancel_remember(self):
+        pending = getattr(self, "_remember_after", None)
+        self._remember_after = None
+        if pending is not None:
+            try:
+                self.canvas.after_cancel(pending)
+            except (tk.TclError, ValueError):
+                pass
+
+    def remember_selection(self):
+        self._cancel_remember()
+        self._selection_unsaved = False
+        if self.audio_duration is None:
+            return
+        sel = list(self.selected) if self.selected and self.selected[0] in ("track", "mark") else None
+        th.update_cache(self.filepath, selection=sel, view=[round(self.view_start, 3), round(self.view_end, 3)])
+
+    def restore_view(self):
+        """Reopening a file: the zoom and scroll position it had (if still
+        valid for this audio). Returns True if restored."""
+        view = th.load_cache(self.filepath).get("view")
+        try:
+            start, end = float(view[0]), float(view[1])
+        except (TypeError, ValueError, IndexError):
+            return False
+        limit = (self.audio_duration or 0.0) * self.OVERSHOOT_FACTOR
+        if not (0.0 <= start < end <= limit + 1e-6) or end - start < 0.01:
+            return False
+        self.view_start, self.view_end = start, end
+        self._refresh_view_from_cache(render=False)
+        return True
+
+    def selection_needs_saving(self):
+        return getattr(self, "_remember_after", None) is not None or getattr(self, "_selection_unsaved", False)
+
+    def restore_selection(self, reveal=True):
+        crumb("waveform restore selection")
+        return self._restore_selection(reveal)
+
+    def _restore_selection(self, reveal=True):
+        """Reopening a file: select the track or card that was selected
+        when it was last open (and, with reveal, bring it into view --
+        not when last session's zoom/scroll was restored)."""
+        saved = th.load_cache(self.filepath).get("selection")
+        if not saved or len(saved) != 2:
+            return False
+        kind, ident = saved
+        if kind == "mark" and self.mark_by_id(ident) is not None:
+            self.selected = ("mark", ident)
+            if reveal:
+                self._ensure_mark_visible(self.mark_by_id(ident))
+        elif kind == "track" and self.track_by_id(ident) is not None:
+            self.selected = ("track", ident)
+        else:
+            return False
+        self._remembered_state = self._view_state()
+        self.render_waveform()
+        if self.panel is not None:
+            try:
+                self.canvas.after_idle(self.panel.scroll_to_selected)
+            except tk.TclError:
+                pass
+        return True
+
+    # What Shift / Ctrl do on the waveform, shown while the key is held
+    # (the toolbar's buttons show theirs by changing color).
+    MODIFIER_HINTS = {
+        "shift": "Shift: click = range from the last click / @cursor   \u00b7   drag a mark = no snapping",
+        "control": "Ctrl: click / drag = move the @cursor only",
+    }
+
+    def _show_modifier_hint(self, held):
+        self._mod_hint = next((self.MODIFIER_HINTS[m] for m in ("control", "shift") if m in held), None)
+        self._draw_modifier_hint()
+
+    def _draw_modifier_hint(self):
+        c = self.canvas
+        try:
+            c.delete("modhint")
+            hint = getattr(self, "_mod_hint", None)
+            if hint and not getattr(self, "closing", False):
+                color = MOD_HINT_COLORS["control" if hint.startswith("Ctrl") else "shift"]
+                layout = self._track_layout()
+                y = (layout["row_top"] + layout["track_top"]) / 2      # the status row, under the waveform
+                w = self._canvas_size()[0]
+                bg = c.create_rectangle(w - 6, y - 8, w - 6, y + 8, fill="#000000", outline="", tags=("modhint",))
+                item = c.create_text(w - 10, y, text=hint, anchor="e", fill=color,
+                                     font=("TkDefaultFont", 9, "bold"), tags=("modhint",))
+                try:                       # a dark backing so it reads over the region key
+                    x0, y0, x1, y1 = c.bbox(item)
+                    c.coords(bg, x0 - 4, y0 - 1, x1 + 4, y1 + 1)
+                except (tk.TclError, TypeError, ValueError):
+                    pass
+        except tk.TclError:
+            raise                  # canvas gone: utils drops this listener
+
+    def teardown(self):
+        """The app is closing (tab.teardown_hook): stop playback and timers
+        and drop the card widgets in one go, so nothing redraws or
+        re-lays-out while Tk takes the window apart."""
+        self.closing = True
+        try:
+            if self._play_state != "stopped":
+                self._halt_engine()
+        except Exception:
+            pass
+        self._play_state = "stopped"
+        self._cancel_remember()
+        if self.panel is not None:
+            self.panel.teardown()
+
     def render_waveform(self):
+        if getattr(self, "closing", False):
+            return
+        crumb("waveform render")
+        self._remember_selection_later()
         c = self.canvas
         c.delete("all")
         w = self._canvas_size()[0]
@@ -3405,6 +4083,7 @@ class WaveformController:
         self._render_cursor(x_of, layout)
         self._render_playhead(x_of, layout)
         self._render_time_readout(w)
+        self._draw_modifier_hint()
         if self.panel is not None:
             try:
                 self.panel.sync()
@@ -3449,7 +4128,8 @@ class WaveformController:
                           font=("TkDefaultFont", 7, "bold"), tags=(tag, text_tag))
             if m["label"]:
                 allotted = max(20, label_width_limit(m) - (x1 + 3))
-                c.create_text(x1 + 3, y0 + 13, text=m["label"].replace("\n", " / "), fill="#ffffff", anchor="nw",
+                c.create_text(x1 + 3, y0 + 13, text=th.strip_adjustments(m["label"]).replace("\n", " / "),
+                              fill="#ffffff", anchor="nw",
                               width=allotted, font=("TkDefaultFont", 7), tags=(tag, text_tag))
             self._mark_hit_regions[m["id"]] = c.bbox(text_tag)
 
@@ -3511,7 +4191,7 @@ class WaveformController:
                     c.create_line(x1, sub_y0, x1, sub_y1, fill=this_mark_color, width=3 if mark_selected else 2,
                                   tags=(tag,))
                     ts_text = th.format_time_ms(m["start"])
-                label = (m["label"] or ts_text).replace("\n", " / ")
+                label = (th.strip_adjustments(m["label"] or "") or ts_text).replace("\n", " / ")
                 c.create_text(x1 + 3, sub_mid, text=label, fill="#ffffff", anchor="w",
                               font=("TkDefaultFont", 7), tags=(tag, text_tag))
                 self._mark_hit_regions[m["id"]] = c.bbox(text_tag)
@@ -3704,6 +4384,11 @@ def onload(filepath: str, canvas=None, text=None, tab=None):
         "{blue}      {cyan}\u25c0\u25c0 / \u25b6\u25b6{blue}: click=5 s, Shift+click=stem region edge, "
         "Ctrl+click=start/end of the audio\n"
         "{blue}      {cyan}select a track or one of its marks{blue}=edit its marks here in the text panel\n"
+        "{blue}      cards: {cyan}Voice \u25be{blue}=assign voices (or right-click a mark on the waveform); "
+        "hover a word for its syllables/time,\n"
+        "{blue}      {cyan}right-click a word{blue} or {cyan}Alt+\u2191/\u2193{blue} (syllables), "
+        "{cyan}Alt+\u2192/\u2190{blue} (time) to adjust: writes {cyan}word {+1}{blue} / "
+        "{cyan}word {-0.1s}{blue} into the text\n"
         "{blue}Keys:  {cyan}Up/Down{blue}=move selection between tracks  {cyan}Left/Right{blue}=nudge by one grid step\n"
         "{blue}       {cyan}Tab/Shift+Tab{blue}=select next/prev mark  {cyan}Delete{blue}=delete selection\n"
         "{blue}       {cyan}Ctrl+Z/Ctrl+Y{blue}=undo/redo marks (while the waveform has focus)\n"
@@ -3744,6 +4429,7 @@ def onload(filepath: str, canvas=None, text=None, tab=None):
             tab.redo_hook = controller.redo_marks
             tab.save_hook = controller.save_marks_now
             tab.before_close_hook = controller.before_close
+            tab.teardown_hook = controller.teardown
             _bind_undo_keys(tab, text)
         controller.set_info_text(descr)
 

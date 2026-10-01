@@ -242,14 +242,49 @@ class EditorTab:
         self._update_line_numbers()
 
     def _on_text_yscroll(self, first, last):
+        """The scrollbar follows at once; the line numbers are redrawn once
+        per burst of scrolling (dragging the scrollbar sends many of these),
+        not once per step."""
         self.vsb.set(first, last)
+        if getattr(self, "_numbers_pending", None) is None:
+            try:
+                self._numbers_pending = self.text.after(15, self._numbers_after_scroll)
+            except tk.TclError:
+                self._update_line_numbers()
+
+    def _numbers_after_scroll(self):
+        self._numbers_pending = None
         self._update_line_numbers()
+
+    def set_line_numbers_visible(self, visible: bool) -> None:
+        """Show / hide the line-number gutter (the timing cards number
+        themselves, and redrawing the gutter on every scroll is costly
+        with cards in the lines)."""
+        if bool(visible) == getattr(self, "_line_numbers_shown", True):
+            return
+        self._line_numbers_shown = bool(visible)
+        try:
+            if visible:
+                self.linenumbers.grid()
+                self._update_line_numbers()
+            else:
+                self.linenumbers.delete("all")
+                self.linenumbers.grid_remove()
+        except tk.TclError:
+            pass
 
     def _update_line_numbers(self, event=None) -> None:
         """
         One number per logical line (not per wrapped screen row).
         Uses dlineinfo() so wrapped continuations do not get extra numbers.
         """
+        if not getattr(self, "_line_numbers_shown", True):
+            return
+        try:
+            from utils import crumb
+            crumb("editor line numbers")
+        except ImportError:
+            pass
         self.linenumbers.delete("all")
         try:
             end_line = int(self.text.index("end-1c").split(".")[0])
@@ -279,7 +314,17 @@ class EditorTab:
         except Exception:
             font = None
 
-        for logical in range(1, end_line + 1):
+        # Only the lines in view (dlineinfo of every line is slow when the
+        # lines hold embedded widgets, e.g. a few hundred timing cards).
+        first, last = 1, end_line
+        try:
+            top = self.text.index("@0,0")
+            bottom = self.text.index(f"@0,{self.text.winfo_height()}")
+            first = max(1, int(str(top).split(".")[0]))
+            last = min(end_line, int(str(bottom).split(".")[0]))
+        except Exception:
+            first, last = 1, end_line
+        for logical in range(first, last + 1):
             idx = f"{logical}.0"
             info = self.text.dlineinfo(idx)
             if info is None:
@@ -331,7 +376,7 @@ class EditorTab:
             # sashpos expects an absolute pixel value from the top of the paned window
             self.paned.sashpos(0, pos)
             self._sash_ready = True
-            debug(3, f"{{blue}}Restored sash for {self.filepath or 'Untitled'} → {pos}px")
+            debug(11, f"{{blue}}Restored sash for {self.filepath or 'Untitled'} → {pos}px")
         except tk.TclError:
             pass
 
@@ -380,7 +425,7 @@ class EditorTab:
             self.text.mark_set("insert", info.get("index", "1.0"))
             self.text.see("insert")
             self.text.yview_moveto(float(info.get("yview", 0.0)))
-            debug(4, f"{{blue}}Restored cursor for {self.filepath}")
+            debug(11, f"{{blue}}Restored cursor for {self.filepath}")
         except (tk.TclError, ValueError):
             pass
 
@@ -535,6 +580,9 @@ class EditorTab:
         # before_close_hook: a plugin's last question before the tab/app
         # closes; returns False to cancel the close.
         self.before_close_hook = None
+        # teardown_hook: called once when the app is quitting, after all
+        # questions/saves, to drop a plugin's widgets fast (see tracked.py)
+        self.teardown_hook = None
         try:
             self.text.configure(state="normal", undo=True)
         except tk.TclError:

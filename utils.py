@@ -107,6 +107,18 @@ def get_stem_min_seconds() -> float:
         return DEFAULT_STEM_MIN_SECONDS
 
 
+DEFAULT_EDGE_LEAD_IN = 0.15
+
+
+def get_edge_lead_in() -> float:
+    """Seconds a card's Start is put before a detected rising edge (the
+    sound usually starts a little before the edge's foot). Preferences."""
+    try:
+        return max(0.0, min(2.0, float(get_preference("edge_lead_in", DEFAULT_EDGE_LEAD_IN))))
+    except (TypeError, ValueError):
+        return DEFAULT_EDGE_LEAD_IN
+
+
 def get_max_recent() -> int:
     """Read MAX_RECENT from Preferences; default 10."""
     try:
@@ -504,8 +516,9 @@ def file_meta_summary(path: str) -> str:
 _tab_plugins_cache = None  # list of modules, or None = not loaded yet
 
 def clear_tab_plugins_cache() -> None:
-    global _tab_plugins_cache
+    global _tab_plugins_cache, _FILE_TYPES_CACHE
     _tab_plugins_cache = None
+    _FILE_TYPES_CACHE = None
 
 def discover_tab_plugins() -> list:
     """
@@ -562,6 +575,33 @@ def discover_tab_plugins() -> list:
     debug(5, f"{{cyan}}found {len(modules)} tab extensions")
     _tab_plugins_cache = sorted(modules, key=lambda m: m.__name__)
     return _tab_plugins_cache
+
+
+_FILE_TYPES_CACHE: Optional[list] = None
+
+
+def plugin_file_types() -> list:
+    """File-dialog entries the *_tab.py plugins declare, in plugin order:
+    each plugin may define FILE_TYPES = [("Label", "*.ext *.ext2"), ...]
+    (or a file_types() function returning that list). Collected once per
+    session (plugins don't change while the app runs); cleared together
+    with the plugin list by clear_tab_plugins_cache()."""
+    global _FILE_TYPES_CACHE
+    if _FILE_TYPES_CACHE is not None:
+        return list(_FILE_TYPES_CACHE)
+    out = []
+    for mod in discover_tab_plugins():
+        try:
+            entries = getattr(mod, "FILE_TYPES", None)
+            if callable(getattr(mod, "file_types", None)):
+                entries = mod.file_types()
+            for label, patterns in entries or []:
+                if label and patterns:
+                    out.append((str(label), str(patterns)))
+        except Exception as exc:
+            debug(5, f"{{red}}{mod.__name__} file types: {exc}")
+    _FILE_TYPES_CACHE = out
+    return list(out)
 
 
 def run_onload_plugins(filepath: str, canvas=None, text=None, tab=None) -> bool:
@@ -712,3 +752,139 @@ def debug(*args, **kwargs):
         pass
 
 #eof
+
+
+# ---------------------------------------------------------------------------
+# Buttons that do something else with Shift (or Ctrl) held: while the key
+# is down, their icon turns amber, so it's visible which buttons change.
+# ---------------------------------------------------------------------------
+
+MOD_HINT_COLORS = {"shift": "#ffb000", "control": "#4fc3ff"}
+_mod_buttons: list = []
+_mod_listeners: list = []      # callables(set of held modifiers), e.g. a canvas showing a hint
+_mod_state: set = set()
+_mod_installed = False
+
+
+def current_modifiers() -> set:
+    return set(_mod_state)
+
+
+def register_modifier_listener(fn, widget=None) -> None:
+    """Call fn(set of held modifiers) whenever Shift/Ctrl go down or up
+    (for controls that aren't buttons, e.g. the waveform canvas). Pass a
+    widget so the key watch can be installed if no button did yet; a
+    listener that raises (its widget is gone) is dropped."""
+    _mod_listeners.append(fn)
+    if widget is not None:
+        _install_mod_watch(widget)
+
+
+def _install_mod_watch(widget) -> None:
+    global _mod_installed
+    if _mod_installed:
+        return
+    try:
+        root = widget.winfo_toplevel()
+        for key, mod in (("Shift_L", "shift"), ("Shift_R", "shift"),
+                         ("Control_L", "control"), ("Control_R", "control")):
+            root.bind_all(f"<KeyPress-{key}>", lambda e, m=mod: _set_mod(m, True), add="+")
+            root.bind_all(f"<KeyRelease-{key}>", lambda e, m=mod: _set_mod(m, False), add="+")
+        root.bind_all("<FocusOut>", lambda e: _clear_mods(e), add="+")
+        _mod_installed = True
+    except Exception:
+        pass
+
+
+def register_modifier_button(button, mods=("shift",)) -> None:
+    """Show button's alternate behavior while one of mods is held (the
+    first held one in mods decides the color -- list them in the order the
+    button checks them). The button's normal text color is taken from
+    button._mod_normal_fg (set it when the color changes) or its fg."""
+    try:
+        if not hasattr(button, "_mod_normal_fg"):
+            button._mod_normal_fg = button.cget("fg")
+    except Exception:
+        return
+    _mod_buttons.append((button, tuple(mods)))
+    _install_mod_watch(button)
+
+
+def _clear_mods(event=None) -> None:
+    # focus left the application (keys released elsewhere go unseen)
+    try:
+        if event is not None and event.widget.focus_get() is not None:
+            return
+    except Exception:
+        pass
+    if _mod_state:
+        _mod_state.clear()
+        _apply_mods()
+
+
+def _set_mod(mod: str, down: bool) -> None:
+    before = set(_mod_state)
+    (_mod_state.add if down else _mod_state.discard)(mod)
+    if _mod_state != before:
+        _apply_mods()
+
+
+def _apply_mods() -> None:
+    alive = []
+    for button, mods in _mod_buttons:
+        try:
+            active = [m for m in mods if m in _mod_state]
+            fg = MOD_HINT_COLORS[active[0]] if active else getattr(button, "_mod_normal_fg", None)
+            if fg:
+                button.configure(fg=fg, activeforeground=fg)
+            alive.append((button, mods))
+        except Exception:
+            pass               # destroyed: drop it
+    _mod_buttons[:] = alive
+    keep = []
+    for fn in _mod_listeners:
+        try:
+            fn(set(_mod_state))
+            keep.append(fn)
+        except Exception:
+            pass               # its widget is gone: drop it
+    _mod_listeners[:] = keep
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics: breadcrumbs of recent app steps (printed by tracked.py's
+# stall watch when the GUI stops responding) and switches to turn suspect
+# features off, for tracking down hangs:
+#     TRACKED_DISABLE=prewarm,fit,spacers,linenumbers,see,slices,patch ./tracked.py
+# ---------------------------------------------------------------------------
+
+import collections as _collections
+import os as _os
+import threading as _threading
+import time as _time
+
+_crumbs = _collections.deque(maxlen=80)
+_crumb_lock = _threading.Lock()
+DISABLED_FEATURES = {f.strip().lower() for f in _os.environ.get("TRACKED_DISABLE", "").split(",") if f.strip()}
+
+
+def feature_on(name: str) -> bool:
+    """False if TRACKED_DISABLE lists this feature (diagnostics)."""
+    return name.lower() not in DISABLED_FEATURES
+
+
+def crumb(label: str) -> None:
+    """Note an app step (cheap; a repeat of the last label just counts up)."""
+    now = _time.monotonic()
+    with _crumb_lock:
+        if _crumbs and _crumbs[-1][1] == label:
+            first, _label, count, _last = _crumbs[-1]
+            _crumbs[-1] = (first, label, count + 1, now)
+        else:
+            _crumbs.append((now, label, 1, now))
+
+
+def recent_crumbs() -> list:
+    with _crumb_lock:
+        return list(_crumbs)
+

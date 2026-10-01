@@ -2,7 +2,8 @@
 Generic log-file viewer tab + debug() helper.
 
 - LogViewerTab: opens any log file, shows existing content, auto-refreshes
-  when the file grows, supports regex filter, detail-level filter, word-wrap,
+  when the file grows, supports regex filter, detail-level filter, wrapping
+  (one button: no wrap / word wrap / hard wrap at the right edge),
   and clear (truncate file).
 - debug(level, msg): writes one line into the app debug log file (filesystem).
 - Plugin API (handles / onload / create_tab): open *.log in LogViewerTab.
@@ -35,6 +36,23 @@ def debug_log_path() -> Path:
 
 
 PREF_WRAP = "debug_wrap"
+# Wrap modes: Tk's text wrap values, with their menu labels.
+WRAP_MODES = (("none", "No wrap"), ("word", "Word wrap"), ("char", "Hard wrap (at the right edge)"))
+
+
+def wrap_mode_from_pref(value) -> str:
+    """The saved wrap preference ("none"/"word"/"char"; older versions
+    saved True/False for word wrap on/off)."""
+    if value is True:
+        return "word"
+    if value in ("word", "char"):
+        return value
+    return "none"
+
+
+def wrap_button_text(mode: str) -> str:
+    short = {"none": "No wrap", "word": "Word wrap", "char": "Hard wrap"}
+    return f"{short.get(mode, 'No wrap')} \u25be"
 PREF_FILTER = "debug_filter"
 PREF_DETAIL = "debug_detail_filter"  # max Lnn to show; 0 = all
 
@@ -170,9 +188,13 @@ class _LogViewState:
         self.size: int = 0
         self.filter_var: Optional[tk.StringVar] = None
         self.detail_var: Optional[tk.StringVar] = None
-        self.wrap_var: Optional[tk.BooleanVar] = None
+        self.wrap_var: Optional[tk.StringVar] = None     # "none" | "word" | "char"
+        self.wrap_button = None
         self.status_label: Optional[ttk.Label] = None
         self.controls_window = None  # canvas window id
+
+
+FILE_TYPES = [("Log files", "*.log")]   # File > Open (tracked.py)
 
 
 def handles(filepath: str) -> bool:
@@ -250,13 +272,17 @@ def _build_controls(canvas, text, tab, state: _LogViewState) -> None:
     state.status_label = ttk.Label(row, text="", foreground="#888888")
     state.status_label.pack(side="left", padx=(4, 8))
 
-    state.wrap_var = tk.BooleanVar(value=bool(_get_pref(PREF_WRAP, False)))
-    ttk.Checkbutton(
-        row,
-        text="Word wrap",
-        variable=state.wrap_var,
-        command=lambda: _toggle_wrap(text, state),
-    ).pack(side="left", padx=(8, 4))
+    # One button for the wrap choice, with the modes in its menu.
+    state.wrap_var = tk.StringVar(value=wrap_mode_from_pref(_get_pref(PREF_WRAP, False)))
+    wrap_btn = ttk.Menubutton(row, text=wrap_button_text(state.wrap_var.get()))
+    wrap_menu = tk.Menu(wrap_btn, tearoff=False, bg="#ffffff", fg="#1e1e1e", activebackground="#cfe0ff",
+                        activeforeground="#1e1e1e", selectcolor="#1e1e1e")
+    for mode, label in WRAP_MODES:
+        wrap_menu.add_radiobutton(label=label, value=mode, variable=state.wrap_var,
+                                  command=lambda: _toggle_wrap(text, state))
+    wrap_btn.configure(menu=wrap_menu)
+    wrap_btn.pack(side="left", padx=(8, 4))
+    state.wrap_button, state.wrap_menu = wrap_btn, wrap_menu
 
     ttk.Button(
         row, text="Clear", command=lambda: _clear_log(text, tab, state)
@@ -265,11 +291,8 @@ def _build_controls(canvas, text, tab, state: _LogViewState) -> None:
         row, text="Reload", command=lambda: _full_reload(text, tab, state)
     ).pack(side="right", padx=2)
 
-    # Apply saved wrap immediately
-    if state.wrap_var.get():
-        text.configure(wrap="word")
-    else:
-        text.configure(wrap="none")
+    # Apply the saved wrap mode immediately
+    text.configure(wrap=state.wrap_var.get())
 
 
 def _read_stat(path: str) -> Tuple[float, int]:
@@ -286,6 +309,7 @@ def _full_reload(text, tab, state: _LogViewState) -> None:
         if path.is_file():
             data = path.read_text(encoding="utf-8", errors="replace")
             state.file_lines = data.splitlines()
+            state.partial_last = bool(data) and not data.endswith(("\n", "\r"))
             state.mtime, state.size = _read_stat(state.filepath)
         else:
             state.file_lines = []
@@ -336,12 +360,17 @@ def _tail(text, tab, state: _LogViewState, new_size: int) -> None:
         if not chunk:
             return
         parts = chunk.splitlines()
-        if state.file_lines and state.size > 0 and not chunk.startswith("\n"):
+        # Continue the last line only if it was cut off mid-write (the file
+        # didn't end with a newline then); otherwise the new text starts a
+        # line of its own -- before, a message that arrived on its own (e.g.
+        # "Auto-saved ...") was glued onto the end of the line before it.
+        if state.file_lines and getattr(state, "partial_last", False):
             first, *rest = parts if parts else [""]
             state.file_lines[-1] = state.file_lines[-1] + first
             state.file_lines.extend(rest)
         else:
             state.file_lines.extend(parts)
+        state.partial_last = not chunk.endswith(("\n", "\r"))
         _rebuild_view(text, tab, state)
     except Exception:
         _full_reload(text, tab, state)
@@ -483,9 +512,14 @@ def _on_detail_changed(text, state: _LogViewState) -> None:
 
 
 def _toggle_wrap(text, state: _LogViewState) -> None:
-    wrap = bool(state.wrap_var.get()) if state.wrap_var else False
-    _set_pref(PREF_WRAP, wrap)
-    text.configure(wrap="word" if wrap else "none")
+    mode = wrap_mode_from_pref(state.wrap_var.get()) if state.wrap_var else "none"
+    _set_pref(PREF_WRAP, mode)
+    text.configure(wrap=mode)
+    if state.wrap_button is not None:
+        try:
+            state.wrap_button.configure(text=wrap_button_text(mode))
+        except tk.TclError:
+            pass
     tab = state.tab
     if hasattr(tab, "_update_line_numbers"):
         tab.frame.after_idle(tab._update_line_numbers)

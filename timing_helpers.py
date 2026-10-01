@@ -10,7 +10,7 @@ Nothing here imports tkinter or touches a GUI widget, so it can be used
 Covers:
   - time formatting (format_time, format_time_ms)
   - waveform peak decoding via ffmpeg (or soundfile/miniaudio)
-  - one combined per-file JSON cache, "<stem>-cache.json" next to the
+  - one combined per-file JSON cache, "<stem>-tracked.json" next to the
     media file: waveform peaks, stem regions, marks and tracks (see
     load_cache/update_cache) -- it travels with the media file rather
     than living in trackED's central session.json
@@ -528,16 +528,113 @@ def word_weight(word: str) -> float:
     return WORD_BASE_WEIGHT + syl
 
 
+# ---------------------------------------------------------------------------
+# Inline per-word adjustments in lyric text
+#
+#   "beautiful {-1}"    one syllable fewer than the heuristic says
+#   "fire {+1}"         one syllable more ("fi-er")
+#   "love {+0.25s}"     a quarter second longer than its syllables give it
+#   "oh {-120ms}"       120 ms shorter
+#
+# A {...} applies to the word just before it (with or without a space in
+# between: "fire{+1}" works too). The two kinds can't be confused: a
+# syllable adjustment is a whole number with no unit; a time adjustment
+# always has a unit (s or ms). Anything else in braces ("{1.5}", "{x}",
+# "{+1.5}") is just text. Several adjustments on one word add up. They
+# stay in the card text (so they survive merging and re-splitting) but are
+# left out of the waveform labels and of every export.
+# ---------------------------------------------------------------------------
+
+_ADJ_RE = re.compile(r"\{\s*([+-])\s*(\d+(?:\.\d*)?|\.\d+)\s*(ms|s)?\s*\}")
+
+
+def _adjustment_matches(text: str) -> List[Tuple[int, int, str, float]]:
+    """Valid adjustments in text: [(start, end, "syl"|"time", value), ...]
+    (value: syllables, or seconds)."""
+    out = []
+    if "{" not in text:
+        return out
+    for m in _ADJ_RE.finditer(text):
+        sign = -1.0 if m.group(1) == "-" else 1.0
+        num, unit = m.group(2), m.group(3)
+        if unit:
+            value = float(num) / (1000.0 if unit == "ms" else 1.0)
+            out.append((m.start(), m.end(), "time", sign * value))
+        elif re.fullmatch(r"\d+", num):
+            out.append((m.start(), m.end(), "syl", sign * int(num)))
+        # a number with a decimal point but no unit is ambiguous: plain text
+    return out
+
+
+def strip_adjustments(text: str) -> str:
+    """The text without its {+n} / {+n s} adjustments (nor the spaces or
+    tabs just before them) -- what the waveform shows and exports write."""
+    matches = _adjustment_matches(text)
+    if not matches:
+        return text
+    out, pos = [], 0
+    for a, b, _kind, _val in matches:
+        out.append(text[pos:a].rstrip(" \t"))
+        pos = b
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def word_infos(text: str) -> List[Dict[str, Any]]:
+    """The words of a lyric text with their adjustments attached:
+    [{"span": (a, b), "word": "fire", "base": 1, "syl_adj": 1,
+      "syllables": 2, "time_adj": 0.0}, ...]. The span covers the word and
+    the adjustments that follow it, so splitting a card into words keeps
+    each word's adjustment with that word."""
+    adjs = _adjustment_matches(text)
+    masked = list(text)
+    for a, b, _k, _v in adjs:
+        for i in range(a, b):
+            masked[i] = "\x00"       # one non-space run, even with spaces inside the braces
+    infos: List[Dict[str, Any]] = []
+    for m in re.finditer(r"\S+", "".join(masked)):
+        a, b = m.start(), m.end()
+        own = [(k, v) for x, y, k, v in adjs if a <= x and y <= b]
+        clean = strip_adjustments(text[a:b])
+        syl_adj = sum(v for k, v in own if k == "syl")
+        time_adj = sum(v for k, v in own if k == "time")
+        if not clean.strip() and own and infos:
+            prev = infos[-1]           # "word {+1}": the braces belong to the word before
+            prev["span"] = (prev["span"][0], b)
+            prev["syl_adj"] += syl_adj
+            prev["time_adj"] += time_adj
+            continue
+        infos.append({"span": (a, b), "word": clean, "syl_adj": syl_adj, "time_adj": time_adj})
+    for info in infos:
+        info["syl_adj"] = int(info["syl_adj"])
+        info["base"] = syllable_count(info["word"]) if info["word"] else 0
+        info["syllables"] = max(0, info["base"] + info["syl_adj"])
+        info["time_adj"] = round(info["time_adj"], 6)
+    return infos
+
+
+def _info_weight(info: Dict[str, Any]) -> float:
+    if not info["word"]:
+        return 0.0
+    return WORD_BASE_WEIGHT + info["syllables"]
+
+
 def text_weight(text: str) -> float:
     """How much time a piece of lyric text is assumed to take: the sum of
-    its word weights (spaces and punctuation don't count here)."""
-    return sum(word_weight(w) for w in text.split())
+    its word weights (syllables, including {+n} adjustments, plus a small
+    base per word; spaces and punctuation don't count here)."""
+    return sum(_info_weight(i) for i in word_infos(text))
+
+
+def time_adjustment(text: str) -> float:
+    """The sum of the text's {+n s} time adjustments, in seconds."""
+    return sum(i["time_adj"] for i in word_infos(text))
 
 
 def gap_weight(before: str, between: str) -> float:
     """Pause between two pieces: from punctuation at the end of `before`
     and the whitespace `between` them (2+ spaces or a line break)."""
-    tail = before.rstrip()
+    tail = strip_adjustments(before).rstrip()
     gap = 0.0
     if tail.endswith((".", "!", "?", "\u2026")):
         gap += GAP_SENTENCE
@@ -552,10 +649,11 @@ def split_text_at_fraction(text: str, frac: float) -> Tuple[str, str]:
     """Split text at the word boundary whose (syllable) weight share is
     closest to frac (0..1). Returns (left, right); either may be "" if the
     text has only one word."""
-    words = text.split()
-    if len(words) < 2:
+    infos = word_infos(text)
+    if len(infos) < 2:
         return (text.strip(), "") if frac >= 0.5 else ("", text.strip())
-    weights = [word_weight(w) for w in words]
+    words = [text[i["span"][0]:i["span"][1]] for i in infos]
+    weights = [_info_weight(i) for i in infos]
     total = sum(weights) or 1.0
     best_i, best_err, acc = 1, None, 0.0
     for i in range(1, len(words)):
@@ -568,43 +666,123 @@ def split_text_at_fraction(text: str, frac: float) -> Tuple[str, str]:
 
 def word_spans(text: str) -> List[Tuple[int, int]]:
     """(start, end) character spans of the words in text; punctuation
-    stays attached to its word ("love," "don't")."""
-    return [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
+    stays attached to its word ("love," "don't"), and so does a following
+    {+n} / {+n s} adjustment."""
+    return [i["span"] for i in word_infos(text)]
+
+
+def _timed_shares(start: float, end: float, weights: List[float], fixed: List[float],
+                  gaps: List[float]) -> Optional[List[Tuple[float, float]]]:
+    """Divide start..end among pieces: each gets its `fixed` seconds plus
+    a share of the rest in proportion to its weight; gaps (weight units,
+    one per piece, after it) are pauses between pieces. None if it
+    doesn't fit."""
+    total_w = sum(weights) + sum(gaps)
+    spare = (end - start) - sum(fixed)
+    if total_w <= 0 or spare <= 0:
+        return None
+    unit = spare / total_w
+    out, t = [], start
+    for w, f, g in zip(weights, fixed, gaps):
+        s0, s1 = t, t + w * unit + f
+        out.append((s0, s1))
+        t = s1 + g * unit
+    out[-1] = (out[-1][0], end)                  # absorb rounding
+    if any(e - s < MIN_RANGE for s, e in out):
+        return None
+    return out
 
 
 def plan_pieces(mark: Dict[str, Any], spans: List[Tuple[int, int]]) -> Optional[List[Tuple[float, Optional[float], str]]]:
     """Split a mark's label into the given character spans (in order,
     non-overlapping) and give each piece a share of the mark's time in
-    proportion to its word weights, leaving short gaps after punctuation
-    and at 2+ spaces / line breaks. Returns [(start, end, text), ...]
-    (end None for a point mark: all pieces keep its time), or None if it
-    can't be done (fewer than 2 pieces, or pieces too short)."""
+    proportion to its word weights -- plus/minus its {+n s} time
+    adjustments -- leaving short gaps after punctuation and at 2+ spaces /
+    line breaks. Returns [(start, end, text), ...] (end None for a point
+    mark: all pieces keep its time), or None if it can't be done (fewer
+    than 2 pieces, pieces too short, or time adjustments that don't fit)."""
     label = mark.get("label") or ""
     pieces = []
-    for i, (a, b) in enumerate(spans):
+    for a, b in spans:
         text = label[a:b].strip()
         if not text:
             continue
-        pieces.append([text, text_weight(text) or WORD_BASE_WEIGHT, a, b])
+        pieces.append([text, text_weight(text) or WORD_BASE_WEIGHT, a, b, time_adjustment(text)])
     if len(pieces) < 2:
         return None
     start = float(mark["start"])
     is_range = mark.get("type") == "range" and mark.get("end") is not None and mark["end"] > start
     if not is_range:
         return [(start, None, p[0]) for p in pieces]
-    end = float(mark["end"])
     gaps = [gap_weight(label[p[2]:p[3]], label[p[3]:nxt[2]]) for p, nxt in zip(pieces, pieces[1:])] + [0.0]
-    total = sum(p[1] for p in pieces) + sum(gaps)
-    unit = (end - start) / total
-    out, t = [], start
-    for (text, weight, _a, _b), gap in zip(pieces, gaps):
-        s0, s1 = t, t + weight * unit
-        out.append((s0, s1, text))
-        t = s1 + gap * unit
-    out[-1] = (out[-1][0], end, out[-1][2])      # absorb rounding
-    if any(e - s < MIN_RANGE for s, e, _ in out):
+    shares = _timed_shares(start, float(mark["end"]), [p[1] for p in pieces], [p[4] for p in pieces], gaps)
+    if shares is None:
         return None
-    return out
+    return [(s0, s1, p[0]) for (s0, s1), p in zip(shares, pieces)]
+
+
+def word_timings(mark: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """word_infos() of a mark's label, each with "seconds": how long the
+    word would get if the card were split into words (None for a point
+    mark, or when that split isn't possible)."""
+    label = mark.get("label") or ""
+    infos = word_infos(label)
+    start = float(mark["start"])
+    is_range = mark.get("type") == "range" and mark.get("end") is not None and mark["end"] > start
+    secs: List[Optional[float]] = [None] * len(infos)
+    if is_range and len(infos) == 1:
+        secs = [float(mark["end"]) - start]
+    elif is_range and infos:
+        plan = plan_pieces(mark, [i["span"] for i in infos])
+        if plan is not None and len(plan) == len(infos):
+            secs = [e - s for s, e, _t in plan]
+    for info, sec in zip(infos, secs):
+        info["seconds"] = sec
+    return infos
+
+
+def format_adjust_seconds(value: float) -> str:
+    """+0.25s / -0.12s (as written inside the braces)."""
+    text = f"{abs(value):.3f}".rstrip("0").rstrip(".")
+    return f"{'-' if value < 0 else '+'}{text}s"
+
+
+def word_at(text: str, index: int) -> Optional[Dict[str, Any]]:
+    """The word_infos() entry at a character index -- in the blank space
+    after a word, that word (before the first word: the first word)."""
+    infos = word_infos(text)
+    best = None
+    for info in infos:
+        a, b = info["span"]
+        if a <= index <= b:
+            return info
+        if b <= index:
+            best = info
+    return best if best is not None else (infos[0] if infos else None)
+
+
+def adjust_word(text: str, index: int, syllables: int = 0, seconds: float = 0.0,
+                clear: bool = False) -> Optional[Tuple[str, Tuple[int, int]]]:
+    """Change the adjustment of the word at `index` (see word_at) by
+    +/-syllables and/or +/-seconds, or remove it (clear=True). Rewrites
+    that word's braces as "word {+1} {+0.1s}" (a part that comes to zero
+    is dropped). Returns (new_text, (start, end) of the word) or None if
+    there's no word there."""
+    info = word_at(text, index)
+    if info is None or not info["word"]:
+        return None
+    a, b = info["span"]
+    syl = 0 if clear else int(info["syl_adj"] + syllables)
+    secs = 0.0 if clear else round(info["time_adj"] + seconds, 3)
+    if info["base"] + syl < 0:
+        syl = -info["base"]          # not below zero syllables
+    parts = [strip_adjustments(text[a:b]).rstrip()]
+    if syl:
+        parts.append(f"{{{'+' if syl > 0 else '-'}{abs(syl)}}}")
+    if abs(secs) >= 0.0005:
+        parts.append("{" + format_adjust_seconds(secs) + "}")
+    word = " ".join(parts)
+    return text[:a] + word + text[b:], (a, a + len(word))
 
 
 def plan_split(mark: Dict[str, Any], at_time: Optional[float] = None,
@@ -645,10 +823,12 @@ def plan_split(mark: Dict[str, Any], at_time: Optional[float] = None,
         t = float(at_time)
         left_text, right_text = split_text_at_fraction(label, (t - start) / (end - start)) if label else ("", "")
     else:
-        if label and len(label.split()) >= 2:
+        if label and len(word_infos(label)) >= 2:
             left_text, right_text = split_text_at_fraction(label, 0.5)
             wl, wr = text_weight(left_text), text_weight(right_text)
-            t = start + (end - start) * wl / (wl + wr)
+            shares = _timed_shares(start, end, [wl, wr], [time_adjustment(left_text), time_adjustment(right_text)],
+                                   [0.0, 0.0])
+            t = shares[0][1] if shares else start + (end - start) * wl / (wl + wr)
         else:
             left_text, right_text = label.strip(), ""
             t = (start + end) / 2
@@ -1139,56 +1319,54 @@ def rebucket_peaks(full_peaks: List[Tuple[float, float]], start_frac: float,
 # Per-file sidecar helpers (waveform cache, marks/tracks)
 # ---------------------------------------------------------------------------
 
-def _sidecar_path(media_path: str, suffix: str, use_stem: bool = False) -> str:
-    """Where a sidecar file for this media file should live: next to the
-    media file if that directory is writable, else a fallback dir under
-    the home directory (using a flattened/escaped absolute path so files
-    from different directories can't collide). use_stem=True names it
-    "<stem><suffix>" ("song-cache.json"), else "<basename><suffix>"
-    ("song.mp3-marks.json" -- the old, pre-combined naming)."""
+def _sidecar_path(media_path: str, suffix: str) -> str:
+    """Where a sidecar file for this media file should live:
+    "<stem><suffix>" ("song-tracked.json") next to the media file if that
+    directory is writable, else in a fallback dir under the home directory
+    (using a flattened/escaped absolute path so files from different
+    directories can't collide)."""
     directory = os.path.dirname(media_path) or "."
-    base = os.path.basename(media_path)
-    name = os.path.splitext(base)[0] if use_stem else base
+    stem = os.path.splitext(os.path.basename(media_path))[0]
     if os.access(directory, os.W_OK):
-        return os.path.join(directory, f"{name}{suffix}")
+        return os.path.join(directory, f"{stem}{suffix}")
     os.makedirs(_FALLBACK_DIR, exist_ok=True)
-    abs_name = os.path.abspath(media_path)
-    if use_stem:
-        abs_name = os.path.splitext(abs_name)[0]
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", abs_name)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.splitext(os.path.abspath(media_path))[0])
     return os.path.join(_FALLBACK_DIR, f"{safe}{suffix}")
 
 
 # ---------------------------------------------------------------------------
-# Combined per-file cache: "<stem>-cache.json" next to the media file.
+# Combined per-file cache: "<stem>-tracked.json" next to the media file
+# (the "-tracked" suffix says which app owns it).
 #
 #   {
 #     "format": 2,
 #     "source_mtime": ..., "source_size": ...,   # media file identity
 #     "duration": ..., "peaks": [...],           # derived -- dropped if the media changes
 #     "regions": [...],                          # derived (stem analysis) -- ditto
+#     "genre_mood": {...},                       # derived -- dropped only if the media's
+#                                                #   timestamp (mtime) changes
 #     "marks": [...], "tracks": [...]            # user data -- ALWAYS kept
 #   }
 #
 # Marks/tracks are deliberately NOT invalidated when the media file's
-# mtime/size change (the old separate -marks.json was): they're the
-# user's own work, and re-copying/restoring an audio file shouldn't make
-# them silently disappear. Only the derived waveform/regions data is
-# recomputed.
+# mtime/size change: they're the user's own work, and re-copying/restoring
+# an audio file shouldn't make them silently disappear. Only the derived
+# data is recomputed.
 #
-# Replaces the older "<file>-waveform-cache.json" + "<file>-marks.json"
-# pair; those are migrated on first load and then removed.
+# "song.mp3" and "song.wav" in one folder share "song-tracked.json" --
+# accepted, since they're presumably the same audio.
 # ---------------------------------------------------------------------------
 
-CACHE_SUFFIX = "-cache.json"
+CACHE_SUFFIX = "-tracked.json"
 WAVEFORM_CACHE_RESOLUTION = 4000  # buckets in the cached full-file overview (as in media_utils.py)
 CACHE_FORMAT = 2
-_DERIVED_KEYS = ("duration", "peaks", "regions", "genre_mood")
+_DERIVED_KEYS = ("duration", "peaks", "regions")   # dropped when the media's mtime or size changes
+_MTIME_KEYS = ("genre_mood",)                     # dropped only when the media's mtime changes
 _cache_lock = threading.RLock()
 
 
 def cache_path(media_path: str) -> str:
-    return _sidecar_path(media_path, CACHE_SUFFIX, use_stem=True)
+    return _sidecar_path(media_path, CACHE_SUFFIX)
 
 
 def _source_identity(media_path: str) -> Dict[str, Any]:
@@ -1219,50 +1397,27 @@ def _write_json_atomic(path: str, data: Dict[str, Any]) -> bool:
         return False
 
 
-def _migrate_old_sidecars(media_path: str) -> Optional[Dict[str, Any]]:
-    """Build a combined cache from the older two-file layout, if present.
-    Returns the new dict (already written) or None if nothing to migrate."""
-    old_wave = _sidecar_path(media_path, "-waveform-cache.json")
-    old_marks = _sidecar_path(media_path, "-marks.json")
-    wave = _read_json(old_wave) if os.path.exists(old_wave) else None
-    marks = _read_json(old_marks) if os.path.exists(old_marks) else None
-    if wave is None and marks is None:
-        return None
-    ident = _source_identity(media_path)
-    data: Dict[str, Any] = {"format": CACHE_FORMAT, **ident, "marks": [], "tracks": []}
-    if wave and wave.get("source_mtime") == ident["source_mtime"] \
-            and wave.get("source_size") == ident["source_size"]:
-        data["duration"] = wave.get("duration")
-        data["peaks"] = wave.get("peaks", [])
-    if marks:
-        # Keep marks even if the old file thought they were stale.
-        data["marks"] = marks.get("marks", [])
-        data["tracks"] = marks.get("tracks", [])
-    if not _write_json_atomic(cache_path(media_path), data):
-        return data  # couldn't write the new file: leave the old ones alone
-    for old in (old_wave, old_marks):
-        try:
-            os.remove(old)
-        except OSError:
-            pass
-    return data
+def _drop_stale(data: Dict[str, Any], ident: Dict[str, Any]) -> None:
+    """Remove derived sections that no longer match the media file."""
+    if not data:
+        return
+    mtime_changed = data.get("source_mtime") != ident["source_mtime"]
+    if mtime_changed or data.get("source_size") != ident["source_size"]:
+        for key in _DERIVED_KEYS:
+            data.pop(key, None)
+    if mtime_changed:
+        for key in _MTIME_KEYS:
+            data.pop(key, None)
 
 
 def load_cache(media_path: str) -> Dict[str, Any]:
     """The whole combined cache for this media file ({} if none), with
     derived sections stripped if the media file changed since they were
-    computed. Migrates the old two-file layout on first use."""
+    computed."""
     with _cache_lock:
         path = cache_path(media_path)
-        data = _read_json(path) if os.path.exists(path) else None
-        if data is None:
-            data = _migrate_old_sidecars(media_path) or {}
-        data = dict(data)
-        ident = _source_identity(media_path)
-        if data and (data.get("source_mtime") != ident["source_mtime"]
-                     or data.get("source_size") != ident["source_size"]):
-            for key in _DERIVED_KEYS:
-                data.pop(key, None)
+        data = dict((_read_json(path) if os.path.exists(path) else None) or {})
+        _drop_stale(data, _source_identity(media_path))
         return data
 
 
@@ -1272,12 +1427,9 @@ def update_cache(media_path: str, **sections: Any) -> bool:
     call from the loader/analysis threads and the UI thread."""
     with _cache_lock:
         path = cache_path(media_path)
-        data = (_read_json(path) if os.path.exists(path) else None) \
-            or _migrate_old_sidecars(media_path) or {}
+        data = (_read_json(path) if os.path.exists(path) else None) or {}
         ident = _source_identity(media_path)
-        if data.get("source_mtime") != ident["source_mtime"] or data.get("source_size") != ident["source_size"]:
-            for key in _DERIVED_KEYS:
-                data.pop(key, None)
+        _drop_stale(data, ident)
         data.update(ident)
         data["format"] = CACHE_FORMAT
         data.update(sections)
@@ -1306,6 +1458,21 @@ def save_regions(media_path: str, regions: List[Dict[str, Any]]) -> None:
     update_cache(media_path, regions=regions)
 
 
+def load_genre_mood(media_path: str) -> Optional[Dict[str, Any]]:
+    """The cached genre/mood estimate, or None if there isn't a current one."""
+    value = load_cache(media_path).get("genre_mood")
+    return value if isinstance(value, dict) and value.get("genre") else None
+
+
+def save_genre_mood(media_path: str, value: Dict[str, Any]) -> None:
+    update_cache(media_path, genre_mood=value)
+
+
+def load_voices(media_path: str) -> List[str]:
+    """The user's voice names for this file (see waveform_tab voices)."""
+    return [v for v in load_cache(media_path).get("voices", []) if isinstance(v, str) and v]
+
+
 def load_marks(media_path: str) -> List[Dict[str, Any]]:
     return list(load_cache(media_path).get("marks", []))
 
@@ -1315,8 +1482,196 @@ def load_tracks(media_path: str) -> List[Dict[str, Any]]:
 
 
 def save_marks(media_path: str, marks: List[Dict[str, Any]],
-               tracks: Optional[List[Dict[str, Any]]] = None) -> None:
-    update_cache(media_path, marks=marks, tracks=tracks or [])
+               tracks: Optional[List[Dict[str, Any]]] = None,
+               voices: Optional[List[str]] = None) -> None:
+    sections: Dict[str, Any] = {"marks": marks, "tracks": tracks or []}
+    if voices is not None:
+        sections["voices"] = list(voices)
+    update_cache(media_path, **sections)
+
+
+def in_parentheses(text: str, span: Tuple[int, int]) -> bool:
+    """Is every non-space character of text[span] inside parentheses
+    (the brackets themselves count as inside)? "(love you)" -> True for
+    "(love", "you)" and the whole; "love (you)" -> False."""
+    a, b = span
+    depth, inside = 0, []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+            inside.append(True)
+        elif ch == ")":
+            inside.append(depth > 0)
+            depth = max(0, depth - 1)
+        else:
+            inside.append(depth > 0)
+    chars = [i for i in range(max(0, a), min(b, len(text))) if not text[i].isspace()]
+    return bool(chars) and all(inside[i] for i in chars)
+
+
+def has_parentheses(text: str) -> bool:
+    """Does the text have any lyrics inside parentheses?"""
+    depth = 0
+    for ch in text or "":
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth > 0 and not ch.isspace():
+            return True
+    return False
+
+
+def paren_voice_name(voices: Optional[List[str]]) -> str:
+    """The voice for lyrics in parentheses on a card with these voices:
+    one past its highest "voice N" (none -> the card counts as voice 1,
+    so "voice 2")."""
+    highest = 1
+    for v in voices or []:
+        m = re.fullmatch(r"voice\s*(\d+)", (v or "").strip(), re.IGNORECASE)
+        if m:
+            highest = max(highest, int(m.group(1)))
+    return f"{VOICE_PREFIX}{highest + 1}"
+
+
+def find_span(text: str, piece: str, start: int = 0) -> Optional[Tuple[int, int]]:
+    """Where a piece of text (e.g. one half of a split) is in the whole."""
+    piece = (piece or "").strip()
+    if not piece:
+        return None
+    i = text.find(piece, max(0, start - 1))
+    if i < 0:
+        i = text.find(piece)
+    return (i, i + len(piece)) if i >= 0 else None
+
+
+# ---------------------------------------------------------------------------
+# Voices: user-defined names ("Lead", "Harmony", "voice 3") that timing
+# marks can be assigned to -- mark["voices"] = [...], any number of them.
+# The names are kept per audio file (one list shared by all its tracks).
+# ---------------------------------------------------------------------------
+
+VOICE_PREFIX = "voice "
+
+
+def next_voice_name(existing: List[str]) -> str:
+    """"voice N", with N one past the highest "voice <number>" in use."""
+    highest = 0
+    for name in existing:
+        m = re.fullmatch(r"voice\s*(\d+)", (name or "").strip(), re.IGNORECASE)
+        if m:
+            highest = max(highest, int(m.group(1)))
+    return f"{VOICE_PREFIX}{highest + 1}"
+
+
+def merge_voice_lists(*lists: Optional[List[str]]) -> List[str]:
+    """Union of voice lists, in first-seen order."""
+    out: List[str] = []
+    for lst in lists:
+        for v in lst or []:
+            if v not in out:
+                out.append(v)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Audio edges: align a card's Start to the foot of the next rising edge
+# (an onset) and its End to the bottom of the next falling edge (where the
+# sound has died away). Works on a fine loudness envelope of a few seconds
+# of audio (5 ms buckets), with thresholds relative to that stretch:
+#   high = low + 50% of the range, low-armed = low + 25%;
+#   the foot / bottom = the latest (rise) or earliest (fall) point within
+#   10% of the range above the local minimum.
+# ---------------------------------------------------------------------------
+
+EDGE_BUCKET_SEC = 0.005      # envelope resolution
+EDGE_WINDOW_SEC = 4.0        # audio decoded per look
+EDGE_CONTEXT_SEC = 0.5       # of it, before the search point
+EDGE_MAX_LOOKS = 6           # give up after ~20 s without an edge
+EDGE_MIN_STEP = 0.02         # "next" edge: at least this far past the current time
+EDGE_SMOOTH_BUCKETS = 4      # moving average (20 ms)
+EDGE_MIN_SPAN = 0.01         # quieter differences than this (1% of full scale) aren't edges
+
+
+def edge_envelope(peaks: List[Tuple[float, float]], smooth: int = EDGE_SMOOTH_BUCKETS) -> List[float]:
+    """Loudness per bucket from (min, max) peaks: half the peak-to-peak,
+    lightly smoothed."""
+    raw = [max(0.0, (float(mx) - float(mn)) / 2.0) for mn, mx in peaks]
+    if smooth <= 1 or len(raw) < smooth:
+        return raw
+    out, acc = [], 0.0
+    for i, v in enumerate(raw):
+        acc += v
+        if i >= smooth:
+            acc -= raw[i - smooth]
+        out.append(acc / min(i + 1, smooth))
+    return out
+
+
+def _percentile(values: List[float], pct: float) -> float:
+    s = sorted(values)
+    if not s:
+        return 0.0
+    k = max(0, min(len(s) - 1, int(round(pct / 100.0 * (len(s) - 1)))))
+    return s[k]
+
+
+def edge_times(env: List[float], t0: float, bucket: float, kind: str) -> List[float]:
+    """All edges in an envelope starting at time t0 (bucket seconds
+    each), in time order: kind "rise" -> feet of rising edges, "fall" ->
+    bottoms of falling edges."""
+    n = len(env)
+    if n < 3 or bucket <= 0:
+        return []
+    low, high = _percentile(env, 10), _percentile(env, 95)
+    span = high - low
+    if span < EDGE_MIN_SPAN:
+        return []
+    thr_hi, thr_lo, near = low + 0.5 * span, low + 0.25 * span, 0.1 * span
+    when = lambda i: t0 + i * bucket
+    out: List[float] = []
+    if kind == "rise":
+        armed_at = 0 if env[0] < thr_lo else None
+        for i in range(1, n):
+            if env[i] < thr_lo:
+                if armed_at is None:
+                    armed_at = i
+            elif env[i] >= thr_hi and armed_at is not None:
+                seg = range(armed_at, i + 1)
+                floor = min(env[k] for k in seg)
+                out.append(when(max(k for k in seg if env[k] <= floor + near)))
+                armed_at = None
+        return out
+    if kind == "fall":
+        loud = env[0] >= thr_hi
+        i = 1
+        while i < n:
+            if env[i] >= thr_hi:
+                loud = True
+            elif loud and env[i] < thr_lo:
+                j = i
+                while j < n - 1 and env[j + 1] < thr_hi:     # the valley: until it gets loud again
+                    j += 1
+                floor = min(env[k] for k in range(i, j + 1))
+                out.append(when(min(k for k in range(i, j + 1) if env[k] <= floor + near)))
+                loud = False
+                i = j
+            i += 1
+        return out
+    raise ValueError(kind)
+
+
+def find_edge(env: List[float], t0: float, bucket: float, after: float, kind: str) -> Optional[float]:
+    """The next edge (see edge_times) at least EDGE_MIN_STEP after
+    `after`, or None."""
+    return next((t for t in edge_times(env, t0, bucket, kind) if t > after + EDGE_MIN_STEP), None)
+
+
+def find_prev_edge(env: List[float], t0: float, bucket: float, before: float, kind: str) -> Optional[float]:
+    """The previous edge (see edge_times) at least EDGE_MIN_STEP before
+    `before`, or None."""
+    earlier = [t for t in edge_times(env, t0, bucket, kind) if t < before - EDGE_MIN_STEP]
+    return earlier[-1] if earlier else None
 
 
 # ---------------------------------------------------------------------------
@@ -1367,7 +1722,7 @@ def _xlights_effect_element(mark: Dict[str, Any]) -> ET.Element:
     start_ms = int(round(mark["start"] * 1000))
     end = mark.get("end")
     end_ms = start_ms + 1 if end is None else max(start_ms + 1, int(round(end * 1000)))
-    label = mark.get("label") or format_time_ms(mark["start"])
+    label = strip_adjustments(mark.get("label") or "") or format_time_ms(mark["start"])
     return ET.Element("Effect", {
         "label": label,
         "starttime": str(start_ms),
@@ -1444,7 +1799,7 @@ def export_lrc_file(path: str, tracks_with_marks: List[Tuple[str, List[Dict[str,
     lines = [f"[ti:{header_names}]"]
     for name, m in combined:
         ts = _lrc_timestamp(m["start"])
-        label = m.get("label") or format_time_ms(m["start"])
+        label = strip_adjustments(m.get("label") or "") or format_time_ms(m["start"])
         if multi:
             label = f"[{name}] {label}"
         lines.append(f"[{ts}]{label}")
@@ -1463,7 +1818,7 @@ def export_audacity_labels_file(path: str, tracks_with_marks: List[Tuple[str, Li
     for name, m in combined:
         start = m["start"]
         end = m["end"] if m.get("end") is not None else start
-        label = m.get("label") or format_time_ms(start)
+        label = strip_adjustments(m.get("label") or "") or format_time_ms(start)
         if multi:
             label = f"[{name}] {label}"
         lines.append(f"{start:.6f}\t{end:.6f}\t{label}")

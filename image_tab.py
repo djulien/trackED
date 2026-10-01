@@ -32,6 +32,7 @@ from typing import Optional
 from utils import debug
 
 IMAGE_EXTS = {".png", ".gif", ".pgm", ".ppm", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+FILE_TYPES = [("Images", " ".join(f"*{e}" for e in sorted(IMAGE_EXTS)))]   # File > Open (tracked.py)
 
 # Formats Tk PhotoImage can load without Pillow (Tk 8.6+)
 _TK_NATIVE = {".png", ".gif", ".pgm", ".ppm"}

@@ -51,8 +51,11 @@ rm -r __pycache__
 
 from __future__ import annotations
 
+import os
 import re
 import sys
+import datetime
+import threading
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -247,6 +250,90 @@ class CustomNotebook(ttk.Notebook):
 # Main application
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Readable colors for Tk's built-in dialogs
+# ---------------------------------------------------------------------------
+# The desktop theme hands Tk a light default text color (via X resources,
+# read into the option database at "userDefault" priority). Our own
+# widgets all set explicit colors, but Tk's built-in dialogs don't: the
+# Open/Save file dialog draws its file names in that light color on a
+# white list, so they were invisible until selected (the same problem the
+# tooltips had). Entries added here at "interactive" priority outrank the
+# desktop's, and are scoped by the dialogs' window classes, so the main
+# window keeps its current look.
+#   TkFDialog     tk_getOpenFile / tk_getSaveFile (filedialog.askopenfilename...)
+#   TkChooseDir   tk_chooseDirectory (filedialog.askdirectory)
+#   TkColorDialog tk_chooseColor (colorchooser.askcolor)
+#   Dialog        tk_messageBox / tk_dialog (messagebox.*)
+#   Toplevel      tkinter.simpledialog (askstring/askfloat...) and our own
+#                 pop-ups -- ours set explicit colors, which always win.
+# File > Open choices: built from what each *_tab.py plugin declares
+# (its FILE_TYPES), plus the editor's own text types. Tk's file dialog
+# matches case-sensitively on Linux, so upper-case variants are added.
+PREF_LAYOUT_SORT_CASE = "xlayout_sort_case"   # read by xlayout_tab.py (PREF_SORT_CASE)
+TEXT_FILE_TYPES = [("Text / lyrics", "*.txt *.lrc *.srt")]
+
+
+def _with_upper(patterns: str) -> str:
+    out = []
+    for pat in patterns.split():
+        for variant in (pat, pat.upper()):
+            if variant not in out:
+                out.append(variant)
+    return " ".join(out)
+
+
+def open_filetypes() -> list:
+    """[("Supported files", all patterns), plugin entries..., text,
+    ("All files", "*")] for filedialog.askopenfilename. The plugin part is
+    collected once per session (utils.plugin_file_types caches it)."""
+    from utils import plugin_file_types
+    entries = plugin_file_types() + TEXT_FILE_TYPES
+    entries = [(label, _with_upper(pats)) for label, pats in entries]
+    every = []
+    for _label, pats in entries:
+        every += [p for p in pats.split() if p not in every]
+    return [("Supported files", " ".join(every))] + entries + [("All files", "*")]
+
+
+DIALOG_WINDOW_CLASSES = ("TkFDialog", "TkChooseDir", "TkColorDialog", "Dialog", "Toplevel")
+DIALOG_FG = "#1e1e1e"
+DIALOG_BG = "#f2f2f2"
+DIALOG_FIELD_BG = "#ffffff"
+# (option, value) pairs; generic ones first, then the per-widget-class
+# field backgrounds, so the more specific entries also come last.
+DIALOG_OPTIONS = (
+    ("background", DIALOG_BG),
+    ("foreground", DIALOG_FG),
+    ("highlightBackground", DIALOG_BG),
+    ("highlightColor", DIALOG_FG),
+    ("activeBackground", "#cfe0ff"),
+    ("activeForeground", DIALOG_FG),
+    ("disabledForeground", "#8a8a8a"),
+    ("selectBackground", "#264f78"),
+    ("selectForeground", "#ffffff"),
+    ("insertBackground", DIALOG_FG),
+    ("troughColor", "#d0d0d0"),
+    ("selectColor", DIALOG_FIELD_BG),          # check/radio indicator
+    ("Entry.background", DIALOG_FIELD_BG),
+    ("Spinbox.background", DIALOG_FIELD_BG),
+    ("Listbox.background", DIALOG_FIELD_BG),
+    ("Text.background", DIALOG_FIELD_BG),
+    ("Canvas.background", DIALOG_FIELD_BG),    # the file dialog's file list
+)
+
+
+def apply_dialog_colors(root) -> None:
+    """Give Tk's built-in dialogs explicit, readable colors (see above).
+    Call once, right after the root window is created."""
+    for cls in DIALOG_WINDOW_CLASSES:
+        for option, value in DIALOG_OPTIONS:
+            try:
+                root.option_add(f"*{cls}*{option}", value, "interactive")
+            except Exception:
+                pass
+
+
 class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
     def __init__(
         self,
@@ -255,6 +342,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         debug_level: Optional[int] = None,
     ):
         super().__init__()
+        apply_dialog_colors(self)      # before any dialog can open
         self.title(APP_NAME)
         self.minsize(400, 300)
         self._restore_window_geometry()
@@ -593,6 +681,25 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         return None
 
     def new_file(self) -> None:
+        self._new_file_impl()
+        self._keep_debug_last()
+
+    def _keep_debug_last(self) -> None:
+        """The debug log tab (with debugging on) is always the right-most."""
+        dbg = getattr(self, "_debug_tab", None)
+        if dbg is None:
+            return
+        try:
+            tabs = self.notebook.tabs()
+            if tabs and str(tabs[-1]) != str(dbg.frame):
+                self.notebook.insert("end", dbg.frame)
+            if dbg in self.tabs and self.tabs[-1] is not dbg:
+                self.tabs.remove(dbg)
+                self.tabs.append(dbg)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _new_file_impl(self) -> None:
         tab = EditorTab(
             self.notebook,
             on_modified=self._on_tab_modified,
@@ -619,10 +726,16 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         debug(2, "New untitled tab")
 
     def open_file(self, path: Optional[str] = None) -> None:
+        try:
+            self._open_file_impl(path)
+        finally:
+            self._keep_debug_last()
+
+    def _open_file_impl(self, path: Optional[str] = None) -> None:
         if path is None:
             path = filedialog.askopenfilename(
                 title="Open File",
-                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                filetypes=open_filetypes(),
             )
         if not path:
             return
@@ -740,7 +853,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
                 debug(1, f"Save failed: {e}")
             if ok:
                 tab.mark_clean()
-                self.status.configure(text=f"Saved changes for {abbreviated_name(tab.filepath)}")
+                self.set_status(f"Saved changes for {abbreviated_name(tab.filepath)}")
                 self._update_title()
             return ok
         if getattr(tab, "protect_file", False):
@@ -757,7 +870,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             tab.mark_clean()
             add_recent(tab.filepath)
             self._rebuild_recent_menu()
-            self.status.configure(text=f"Saved {tab.filepath}")
+            self.set_status(f"Saved {tab.filepath}")
             self._update_title()
             debug(1, f"Saved {tab.filepath}")
             return True
@@ -831,7 +944,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
                         tab.update_tab_label((now - since) / interval)   # advance the countdown dial
             if saved:
                 names = ", ".join(abbreviated_name(t.filepath) for t in saved)
-                self.status.configure(text=f"Auto-saved {names}")
+                self.set_status(f"Auto-saved {names}")
                 debug(2, f"Auto-saved {names}")
         finally:
             self.after(1000, self._autosave_tick)
@@ -851,7 +964,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             # Export the panel text as a copy; the tab stays on its audio file.
             try:
                 Path(path).write_text(tab.get_content(), encoding="utf-8")
-                self.status.configure(text=f"Saved text copy to {path}")
+                self.set_status(f"Saved text copy to {path}")
                 return True
             except Exception as e:
                 messagebox.showerror("Save Error", str(e))
@@ -901,8 +1014,23 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
     def close_current(self) -> None:
         self.close_tab()
 
+    def set_status(self, message: str) -> None:
+        """A message in the status bar, stamped with the date and time it
+        appeared (it stays until replaced)."""
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self.status.configure(text=f"{stamp}  {message}" if message else "")
+        except tk.TclError:
+            pass
+
     def _on_tab_modified(self, tab: EditorTab) -> None:
         self._update_title()
+        # new unsaved changes: an "Auto-saved ..." note no longer applies
+        try:
+            if getattr(tab, "dirty", False) and "Auto-saved" in str(self.status.cget("text")):
+                self.status.configure(text="")
+        except (tk.TclError, AttributeError):
+            pass
 
     def _on_tab_changed(self, event=None) -> None:
         # Preserve tab selection when leaving / returning
@@ -987,9 +1115,24 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         stem_var = tk.StringVar(value=f"{get_stem_min_seconds():g}")
         ttk.Spinbox(frm, from_=0, to=30, increment=0.25, width=6, textvariable=stem_var).grid(
             row=5, column=1, sticky="w", padx=(8, 0), pady=(10, 4))
-        ttk.Label(frm, text="(shorter vocal / non-vocal changes are merged into their\n"
+        ttk.Label(frm, text="(shorter vocal / instrumental changes are merged into their\n"
                             " neighbors; applies to audio tabs right away)",
                   foreground="#666666").grid(row=6, column=0, columnspan=2, sticky="w")
+
+        case_var = tk.BooleanVar(value=bool(get_preference(PREF_LAYOUT_SORT_CASE, True)))
+        ttk.Checkbutton(frm, text="Case-sensitive sorting in xLights layout lists", variable=case_var).grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(frm, text="(on: \"Zebra\" before \"apple\", as in xLights)",
+                  foreground="#666666").grid(row=8, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(frm, text="Start before a rising edge (seconds):").grid(row=9, column=0, sticky="w",
+                                                                          pady=(10, 4))
+        lead_var = tk.StringVar(value=f"{utils.get_edge_lead_in():g}")
+        ttk.Spinbox(frm, from_=0, to=2, increment=0.05, width=6, textvariable=lead_var).grid(
+            row=9, column=1, sticky="w", padx=(8, 0), pady=(10, 4))
+        ttk.Label(frm, text="(cards' \u2196/\u2197 put Start this much before the detected edge --\n"
+                            " the sound usually starts a little earlier)",
+                  foreground="#666666").grid(row=10, column=0, columnspan=2, sticky="w")
 
         def on_ok():
             try:
@@ -1014,6 +1157,11 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
                         ctl.resmooth_regions()
             except ValueError:
                 pass
+            self.set_layout_sort_case(bool(case_var.get()))
+            try:
+                set_preference("edge_lead_in", max(0.0, min(2.0, float(lead_var.get()))))
+            except ValueError:
+                pass
             from utils import save_recent
             save_recent(load_recent())
             self._rebuild_recent_menu()
@@ -1024,13 +1172,24 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             win.destroy()
 
         btn_frm = ttk.Frame(frm)
-        btn_frm.grid(row=7, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        btn_frm.grid(row=11, column=0, columnspan=2, pady=(12, 0), sticky="e")
         ttk.Button(btn_frm, text="OK", command=on_ok).pack(side="right", padx=(4, 0))
         ttk.Button(btn_frm, text="Cancel", command=on_cancel).pack(side="right")
 
         win.bind("<Return>", lambda e: on_ok())
         win.bind("<Escape>", lambda e: on_cancel())
         spin.focus_set()
+
+    def set_layout_sort_case(self, value: bool) -> None:
+        """Preferences: case-sensitive sorting in xlayout tabs (re-sorts
+        the open ones right away)."""
+        if bool(get_preference(PREF_LAYOUT_SORT_CASE, True)) == value:
+            return
+        set_preference(PREF_LAYOUT_SORT_CASE, value)
+        for t in self.tabs:
+            view = getattr(getattr(t, "canvas", None), "_layout_view", None)
+            if view is not None:
+                view.refresh_all()
 
     # ------------------------------------------------------------------ Edit helpers
     def _text_event(self, sequence: str) -> None:
@@ -1140,6 +1299,13 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         data["recent"] = load_recent()
         return data
 
+    def _quit_cancelled(self) -> None:
+        """The user stayed (Cancel in a close question): a later Ctrl+C
+        asks again rather than exiting at once."""
+        guard = getattr(self, "_interrupt_guard", None)
+        if guard is not None:
+            guard.reset()
+
     def on_quit(self) -> None:
         # Ask about every dirty tab
         for tab in list(self.tabs):
@@ -1148,6 +1314,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
                 if isinstance(tab, EditorTab):
                     self.notebook.select(tab.frame)
                 if not hook():
+                    self._quit_cancelled()
                     return
             if isinstance(tab, EditorTab) and tab.dirty:
                 self.notebook.select(tab.frame)
@@ -1157,9 +1324,11 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
                     f'"{name}" has unsaved changes.\nSave before quitting?',
                 )
                 if answer is None:
+                    self._quit_cancelled()
                     return
                 if answer:
                     if not self.save_file():
+                        self._quit_cancelled()
                         return
             # Persist sash even for clean tabs
             if isinstance(tab, EditorTab):
@@ -1170,7 +1339,32 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         self._save_window_geometry()
         save_session_data(self._collect_session())
         debug(1, "{{pink}}Session saved, exiting")
+        self._teardown_and_destroy()
+
+    def _teardown_and_destroy(self) -> None:
+        """Take the window down quickly: hide it first (no repaints of a
+        half-destroyed window), let each plugin drop its widgets in one go
+        (tab.teardown_hook -- e.g. a timing track's hundreds of card
+        widgets, which Tk would otherwise remove one by one, re-laying out
+        the text each time), then destroy. Each step's time goes to the
+        debug log."""
+        t0 = time.monotonic()
+        try:
+            self.withdraw()
+        except tk.TclError:
+            pass
+        for tab in list(self.tabs):
+            hook = getattr(tab, "teardown_hook", None)
+            if callable(hook):
+                t1 = time.monotonic()
+                try:
+                    hook()
+                except Exception as exc:
+                    debug(1, f"{{red}}teardown {getattr(tab, 'filepath', '?')}: {exc}")
+                debug(2, f"quit: teardown {abbreviated_name(tab.filepath)} {1000 * (time.monotonic() - t1):.0f} ms")
+        t1 = time.monotonic()
         self.destroy()
+        debug(2, f"quit: destroy {1000 * (time.monotonic() - t1):.0f} ms, total {1000 * (time.monotonic() - t0):.0f} ms")
 
 
 def parse_args(argv: List[str]):
@@ -1220,9 +1414,195 @@ def parse_args(argv: List[str]):
     return files, fresh, debug_level
 
 
+class InterruptGuard:
+    """Ctrl+C in the terminal: the first one is a normal close request (the
+    app asks about unsaved changes, as for the window's close button); a
+    second one exits at once.
+
+    The second Ctrl+C works even if the GUI is stuck: a small thread
+    watches the signal wake-up pipe, which the interpreter writes to as
+    soon as the signal arrives -- before any Python code (which a stuck
+    main thread wouldn't get to) runs. A periodic no-op timer keeps Tk's
+    loop returning to Python, so the first Ctrl+C is handled promptly.
+
+    Also a stall watch: if the Tk loop doesn't come round for
+    STALL_SECONDS, it prints the app's last steps (utils.crumb) with their
+    times, and every thread's Python stack, to the terminal -- and again
+    every REPORT_EVERY seconds while it stays stuck, so it shows whether
+    the app is still running Python callbacks (new steps) or Tk is stuck
+    on its own (nothing new). While stuck, a single Ctrl+C exits.
+    The disabled diagnostic features (TRACKED_DISABLE) are listed at start."""
+
+    STALL_SECONDS = 5
+    REPORT_EVERY = 10
+
+    def __init__(self, app):
+        import os
+        import signal
+        import threading
+        self.app = app
+        self.count = 0
+        self._lock = threading.Lock()
+        try:
+            r, w = os.pipe()
+            os.set_blocking(w, False)
+            signal.set_wakeup_fd(w)
+            self._pipe = r
+            signal.signal(signal.SIGINT, self._on_sigint)
+            threading.Thread(target=self._watch, name="interrupt-guard", daemon=True).start()
+        except (ValueError, OSError, AttributeError) as exc:     # not the main thread / no pipes
+            debug(1, f"{{red}}Ctrl+C guard not installed: {exc}")
+            return
+        app._interrupt_guard = self
+        self._beat = time.monotonic()
+        self._stalled_since = None
+        threading.Thread(target=self._stall_watch, name="stall-watch", daemon=True).start()
+        disabled = utils.DISABLED_FEATURES
+        if disabled:
+            sys.stderr.write(f"trackED: diagnostics -- disabled: {', '.join(sorted(disabled))}\n")
+        self._tick()
+
+    def reset(self):
+        with self._lock:
+            self.count = 0
+
+    def _watch(self):
+        import os
+        import signal
+        while True:
+            try:
+                data = os.read(self._pipe, 64)
+            except OSError:
+                return
+            for byte in data:
+                if byte == signal.SIGINT:
+                    with self._lock:
+                        self.count += 1
+                        count = self.count
+                    if count >= 2 or self._stalled_since is not None:
+                        sys.stderr.write("\nCtrl+C while the GUI is stuck (or a second Ctrl+C): "
+                                         "exiting without saving.\n")
+                        sys.stderr.flush()
+                        os._exit(130)
+
+    def _on_sigint(self, signum, frame):
+        # runs in the main thread once Python gets control
+        sys.stderr.write("\nCtrl+C: closing (press Ctrl+C again to exit at once)\n")
+        sys.stderr.flush()
+        try:
+            self.app.after(0, self.app.on_quit)
+        except tk.TclError:
+            pass
+
+    def _tick(self):
+        now = time.monotonic()
+        # how late this tick came: the time the main loop spent busy
+        self._busy = getattr(self, "_busy", 0.0) + max(0.0, now - getattr(self, "_beat", now) - 0.25)
+        self._beat = now
+        if self._stalled_since is not None:
+            sys.stderr.write(f"trackED: responsive again after {self._beat - self._stalled_since:.1f} s\n")
+            sys.stderr.flush()
+            self._stalled_since = None
+        try:
+            self.app.after(250, self._tick)
+        except tk.TclError:
+            pass
+
+    BUSY_WINDOW = 5.0
+    BUSY_REPORT = 0.5          # report when the main loop was busy more than half the window
+
+    def _busy_watch(self, now):
+        """Busy but not stuck (e.g. CPU at 100% while the window still
+        responds): every BUSY_WINDOW seconds, if the main loop was busy more
+        than half that time, print which app steps ran how often."""
+        start = getattr(self, "_busy_window_start", None)
+        if start is None:
+            self._busy_window_start, self._busy_at_start = now, getattr(self, "_busy", 0.0)
+            self._cpu_at_start, self._threads_at_start = time.process_time(), self._thread_cpu()
+            return
+        if now - start < self.BUSY_WINDOW:
+            return
+        busy = getattr(self, "_busy", 0.0) - self._busy_at_start
+        cpu = time.process_time() - self._cpu_at_start
+        threads_now = self._thread_cpu()
+        threads_then = self._threads_at_start
+        self._busy_window_start, self._busy_at_start = now, getattr(self, "_busy", 0.0)
+        self._cpu_at_start, self._threads_at_start = time.process_time(), threads_now
+        span = now - start
+        if busy < self.BUSY_REPORT * span and cpu < 0.8 * span:
+            return
+        counts = {}
+        for first, label, count, last in utils.recent_crumbs():
+            if last >= start:
+                key = re.sub(r"\d+", "#", label)
+                counts[key] = counts.get(key, 0) + count
+        top = sorted(counts.items(), key=lambda kv: -kv[1])[:12]
+        lines = [f"\ntrackED: busy -- main loop {100 * busy / span:.0f}%, CPU {100 * cpu / span:.0f}% "
+                 f"of the last {span:.0f} s (still responding)."]
+        per_thread = sorted(((name, sec - threads_then.get(name, 0.0)) for name, sec in threads_now.items()),
+                            key=lambda kv: -kv[1])
+        if per_thread:
+            lines.append("CPU by thread: " + ", ".join(f"{name} {sec:.1f} s" for name, sec in per_thread[:5]
+                                                       if sec >= 0.05))
+        lines.append("App steps in that time (# = a number):")
+        lines += [f"  {n:6d}  {label}" for label, n in top] or ["  (none -- the main thread's time went to Tk itself)"]
+        sys.stderr.write("\n".join(lines) + "\n")
+        sys.stderr.flush()
+
+    @staticmethod
+    def _thread_cpu():
+        """CPU seconds used so far by each of this process's threads, by
+        thread name (Linux /proc; {} elsewhere)."""
+        names = {getattr(t, "native_id", None): t.name for t in threading.enumerate()}
+        out = {}
+        try:
+            tick = os.sysconf("SC_CLK_TCK")
+            for tid in os.listdir("/proc/self/task"):
+                with open(f"/proc/self/task/{tid}/stat") as f:
+                    fields = f.read().rsplit(")", 1)[1].split()
+                sec = (int(fields[11]) + int(fields[12])) / tick       # utime + stime
+                name = names.get(int(tid)) or f"thread {tid}"
+                out[name] = out.get(name, 0.0) + sec
+        except (OSError, ValueError, IndexError, AttributeError):
+            return {}
+        return out
+
+    def _stall_watch(self):
+        import faulthandler
+        last_report = 0.0
+        while True:
+            time.sleep(1.0)
+            now = time.monotonic()
+            try:
+                self._busy_watch(now)
+            except Exception:
+                pass
+            stalled = now - self._beat
+            if stalled < self.STALL_SECONDS:
+                continue
+            if self._stalled_since is None:
+                self._stalled_since = self._beat
+            if now - last_report < self.REPORT_EVERY:
+                continue
+            last_report = now
+            lines = [f"\ntrackED: the GUI has not responded for {stalled:.1f} s. Last app steps "
+                     "(seconds before now, xN = repeated):"]
+            for first, label, count, last in utils.recent_crumbs()[-40:]:
+                rep_txt = f" x{count}" if count > 1 else ""
+                lines.append(f"  -{now - last:7.2f}  {label}{rep_txt}")
+            lines.append("Python stacks:")
+            sys.stderr.write("\n".join(lines) + "\n")
+            sys.stderr.flush()
+            try:
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
     files, fresh, dbg = parse_args(sys.argv)
     app = EditorApp(files_to_open=files, fresh=fresh, debug_level=dbg)
+    InterruptGuard(app)
     app.mainloop()
 
 #eof
