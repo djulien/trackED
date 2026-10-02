@@ -55,7 +55,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Dict, List, Optional
 
-from utils import insert_styled_text, register_modifier_button, crumb, feature_on
+from utils import insert_styled_text, register_modifier_button, crumb, fast_destroy
 
 import timing_helpers as th
 
@@ -96,7 +96,6 @@ LIST_BG = "#1e1e1e"       # the card list's background (between cards)
 CARD_GAP = 3              # pixels between cards
 WHEEL_UNITS = 3           # mouse-wheel step in the card list
 PLAY_LOOKAHEAD_CARDS = 2  # while playing, keep this many cards after the current one in view
-PATCH_MAX_CARDS = 20      # add/remove up to this many cards in place (or a third of the track), else rebuild
 BUILD_AT_ONCE = 40        # tracks with more cards than this are built in slices ("Loading track ...")
 BUILD_SLICE_SEC = 0.05    # work per event-loop pass while building
 BUILD_MIN_CARDS = 5       # ...but at least this many cards per pass
@@ -109,25 +108,6 @@ JOIN_BTN_WIDTH = 11
 NO_VOICE = "(no voice)"
 WORD_TIP_DELAY_MS = 600
 VOICE_BTN_MAX_CHARS = 18
-
-
-def _longest_increasing(items, key):
-    """The longest subsequence of items whose key() values increase (the
-    cards that can stay where they are when the order changes)."""
-    tails, prev, idx = [], [None] * len(items), []
-    import bisect
-    keys = [key(x) for x in items]
-    for i, k in enumerate(keys):
-        j = bisect.bisect_left(tails, k)
-        if j == len(tails):
-            tails.append(k); idx.append(i)
-        else:
-            tails[j] = k; idx[j] = i
-        prev[i] = idx[j - 1] if j > 0 else None
-    out, i = [], idx[-1] if idx else None
-    while i is not None:
-        out.append(items[i]); i = prev[i]
-    return out[::-1]
 
 
 def voice_button_text(voices, label: str = "") -> str:
@@ -387,8 +367,6 @@ class WrapField:
         long label right at a wrapping width can make the layout see-saw:
         taller -> the card shifts the panel's layout -> narrower/wider ->
         shorter -> ... without end."""
-        if not feature_on("fit"):
-            return
         laid_out = self._laid_out()
         if laid_out and self._pending is not None:
             text, self._pending = self._pending, None
@@ -448,11 +426,9 @@ class TimingPanel:
         self._shift_edge = False
         self._word_tip = None
         self._word_tip_after = None
-        self.spacers: List[tk.Frame] = []
         self._header_label = None
         self._extras: List[tk.Widget] = []
         try:
-            self.text.bind("<Configure>", self._on_text_configure, add="+")
             self.text.bind("<Button-1>", self._click_off, add="+")
             # Up/Down in the card list: the previous/next card (instead of
             # the Text widget moving its cursor across the embedded cards)
@@ -468,12 +444,9 @@ class TimingPanel:
         self.mode = "closing"
         self._build_gen = getattr(self, "_build_gen", 0) + 1     # stop a build in progress
         if getattr(self, "list", None) is not None:
-            try:
-                self.list.destroy()              # the canvas and every card in one Tk call
-            except tk.TclError:
-                pass
+            fast_destroy(self.list)              # the canvas and every card in one Tk call
             self.list = None
-        self.cards, self.order, self.spacers = {}, [], []
+        self.cards, self.order = {}, []
 
     def sync(self, force: bool = False) -> None:
         if self.mode == "closing":
@@ -496,7 +469,7 @@ class TimingPanel:
             # same track, some cards added/removed/moved (delete, split,
             # merge, a time edit past a neighbor): change just those cards
             crumb(f"panel.sync: patch to {len(marks)} cards")
-            if getattr(self, "building", False) or not feature_on("patch") or not self._patch(marks):
+            if getattr(self, "building", False) or not self._patch(marks):
                 self._build(track, marks)
             else:
                 self._update(track, marks)
@@ -519,11 +492,9 @@ class TimingPanel:
     def show_info(self) -> None:
         self._clear()
         self._show_list(False)
-        self._show_line_numbers(True)
         self.mode = "info"
         self.track_id = None
         self._with_text(lambda: (self.text.delete("1.0", "end"), insert_styled_text(self.text, self.ctl.info_text)))
-        self._refresh_gutter()
 
     def append_info(self, styled: str) -> None:
         """Info-mode text grows as analysis/transcription progress; only
@@ -625,6 +596,11 @@ class TimingPanel:
             return
         width = self._list_width()
         crumb(f"panel list size {width}x{self._list_height()}")
+        if width == getattr(self, "_items_width", None):
+            self._apply_field_cap()
+            self._schedule_relayout()
+            return
+        self._items_width = width
         for card in self.cards.values():
             try:
                 self.canvas.itemconfigure(card["item"], width=width)
@@ -670,10 +646,12 @@ class TimingPanel:
                     pass
                 card["shown"] = True
             positions[mid] = y
-            try:
-                self.canvas.coords(card["item"], 0, y)
-            except (tk.TclError, KeyError):
-                pass
+            if card.get("y") != y:              # only move what moved (each move is X-server work)
+                try:
+                    self.canvas.coords(card["item"], 0, y)
+                    card["y"] = y
+                except (tk.TclError, KeyError):
+                    pass
             y += height + CARD_GAP
         if waiting:
             self._schedule_relayout(delay_ms=30)
@@ -754,7 +732,6 @@ class TimingPanel:
         self._extras = []
         self.cards = {}
         self.order = []
-        self.spacers = []
         self._positions = {}
         if getattr(self, "list", None) is not None:
             try:
@@ -766,7 +743,7 @@ class TimingPanel:
             self._schedule_dispose()
         crumb("panel._clear done")
 
-    DISPOSE_PER_PASS = 5
+    DISPOSE_PER_PASS = 25
 
     def _schedule_dispose(self):
         if getattr(self, "_dispose_pending", None) is None:
@@ -781,10 +758,7 @@ class TimingPanel:
         self._dispose_pending = None
         trash = getattr(self, "_trash", [])
         for widget in trash[:self.DISPOSE_PER_PASS]:
-            try:
-                widget.destroy()
-            except tk.TclError:
-                pass
+            fast_destroy(widget)
         del trash[:self.DISPOSE_PER_PASS]
         if trash:
             self._schedule_dispose()
@@ -798,14 +772,13 @@ class TimingPanel:
         self._ensure_list()
         self.mode = "track"
         self._show_list(True)
-        self._show_line_numbers(False)
         self.track_id = track["id"] if track else None
         self.order = [m["id"] for m in marks]
         self._build_gen = getattr(self, "_build_gen", 0) + 1
         self.building = False
         self._make_header(track, marks).pack(side="left", fill="x", expand=True)
         crumb(f"panel._build {len(marks)} cards")
-        if len(marks) <= BUILD_AT_ONCE or not feature_on("slices"):
+        if len(marks) <= BUILD_AT_ONCE:
             self._add_cards(marks, 0, len(marks))
             self._finish_build(track, marks)
             return
@@ -1142,11 +1115,6 @@ class TimingPanel:
             for seq in ("<Control-y>", "<Control-Y>", "<Control-Shift-z>", "<Control-Shift-Z>"):
                 entry.bind(seq, lambda ev, mid=mark["id"]: self._undo_redo(mid, "redo"))
 
-        spacer = tk.Frame(f, height=1, width=1, bg=normal_bg)     # (cards take the list's width)
-        w["labels"].append(spacer)
-        spacer.grid(row=2, column=0, columnspan=ncols, sticky="w")
-        self.spacers.append(spacer)
-        w["spacer"] = spacer
 
         for widget in [f] + list(f.winfo_children()):
             if not isinstance(widget, tk.Entry):
@@ -1154,70 +1122,6 @@ class TimingPanel:
                             add="+")
         self._forward_wheel(f)
         return w
-
-    def _show_line_numbers(self, visible):
-        """The tab's line numbers: off while cards are shown (each card has
-        its own #), on for the info text."""
-        setter = getattr(getattr(self.ctl, "tab", None), "set_line_numbers_visible", None)
-        if callable(setter) and feature_on("linenumbers"):
-            crumb(f"panel line numbers {'on' if visible else 'off'}")
-            try:
-                setter(visible)
-            except tk.TclError:
-                pass
-
-    def _refresh_gutter(self, delay_ms: int = 40) -> None:
-        """Re-align the tab's line-number gutter with the cards. Card lines
-        are as tall as the card, so each number is placed beside the card's
-        first row (tab.gutter_offsets). Deferred (the embedded windows only
-        have real sizes once Tk has laid them out) and coalesced: however
-        often it's asked for -- every scroll step -- one refresh runs, and
-        it measures only the cards in view."""
-        tab = self.ctl.tab
-        if tab is None or not hasattr(tab, "_update_line_numbers"):
-            return
-        if self.mode == "track" and hasattr(tab, "set_line_numbers_visible"):
-            return               # no line numbers while cards are shown
-        if getattr(self, "_gutter_pending", None) is not None:
-            return
-
-        def run():
-            self._gutter_pending = None
-            offsets = {}
-            if self.mode == "track":
-                first, last = self._visible_lines()
-                for line in range(first, last + 1):
-                    i = line - 2                     # line 1 is the header
-                    if not 0 <= i < len(self.order):
-                        continue
-                    card = self.cards.get(self.order[i])
-                    if not card:
-                        continue
-                    try:
-                        num = card["num"]
-                        offsets[line] = int(num.winfo_y()) + int(num.winfo_height()) // 2
-                    except (tk.TclError, TypeError, ValueError):
-                        pass
-            tab.gutter_offsets = offsets or None
-            try:
-                tab._update_line_numbers()
-            except tk.TclError:
-                pass
-        try:
-            self._gutter_pending = self.text.after(delay_ms, run)
-        except tk.TclError:
-            self._gutter_pending = None
-
-    def _visible_lines(self):
-        """First and last text lines in view (all lines if unknown)."""
-        try:
-            top = str(self.text.index("@0,0"))
-            bottom = str(self.text.index(f"@0,{int(self.text.winfo_height())}"))
-            if re.fullmatch(r"\d+\.\d+", top) and re.fullmatch(r"\d+\.\d+", bottom):
-                return int(top.split(".")[0]), int(bottom.split(".")[0])
-        except (tk.TclError, TypeError, ValueError, AttributeError):
-            pass
-        return 1, len(self.order) + 2
 
     def _forward_wheel(self, frame):
         """Embedded widgets swallow the mouse wheel; pass it to the Text
@@ -1234,7 +1138,7 @@ class TimingPanel:
                 widget.bind(seq, wheel, add="+")
 
     def _card_width(self) -> int:
-        """The cards' width (their spacers): the text panel's width less a
+        """The cards' text width: the card list's width less a
         margin; a guess while the panel isn't laid out yet."""
         return max(300, self._list_width() - 12)
 
@@ -1277,24 +1181,6 @@ class TimingPanel:
             except (tk.TclError, TypeError, ValueError, AttributeError):
                 pass
 
-    def _on_text_configure(self, event=None):
-        # The cards follow the card list's size now (_on_list_configure).
-        if self.mode != "track" or not self.spacers or not feature_on("spacers"):
-            return
-        try:
-            width = max(300, self.text.winfo_width() - 40)
-        except tk.TclError:
-            return
-        crumb(f"panel._on_text_configure width {width}")
-        for sp in self.spacers:
-            try:
-                if int(sp.cget("width")) != width:       # only real changes (each one re-lays out a card)
-                    sp.configure(width=width)
-            except (tk.TclError, TypeError, ValueError):
-                pass
-        self._refresh_gutter()
-
-    # ------------------------------------------------------------------ updating
     def _focused(self):
         try:
             return self.text.focus_get()
@@ -1458,7 +1344,7 @@ class TimingPanel:
                 except tk.TclError:
                     pass
         card = self.cards.get(mid) if mid else None
-        if card is not None and feature_on("see"):
+        if card is not None:
             crumb("panel see playing")
             try:
                 i = self.order.index(mid)
@@ -1474,7 +1360,7 @@ class TimingPanel:
     def _scroll_to_selected(self):
         mid = self.ctl.selected_mark_id()
         card = self.cards.get(mid)
-        if card is None or not feature_on("see"):
+        if card is None:
             return
         crumb("panel see selected")
         self._see(mid)

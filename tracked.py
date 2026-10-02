@@ -323,6 +323,29 @@ DIALOG_OPTIONS = (
 )
 
 
+PREF_INPUT_METHODS = "use_input_methods"
+
+
+def apply_input_methods(root) -> bool:
+    """Whether Tk talks to the desktop's X input method (XIM) for typing.
+
+    With ibus (and other XIM servers), Tk sets up an input context for each
+    text/entry widget and talks to the input method server synchronously.
+    A timing track has several such fields per card, so building or
+    switching a track with ~70 cards kept this app waiting on ibus-daemon
+    for seconds (busy reports: main loop busy, almost no CPU of our own;
+    htop: ibus-daemon). Off by default (Preferences); then Tk reads the
+    keyboard directly: plain typing works, but anything the input method
+    composes (IME input, and possibly dead-key / Compose-key accents,
+    depending on the desktop setup) needs it on."""
+    use = bool(get_preference(PREF_INPUT_METHODS, False))
+    try:
+        root.tk.call("tk", "useinputmethods", "-displayof", root, 1 if use else 0)
+    except (tk.TclError, AttributeError):
+        pass
+    return use
+
+
 def apply_dialog_colors(root) -> None:
     """Give Tk's built-in dialogs explicit, readable colors (see above).
     Call once, right after the root window is created."""
@@ -343,6 +366,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
     ):
         super().__init__()
         apply_dialog_colors(self)      # before any dialog can open
+        apply_input_methods(self)      # before any text widget is made
         self.title(APP_NAME)
         self.minsize(400, 300)
         self._restore_window_geometry()
@@ -1134,6 +1158,13 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
                             " the sound usually starts a little earlier)",
                   foreground="#666666").grid(row=10, column=0, columnspan=2, sticky="w")
 
+        im_var = tk.BooleanVar(value=bool(get_preference(PREF_INPUT_METHODS, False)))
+        ttk.Checkbutton(frm, text="Use the desktop's input method (IME, e.g. ibus) in text fields",
+                        variable=im_var).grid(row=11, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(frm, text="(off: much faster with many timing cards; on: needed for IME typing and\n"
+                            " possibly dead-key/Compose accents -- fully applies after a restart)",
+                  foreground="#666666").grid(row=12, column=0, columnspan=2, sticky="w")
+
         def on_ok():
             try:
                 val = int(max_var.get())
@@ -1158,6 +1189,9 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             except ValueError:
                 pass
             self.set_layout_sort_case(bool(case_var.get()))
+            if bool(im_var.get()) != bool(get_preference(PREF_INPUT_METHODS, False)):
+                set_preference(PREF_INPUT_METHODS, bool(im_var.get()))
+                apply_input_methods(self)
             try:
                 set_preference("edge_lead_in", max(0.0, min(2.0, float(lead_var.get()))))
             except ValueError:
@@ -1172,7 +1206,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             win.destroy()
 
         btn_frm = ttk.Frame(frm)
-        btn_frm.grid(row=11, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        btn_frm.grid(row=13, column=0, columnspan=2, pady=(12, 0), sticky="e")
         ttk.Button(btn_frm, text="OK", command=on_ok).pack(side="right", padx=(4, 0))
         ttk.Button(btn_frm, text="Cancel", command=on_cancel).pack(side="right")
 
@@ -1363,7 +1397,15 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
                     debug(1, f"{{red}}teardown {getattr(tab, 'filepath', '?')}: {exc}")
                 debug(2, f"quit: teardown {abbreviated_name(tab.filepath)} {1000 * (time.monotonic() - t1):.0f} ms")
         t1 = time.monotonic()
-        self.destroy()
+        # One Tk call for the whole window tree (tkinter's destroy() would
+        # take every widget down separately -- seconds of X-server work).
+        try:
+            utils.fast_destroy(self)
+            import tkinter
+            if getattr(tkinter, "_default_root", None) is self:
+                tkinter._default_root = None
+        except Exception:
+            self.destroy()
         debug(2, f"quit: destroy {1000 * (time.monotonic() - t1):.0f} ms, total {1000 * (time.monotonic() - t0):.0f} ms")
 
 
@@ -1431,7 +1473,7 @@ class InterruptGuard:
     every REPORT_EVERY seconds while it stays stuck, so it shows whether
     the app is still running Python callbacks (new steps) or Tk is stuck
     on its own (nothing new). While stuck, a single Ctrl+C exits.
-    The disabled diagnostic features (TRACKED_DISABLE) are listed at start."""
+    Busy-but-responding stretches get a lighter report (_busy_watch)."""
 
     STALL_SECONDS = 5
     REPORT_EVERY = 10
@@ -1457,9 +1499,6 @@ class InterruptGuard:
         self._beat = time.monotonic()
         self._stalled_since = None
         threading.Thread(target=self._stall_watch, name="stall-watch", daemon=True).start()
-        disabled = utils.DISABLED_FEATURES
-        if disabled:
-            sys.stderr.write(f"trackED: diagnostics -- disabled: {', '.join(sorted(disabled))}\n")
         self._tick()
 
     def reset(self):

@@ -181,9 +181,6 @@ class FakeTab(FakeWidget):
         self.dirty_since = None
         self.title_refreshes = 0
 
-    def set_line_numbers_visible(self, visible):
-        self._line_numbers_shown = bool(visible)
-
     def mark_dirty(self):
         if not self.dirty:
             self.dirty = True
@@ -2477,17 +2474,6 @@ def test_undo_routing_and_card_style(th, wt, media):
     entries = [card["start"], card["end"], card["text"]]
     check(all(e.cget("fg") == tp.FG and e.cget("bg") == tp.ENTRY_BG for e in entries),
           "card fields have explicit text/background colors")
-    ctl.render_waveform()
-    run_afters()
-    if hasattr(tab, "set_line_numbers_visible"):
-        check(getattr(tab, "_line_numbers_shown", True) is False and not tab.gutter_offsets,
-              "while cards are shown the tab's line numbers are hidden (each card shows its own #)")
-        ctl.selected = None; ctl.render_waveform(); run_afters()
-        check(getattr(tab, "_line_numbers_shown", True) is True, "...and back for the info text")
-    else:
-        check(not tab.gutter_offsets, "no gutter offsets while cards are shown")
-    ctl.selected = None; ctl.render_waveform(); run_afters()
-    check(not tab.gutter_offsets, "back in the info view, line numbers use normal centering")
 
 
 def test_word_adjustments(th):
@@ -3556,7 +3542,6 @@ def test_card_speed(th, wt, media):
         check(not painted, "a redraw with nothing changed touches no card")
     finally:
         panel._paint, panel._set_entry = real_paint, real_set
-    check(tp._longest_increasing([5, 1, 2, 9, 3, 4], key=lambda x: x) == [1, 2, 3, 4], "longest increasing run")
 
 
 def test_round10(th, wt, media):
@@ -3695,12 +3680,6 @@ def test_round10(th, wt, media):
     tracked.EditorApp._on_tab_modified(app, types.SimpleNamespace(dirty=True))
     check(status.cget("text") == "Opened x", "...other messages stay")
 
-    # #11 gutter refreshes are coalesced
-    AFTERS.clear()
-    for _ in range(50):
-        panel._refresh_gutter(delay_ms=10)
-    check(len(AFTERS) <= 1, f"50 scroll steps -> one gutter refresh ({len(AFTERS)})")
-    run_afters()
 
     # #15 Ctrl+C
     calls = []
@@ -3785,8 +3764,6 @@ def test_round11(th, wt, media):
     # #2 prewarm
     check(not hasattr(panel, "_prewarm"), "no prewarm of the cards' windows (it set off the Tk stalls)")
 
-    # #8 no line numbers while cards are shown
-    check(tab._line_numbers_shown is False, "line numbers hidden while cards are shown")
 
     # #11 teardown
     ctl.teardown()
@@ -3798,9 +3775,11 @@ def test_round11(th, wt, media):
     calls = []
     fake_tab = types.SimpleNamespace(teardown_hook=lambda: calls.append("tab"), filepath=path)
     app = types.SimpleNamespace(tabs=[fake_tab], withdraw=lambda: calls.append("withdraw"),
-                                destroy=lambda: calls.append("destroy"))
+                                destroy=lambda: calls.append("slow destroy"), _w=".", children={},
+                                tk=types.SimpleNamespace(call=lambda *a: calls.append(a), deletecommand=lambda n: None))
     tracked.EditorApp._teardown_and_destroy(app)
-    check(calls == ["withdraw", "tab", "destroy"], "quitting: hide the window, let plugins drop their widgets, then destroy")
+    check(calls == ["withdraw", "tab", ("destroy", ".")],
+          "quitting: hide the window, let plugins drop their widgets, then destroy everything in one Tk call")
 
 
 def test_waveform_mod_hints(th, wt, media):
@@ -3923,9 +3902,6 @@ def test_diagnostics():
     got = utils.recent_crumbs()
     check([(c[1], c[2]) for c in got] == [("waveform render", 3), ("panel._build 70 cards", 1)],
           "breadcrumbs: repeats are counted, not listed again")
-    utils.DISABLED_FEATURES.add("prewarm")
-    check(not utils.feature_on("prewarm") and utils.feature_on("fit"), "TRACKED_DISABLE switches a feature off")
-    utils.DISABLED_FEATURES.discard("prewarm")
     out = io.StringIO()
     real_err, real_sleep = sys.stderr, time.sleep
     guard = tracked.InterruptGuard.__new__(tracked.InterruptGuard)
@@ -3965,8 +3941,8 @@ def test_stall_fixes(th, wt, media):
     ctl.selected = ("track", big["id"]); ctl.render_waveform(); run_afters()
     frames = [c["frame"] for c in panel.cards.values()]
     destroyed = []
-    for fr in frames:
-        fr.destroy = (lambda f_: (lambda: destroyed.append(f_)))(fr)
+    real_fast = tp.fast_destroy
+    tp.fast_destroy = lambda w: destroyed.append(w)
     deletes = []
     real_delete = panel.canvas.delete
     panel.canvas.delete = lambda *a: deletes.append(a) or real_delete(*a)
@@ -3977,7 +3953,8 @@ def test_stall_fixes(th, wt, media):
           "switching tracks: the old cards leave the list in one go, nothing destroyed card by card first")
     check(len(panel.cards) == 1, "...and the new track is shown right away")
     run_afters()
-    check(len(destroyed) == len(frames), "...the old cards' Python side is tidied up afterwards, a few at a time")
+    tp.fast_destroy = real_fast
+    check(all(f in destroyed for f in frames), "...the old cards are destroyed afterwards, a batch at a time")
     field = tp.WrapField(FakeWidget())
     field.widget.winfo_width = lambda: 1                  # not laid out yet
     field.widget.count = lambda *a: (8,)                  # what Tk would say at 1 pixel wide
@@ -4116,6 +4093,37 @@ def test_busy_report():
     check(out.getvalue() == "", "...and nothing when it's idle")
 
 
+def test_fast_destroy():
+    print("\n-- fast_destroy: one Tk call for a whole widget tree --")
+    import utils
+    calls, deleted = [], []
+    fake_tk = types.SimpleNamespace(call=lambda *a: calls.append(a), deletecommand=lambda n: deleted.append(n))
+    root = types.SimpleNamespace(_w=".list", _name="list", tk=fake_tk, _tclCommands=["cb1"], children={})
+    kids = [types.SimpleNamespace(_w=f".list.k{i}", _name=f"k{i}", tk=fake_tk, _tclCommands=[f"k{i}cb"],
+                                  children={}) for i in range(3)]
+    root.children = {k._name: k for k in kids}
+    master = types.SimpleNamespace(children={"list": root})
+    root.master = master
+    utils.fast_destroy(root)
+    check(calls == [("destroy", ".list")], "a widget tree is destroyed with a single Tk call")
+    check(sorted(deleted) == ["cb1", "k0cb", "k1cb", "k2cb"] and "list" not in master.children,
+          "...its callbacks are released and it's detached from its parent")
+
+
+def test_input_methods():
+    print("\n-- the desktop input method (ibus/XIM) is off unless chosen --")
+    import utils
+    import tracked
+    calls = []
+    root = types.SimpleNamespace(tk=types.SimpleNamespace(call=lambda *a: calls.append(a)))
+    utils.set_preference(tracked.PREF_INPUT_METHODS, False)
+    check(tracked.apply_input_methods(root) is False and calls[-1] == ("tk", "useinputmethods", "-displayof", root, 0),
+          "by default Tk doesn't use the X input method (ibus kept the app waiting with many cards)")
+    utils.set_preference(tracked.PREF_INPUT_METHODS, True)
+    check(tracked.apply_input_methods(root) is True and calls[-1][-1] == 1, "...a preference turns it on")
+    utils.set_preference(tracked.PREF_INPUT_METHODS, False)
+
+
 def test_dialog_colors():
     print("\n-- Tk's built-in dialogs get readable colors --")
     import tracked
@@ -4202,6 +4210,8 @@ def main():
         test_card_fits_panel(th, wt, media)
         test_card_list(th, wt, media)
         test_busy_report()
+        test_fast_destroy()
+        test_input_methods()
         test_playback_loop_and_cursor(th, wt, media)
         test_cursor_playhead_model(th, wt, media)
         test_shift_click_anchor(th, wt, media)

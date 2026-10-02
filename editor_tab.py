@@ -256,30 +256,11 @@ class EditorTab:
         self._numbers_pending = None
         self._update_line_numbers()
 
-    def set_line_numbers_visible(self, visible: bool) -> None:
-        """Show / hide the line-number gutter (the timing cards number
-        themselves, and redrawing the gutter on every scroll is costly
-        with cards in the lines)."""
-        if bool(visible) == getattr(self, "_line_numbers_shown", True):
-            return
-        self._line_numbers_shown = bool(visible)
-        try:
-            if visible:
-                self.linenumbers.grid()
-                self._update_line_numbers()
-            else:
-                self.linenumbers.delete("all")
-                self.linenumbers.grid_remove()
-        except tk.TclError:
-            pass
-
     def _update_line_numbers(self, event=None) -> None:
         """
         One number per logical line (not per wrapped screen row).
         Uses dlineinfo() so wrapped continuations do not get extra numbers.
         """
-        if not getattr(self, "_line_numbers_shown", True):
-            return
         try:
             from utils import crumb
             crumb("editor line numbers")
@@ -295,11 +276,6 @@ class EditorTab:
 
         # Optional override: list of original line numbers (e.g. log filter)
         orig = getattr(self, "_gutter_orig_nums", None)
-        # Optional per-line vertical offsets (line -> px from the line's
-        # top) for lines much taller than text, e.g. timing-panel cards
-        # embedded in the Text: the number then sits beside the card's
-        # first row instead of floating in the middle of it.
-        offsets = getattr(self, "gutter_offsets", None) or {}
 
         width = 40
         if orig:
@@ -315,7 +291,7 @@ class EditorTab:
             font = None
 
         # Only the lines in view (dlineinfo of every line is slow when the
-        # lines hold embedded widgets, e.g. a few hundred timing cards).
+        # lines hold embedded widgets or are very long).
         first, last = 1, end_line
         try:
             top = self.text.index("@0,0")
@@ -333,7 +309,7 @@ class EditorTab:
             label = str(orig[logical - 1]) if orig and logical <= len(orig) else str(logical)
             self.linenumbers.create_text(
                 width - 4,
-                y + offsets[logical] if logical in offsets else y + h // 2,
+                y + h // 2,
                 anchor="e",
                 text=label,
                 fill="#666666",
@@ -570,7 +546,6 @@ class EditorTab:
         # panel) to its own history, e.g. waveform_tab's timing marks.
         self.undo_hook = None
         self.redo_hook = None
-        self.gutter_offsets = None
         # save_hook: a plugin's own save for files whose changes live
         # elsewhere (waveform_tab saves marks to the sidecar cache, never
         # the audio). title_detail: extra text for the window title, e.g.

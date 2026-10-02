@@ -852,27 +852,16 @@ def _apply_mods() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Diagnostics: breadcrumbs of recent app steps (printed by tracked.py's
-# stall watch when the GUI stops responding) and switches to turn suspect
-# features off, for tracking down hangs:
-#     TRACKED_DISABLE=prewarm,fit,spacers,linenumbers,see,slices,patch ./tracked.py
+# Diagnostics: breadcrumbs of recent app steps, printed by tracked.py's
+# stall / busy reports when the GUI stops responding or runs flat out.
 # ---------------------------------------------------------------------------
 
 import collections as _collections
-import os as _os
 import threading as _threading
 import time as _time
 
 _crumbs = _collections.deque(maxlen=80)
 _crumb_lock = _threading.Lock()
-DISABLED_FEATURES = {f.strip().lower() for f in _os.environ.get("TRACKED_DISABLE", "").split(",") if f.strip()}
-
-
-def feature_on(name: str) -> bool:
-    """False if TRACKED_DISABLE lists this feature (diagnostics)."""
-    return name.lower() not in DISABLED_FEATURES
-
-
 def crumb(label: str) -> None:
     """Note an app step (cheap; a repeat of the last label just counts up)."""
     now = _time.monotonic()
@@ -887,4 +876,41 @@ def crumb(label: str) -> None:
 def recent_crumbs() -> list:
     with _crumb_lock:
         return list(_crumbs)
+
+
+def fast_destroy(widget) -> None:
+    """Destroy a widget and everything inside it with ONE Tk call.
+
+    tkinter's own destroy() walks the Python children and destroys each
+    widget separately -- for a card list that's thousands of separate X
+    window destructions (the X server / compositor then runs flat out for
+    seconds, while this process mostly waits). Tk destroying a parent
+    takes its children along in one go. Afterwards the Python wrappers are
+    detached and their callback commands deleted (Tcl only, no X traffic)."""
+    try:
+        widget.tk.call("destroy", widget._w)
+    except (tk.TclError, AttributeError):
+        pass
+    stack = [widget]
+    while stack:
+        w = stack.pop()
+        children = getattr(w, "children", None)
+        if isinstance(children, dict):
+            stack.extend(children.values())
+            w.children = {}
+        for name in getattr(w, "_tclCommands", None) or []:
+            try:
+                w.tk.deletecommand(name)
+            except (tk.TclError, AttributeError):
+                pass
+        try:
+            w._tclCommands = None
+        except AttributeError:
+            pass
+    master = getattr(widget, "master", None)
+    try:
+        if master is not None and master.children.get(widget._name) is widget:
+            del master.children[widget._name]
+    except (AttributeError, KeyError):
+        pass
 
