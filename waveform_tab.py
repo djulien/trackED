@@ -87,6 +87,7 @@ from utils import (insert_styled_text, get_preference, set_preference, get_stem_
 
 import timing_helpers as th
 import audio_analysis as aa
+import deps
 from timing_panel import TimingPanel
 
 VERSION = "1.1.0"
@@ -450,23 +451,240 @@ def _metadata_text(filepath):
     return out
 
 
-def _install_packages(packages, status_callback):
-    """Run `python -m pip install ...` and return (success, message).
-    Same approach audio_tab.py uses for its own missing dependencies."""
-    if not packages:
-        return True, "Nothing to install"
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade"] + packages
-    status_callback(f"Running: {' '.join(cmd)}")
+_MARK_CLIPBOARD = {"marks": []}    # shared by all audio tabs (copy marks between songs too)
+
+DLG_BG = "#f4f4f4"
+DLG_FG = "#1e1e1e"
+DLG_DIM = "#666666"
+DLG_LOG_BG = "#1e1e1e"
+DLG_LOG_FG = "#d4d4d4"
+
+
+class InstallDialog:
+    """The \u26a0 Install button's window: every missing dependency (see
+    deps.py) with what it's for and its download size, a check box each,
+    and "All missing". Installs in a worker thread with pip's output in a
+    log box; afterwards offers to restart trackED (new packages are only
+    picked up by a fresh start). Classic Tk widgets with explicit colors
+    (the desktop theme's light default text would be invisible here)."""
+
+    def __init__(self, parent, on_done=None):
+        self.on_done = on_done
+        self.items = deps.missing(include_broken=False)
+        self.vars = {}
+        self.busy = False
+        top = self.top = tk.Toplevel(parent)
+        top.title("Install optional packages")
+        top.configure(bg=DLG_BG)
+        try:
+            top.transient(parent.winfo_toplevel())
+        except tk.TclError:
+            pass
+        tk.Label(top, text="These packages are missing. Pick the ones you want; trackED works without\n"
+                           "them, but the features listed next to each need them.",
+                 bg=DLG_BG, fg=DLG_FG, justify="left").pack(anchor="w", padx=12, pady=(10, 6))
+        box = tk.Frame(top, bg=DLG_BG)
+        box.pack(fill="x", padx=12)
+        self.all_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(box, text="All missing", variable=self.all_var, command=self._toggle_all,
+                       bg=DLG_BG, fg=DLG_FG, activebackground=DLG_BG, activeforeground=DLG_FG,
+                       selectcolor="#ffffff", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w")
+        for row, dep in enumerate(self.items, start=1):
+            var = tk.BooleanVar(value=True)
+            self.vars[dep["key"]] = var
+            tk.Checkbutton(box, text=dep["key"], variable=var, command=self._sync_all,
+                           bg=DLG_BG, fg=DLG_FG, activebackground=DLG_BG, activeforeground=DLG_FG,
+                           selectcolor="#ffffff").grid(row=row, column=0, sticky="w", padx=(16, 8))
+            tk.Label(box, text=dep["purpose"], bg=DLG_BG, fg=DLG_FG, anchor="w").grid(row=row, column=1, sticky="w")
+            tk.Label(box, text=dep["size"], bg=DLG_BG, fg=DLG_DIM, anchor="w").grid(row=row, column=2,
+                                                                                 sticky="w", padx=(12, 0))
+        broken = [(d, deps.status(d)[1]) for d in deps.DEPENDENCIES if deps.status(d)[0] == "broken"]
+        for dep, note in broken:
+            tk.Label(top, text=f"{dep['key']}: {note}", bg=DLG_BG, fg="#b00020",
+                     justify="left").pack(anchor="w", padx=12, pady=(6, 0))
+        self.log = tk.Text(top, height=10, width=90, bg=DLG_LOG_BG, fg=DLG_LOG_FG, insertbackground=DLG_LOG_FG,
+                           wrap="word", state="disabled")
+        self.log.pack(fill="both", expand=True, padx=12, pady=(10, 4))
+        btns = tk.Frame(top, bg=DLG_BG)
+        btns.pack(fill="x", padx=12, pady=(4, 10))
+        self.close_btn = tk.Button(btns, text="Close", command=self.close, bg="#e0e0e0", fg=DLG_FG,
+                                   activebackground="#d0d0d0", activeforeground=DLG_FG)
+        self.close_btn.pack(side="right")
+        self.install_btn = tk.Button(btns, text="Install selected", command=self.install, bg="#2e7d32", fg="#ffffff",
+                                     activebackground="#388e3c", activeforeground="#ffffff")
+        self.install_btn.pack(side="right", padx=(0, 8))
+        top.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _toggle_all(self):
+        for var in self.vars.values():
+            var.set(bool(self.all_var.get()))
+
+    def _sync_all(self):
+        self.all_var.set(all(v.get() for v in self.vars.values()))
+
+    def selected(self):
+        return [k for k, v in self.vars.items() if v.get()]
+
+    def _log(self, line):
+        try:
+            self.log.configure(state="normal")
+            self.log.insert("end", line + "\n")
+            self.log.see("end")
+            self.log.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    def install(self):
+        keys = self.selected()
+        if self.busy or not keys:
+            return
+        self.busy = True
+        self.install_btn.configure(state="disabled", text="Installing...")
+        self._log("Installing " + ", ".join(keys) + " -- large packages can take several minutes.")
+        lines = []
+        lock = threading.Lock()
+
+        def log(line):                     # worker thread: queue only, never touch Tk
+            with lock:
+                lines.append(line)
+
+        def worker():
+            result = deps.install(keys, log=log)
+            with lock:
+                lines.append(None)
+                self._result = result
+
+        def pump():
+            with lock:
+                batch, lines[:] = list(lines), []
+            for line in batch:
+                if line is None:
+                    self._finished(*self._result)
+                    return
+                self._log(line)
+            try:
+                self.top.after(150, pump)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.top.after(150, pump)
+
+    def _finished(self, ok, failed):
+        self.busy = False
+        for key, why in failed:
+            self._log(f"NOT installed: {key} -- {why}")
+        if ok:
+            self._log("Installed: " + ", ".join(ok))
+        self.install_btn.configure(state="normal", text="Install selected")
+        if self.on_done:
+            self.on_done(ok, failed)
+
+    def close(self):
+        if self.busy and not messagebox.askyesno(
+                "Install", "An install is still running. Close this window anyway?\n"
+                           "(The install keeps running in the background.)", parent=self.top):
+            return
+        try:
+            self.top.destroy()
+        except tk.TclError:
+            pass
+
+
+class VoiceExportDialog:
+    """Track menu > Export per Voice: which timing tracks to write (one per
+    voice; optionally "All voices" only and every card), and whether the
+    cards for all voices (no voice set) go into each voice's track. Then a
+    Save dialog; the file type (xLights / LRC / Audacity) comes from the
+    extension, as for Export Combined."""
+
+    def __init__(self, parent, ctl, track, marks):
+        self.ctl, self.track, self.marks = ctl, track, marks
+        voices = th.voices_in(marks, getattr(ctl, "voices", []))
+        top = self.top = tk.Toplevel(parent)
+        top.title(f"Export per Voice \u2013 {track['name']}")
+        top.configure(bg=DLG_BG)
+        tk.Label(top, text="Timing tracks to write:", bg=DLG_BG, fg=DLG_FG,
+                 font=("TkDefaultFont", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        self.vars = []
+        n_all = sum(1 for m in marks if not th.effective_voices(m))
+        choices = [(v, f"{track['name']} - {v}", True) for v in voices]
+        choices.append((th.ALL_VOICES_NAME, f"{track['name']} - All voices  (only the {n_all} cards for all voices)",
+                        not voices))
+        choices.append((th.ANY_VOICE, f"{track['name']}  (every card, any voice)", False))
+        for key, text, on in choices:
+            var = tk.BooleanVar(value=on)
+            self.vars.append((key, var))
+            tk.Checkbutton(top, text=text, variable=var, bg=DLG_BG, fg=DLG_FG, activebackground=DLG_BG,
+                           activeforeground=DLG_FG, selectcolor="#ffffff").pack(anchor="w", padx=24)
+        self.each_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(top, text="Cards for \u201cAll voices\u201d (no voice set) also go into each voice's track",
+                       variable=self.each_var, bg=DLG_BG, fg=DLG_FG, activebackground=DLG_BG,
+                       activeforeground=DLG_FG, selectcolor="#ffffff").pack(anchor="w", padx=12, pady=(8, 0))
+        if not voices:
+            tk.Label(top, text="No card has a voice yet: use a card's Voice \u25be button to assign one.",
+                     bg=DLG_BG, fg=DLG_DIM).pack(anchor="w", padx=12, pady=(6, 0))
+        btns = tk.Frame(top, bg=DLG_BG)
+        btns.pack(fill="x", padx=12, pady=10)
+        tk.Button(btns, text="Cancel", command=top.destroy, bg="#e0e0e0", fg=DLG_FG,
+                  activebackground="#d0d0d0", activeforeground=DLG_FG).pack(side="right")
+        tk.Button(btns, text="Export...", command=self.export, bg="#2e7d32", fg="#ffffff",
+                  activebackground="#388e3c", activeforeground="#ffffff").pack(side="right", padx=(0, 8))
+
+    def tracks(self):
+        outputs = [key for key, var in self.vars if var.get()]
+        return th.voice_export_tracks(self.track["name"], self.marks, outputs, bool(self.each_var.get()))
+
+    def export(self, path=None):
+        tracks = self.tracks()
+        if not tracks:
+            messagebox.showinfo("Export per Voice", "Nothing to export: no checked track has any cards.",
+                                parent=self.top)
+            return False
+        if path is None:
+            path = filedialog.asksaveasfilename(parent=self.top, title="Export per Voice",
+                                                initialfile=f"{self.track['name']}-voices.xtiming",
+                                                defaultextension=".xtiming", filetypes=WaveformController._EXPORT_FILETYPES)
+        if not path:
+            return False
+        overlaps = [(name, th.overlap_count(ms)) for name, ms in tracks]
+        overlaps = [(n, c) for n, c in overlaps if c]
+        try:
+            th.export_timing_tracks(path, tracks)
+        except Exception as exc:
+            messagebox.showerror("Export per Voice", f"Could not export:\n{exc}", parent=self.top)
+            return False
+        debug(1, f"{{green}}Exported {len(tracks)} voice track(s) of '{self.track['name']}' to {path}")
+        if overlaps:
+            messagebox.showwarning("Export per Voice",
+                                   "Exported, but these tracks have overlapping cards, which xLights shows "
+                                   "oddly:\n\n" + "\n".join(f"  {n}: {c} overlap(s)" for n, c in overlaps),
+                                   parent=self.top)
+        try:
+            self.top.destroy()
+        except tk.TclError:
+            pass
+        return True
+
+
+def _explained(error, what):
+    """aa.explain_error for the text panel: the error in red, the advice
+    (its following lines) in yellow."""
+    text = aa.explain_error(error, what) if isinstance(error, BaseException) else str(error)
+    return text.replace("\n", "\n{yellow}")
+
+
+def _restart_app(widget):
+    """Ask trackED (tracked.EditorApp.restart) to save and start again."""
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if proc.returncode == 0:
-            return True, "Install finished successfully.\nPlease restart the application."
-        err = (proc.stderr or proc.stdout or "").strip()
-        return False, f"pip failed (code {proc.returncode}):\n{err[:800]}"
-    except subprocess.TimeoutExpired:
-        return False, "pip timed out"
-    except Exception as exc:
-        return False, f"Unexpected error: {exc}"
+        app = widget.winfo_toplevel()
+    except tk.TclError:
+        return False
+    restart = getattr(app, "restart", None)
+    if callable(restart):
+        restart()
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +760,7 @@ class WaveformController:
         self._play_seg_start = 0.0
         self._play_seg_end: Optional[float] = None
         self._play_position = 0.0
-        self._play_origin = 0.0       # the @cursor when Play was pressed (Reset returns here)
+        self._play_origin = 0.0       # the @cursor when Play was pressed (paused + Play returns here)
         self._last_click_mark_id = None  # point made by the last plain click (Shift+click extends it)
         self._play_speed = 1.0
         self._play_started_wall: Optional[float] = None
@@ -578,9 +796,8 @@ class WaveformController:
         # -- transport --
         self.play_back_btn = _tb_button(bar, "\u25c0\u25c0", lambda: self.skip_play(-5.0))
         self.play_btn = _tb_button(bar, "\u25b6", self.toggle_play, width=2)
-        self.play_stop_btn = _tb_button(bar, "\u25a0", self.stop_play)
         self.play_fwd_btn = _tb_button(bar, "\u25b6\u25b6", lambda: self.skip_play(5.0))
-        for btn in (self.play_back_btn, self.play_btn, self.play_stop_btn, self.play_fwd_btn):
+        for btn in (self.play_back_btn, self.play_btn, self.play_fwd_btn):
             btn.pack(side="left", padx=(0, 2))
         _Tooltip(self.play_back_btn, "Back 5 seconds\nShift+click: start of the stem region\n"
                                      "Ctrl+click: start of the audio")
@@ -589,17 +806,18 @@ class WaveformController:
         for btn in (self.play_back_btn, self.play_fwd_btn):
             btn.bind("<ButtonRelease-1>", lambda e: setattr(self, "_skip_mods", e.state), add="+")
             register_modifier_button(btn, ("control", "shift"))     # skip_play checks Ctrl first
-        _Tooltip(self.play_btn, "Play / pause from the @cursor\n"
+        _Tooltip(self.play_btn, "Play from the @cursor / pause\n"
+                                "While paused: Play starts again from where it started (or from the\n"
+                                "@cursor if you moved it); Ctrl+click resumes from the paused spot\n"
                                 "Shift+click: loop (from the @cursor to the end of the selected range,\n"
-                                "or the selected mark from its start) until Reset")
-        _Tooltip(self.play_stop_btn, "Reset: back to where Play started")
+                                "or the selected mark from its start) until paused")
         _Tooltip(self.play_fwd_btn, "Forward 5 seconds\nShift+click: end of the stem region\n"
                                     "Ctrl+click: end of the audio")
         # Shift detection for the Play button: remember Shift on release
         # (widget bindings run before the class binding that invokes the
         # command), and show a loop cursor while Shift is held over it.
         self.play_btn.bind("<ButtonRelease-1>", self._on_play_btn_release, add="+")
-        register_modifier_button(self.play_btn, ("shift",))
+        register_modifier_button(self.play_btn, ("shift", "control"))
         self.play_btn.bind("<Enter>", lambda e: self._set_play_cursor(bool(e.state & SHIFT_MASK)), add="+")
         self.play_btn.bind("<Motion>", lambda e: self._set_play_cursor(bool(e.state & SHIFT_MASK)), add="+")
         self.play_btn.bind("<Leave>", lambda e: self._set_play_cursor(False), add="+")
@@ -782,15 +1000,21 @@ class WaveformController:
         return w, h
 
     def _refresh_playback_availability(self):
-        """Show/hide the "install missing playback packages" button based
-        on whether the active engine's dependencies are present. Doesn't
-        block the waveform/marks/tracks UI -- only affects the Play
-        controls' usability."""
+        """Show the \u26a0 Install button while anything in deps.py is
+        missing (or "Restart" once packages were installed). Doesn't block
+        the waveform/marks/tracks UI."""
         playback_missing = bool(th.PLAYBACK_MISSING) and isinstance(self.engine, th.SoundDevicePlaybackEngine)
-        if playback_missing or th.OPTIONAL_MISSING:
+        if getattr(self, "_restart_pending", False):
+            self.install_btn.configure(text="\u27f3 Restart", state="normal")
             self.install_btn.pack(side="left", padx=(6, 0))
-            self._install_tip.text = ("Missing packages: " + ", ".join(th.installable_missing().values())
-                                      + "\nClick to install them with pip")
+            self._install_tip.text = "New packages were installed: restart trackED to use them"
+            return
+        missing = deps.missing()
+        if missing or playback_missing:
+            self.install_btn.configure(text="\u26a0 Install", state="normal")
+            self.install_btn.pack(side="left", padx=(6, 0))
+            self._install_tip.text = ("Missing: " + ", ".join(d["key"] for d in missing)
+                                      + "\nClick to choose which to install")
             if playback_missing:
                 self.play_status_var.set("Playback packages missing")
         else:
@@ -820,30 +1044,31 @@ class WaveformController:
         self.render_waveform()
 
     def _on_install_clicked(self):
-        packages = list(th.installable_missing().values())
-        if not packages:
+        if getattr(self, "_restart_pending", False):
+            _restart_app(self.canvas)
             return
-        self.install_btn.configure(state="disabled", text="\u26a0 Installing...")
-        self.play_status_var.set("Installing...")
+        if getattr(self, "_install_dialog", None) is not None:
+            try:
+                self._install_dialog.top.lift()
+                return
+            except tk.TclError:
+                pass
+        self._install_dialog = InstallDialog(self.canvas, on_done=self._install_finished)
 
-        def status_cb(msg):
-            self.canvas.after(0, lambda: self.play_status_var.set(msg[:60]))
-
-        def worker():
-            ok, message = _install_packages(packages, status_cb)
-            self.canvas.after(0, lambda: self._install_finished(ok, message))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _install_finished(self, success, message):
-        if success:
-            self.play_status_var.set("Installed -- please restart the app")
-            self.install_btn.configure(text="\u26a0 Restart required", state="disabled")
-            messagebox.showinfo("Installation complete", "Packages installed.\nPlease restart the application.")
-        else:
+    def _install_finished(self, ok, failed):
+        aa.clear_probe_cache()
+        if not ok:
             self.play_status_var.set("Install failed")
-            self.install_btn.configure(text="\u26a0 Install failed -- retry?", state="normal")
-            messagebox.showerror("Installation failed", message)
+            return
+        self._restart_pending = True
+        self._refresh_playback_availability()
+        self.play_status_var.set("Installed -- restart to use the new packages")
+        parent = getattr(getattr(self, "_install_dialog", None), "top", None)
+        if messagebox.askyesno("Restart trackED",
+                               "Installed: " + ", ".join(ok) + "\n\nRestart trackED now to use them?\n"
+                               "(Your changes are saved first and your open files reopened.)",
+                               parent=parent):
+            _restart_app(self.canvas)
 
     def _configure_canvas(self):
         c = self.canvas
@@ -885,6 +1110,9 @@ class WaveformController:
         # native undo binding and an app-wide bind_all would double-fire;
         # the canvas has no native undo binding to conflict with, so this
         # is the one safe place for marks/tracks undo/redo shortcuts.
+        for key, fn in (("c", self.copy_selection), ("x", self.cut_selection), ("v", self.paste_marks)):
+            c.bind(f"<Control-{key}>", lambda e, f_=fn: (f_(), "break")[1])
+            c.bind(f"<Control-{key.upper()}>", lambda e, f_=fn: (f_(), "break")[1])
         c.bind("<Control-z>", lambda e: self.undo_marks())
         c.bind("<Control-y>", lambda e: self.redo_marks())
 
@@ -892,7 +1120,7 @@ class WaveformController:
         state = "normal" if enabled else "disabled"
         for btn in (self.jump_start_btn, self.zoom_in_btn, self.zoom_out_btn,
                     self.zoom_fit_btn, self.jump_end_btn, self.speed_btn,
-                    self.play_btn, self.play_back_btn, self.play_fwd_btn, self.play_stop_btn):
+                    self.play_btn, self.play_back_btn, self.play_fwd_btn):
             btn.configure(state=state)
 
     # ------------------------------------------------------------------ loading
@@ -1148,13 +1376,17 @@ class WaveformController:
         prompt -- all through tab.save_hook = save_marks_now. The audio
         file itself is never written. Without a tab (standalone use) they
         are saved immediately, as before."""
-        if record_history:
-            self._push_mark_history()
-        self._sync_play_segment()
+        # The unsaved flag comes first, so a failure in the bookkeeping
+        # below (logged) can't leave a change looking saved.
         mark_dirty = getattr(self.tab, "mark_dirty", None) if self.tab is not None else None
         if callable(mark_dirty):
             mark_dirty()
-        else:
+        for step in ((self._push_mark_history,) if record_history else ()) + (self._sync_play_segment,):
+            try:
+                step()
+            except Exception as exc:
+                debug(1, f"{{red}}_mark_changed: {step.__name__} failed: {exc!r}")
+        if not callable(mark_dirty):
             self.save_marks_now()
 
     def save_marks_now(self):
@@ -1566,16 +1798,20 @@ class WaveformController:
         is_range = mark["type"] == "range" and mark.get("end") is not None
         self.start_play(loop=loop, segment=(mark["start"], mark["end"] if is_range else None), mark_id=mark_id)
 
-    def toggle_mark_play(self, mark_id, loop=False):
-        """A timing card's Play/Pause button: pause if this mark is
-        playing, resume if it's paused, else start it (looping with Shift)."""
+    def toggle_mark_play(self, mark_id, loop=False, resume=False):
+        """A timing card's Play/Pause button, like the main one: pause if
+        this mark is playing; while paused, play it again from its start
+        (Ctrl: resume from the paused spot); else start it (Shift: loop)."""
         mine = self._play_mark_id == mark_id and self._play_state != "stopped"
         if loop:
             self.play_mark_by_id(mark_id, loop=True)
         elif mine and self._play_state == "playing":
             self.pause_play()
         elif mine and self._play_state == "paused":
-            self.start_play()
+            if resume:
+                self.start_play()
+            else:
+                self.play_mark_by_id(mark_id, loop=self._loop)
         else:
             self.play_mark_by_id(mark_id, loop=False)
 
@@ -1864,13 +2100,15 @@ class WaveformController:
         self.render_waveform()
         return True
 
-    def merge_mark_by_id(self, mark_id, direction=1):
+    def merge_mark_by_id(self, mark_id, direction=1, pool=None):
         """Merge a mark with its next (+1) / previous (-1) neighbor in the
-        same track (or the unassigned marks) into one range."""
+        same track (or the unassigned marks) into one range. pool: only
+        these marks count as neighbors (the card editor passes the cards
+        its Show: filter shows, so hidden cards are skipped)."""
         mark = self.mark_by_id(mark_id)
         if mark is None:
             return False
-        other = th.neighbor_mark(self.marks, mark, direction)
+        other = th.neighbor_mark(self.marks if pool is None else pool, mark, direction)
         if other is None:
             return False
         start, end, label = th.merged_fields(mark, other)
@@ -2019,6 +2257,10 @@ class WaveformController:
             pass
         current = self.mark_voices(mark_id)
         self._voice_vars = {}
+        all_var = tk.BooleanVar(value=not current)
+        self._voice_vars[None] = all_var
+        menu.add_checkbutton(label="All voices", variable=all_var, onvalue=True, offvalue=False,
+                             command=lambda: self.set_mark_voices(mark_id, []))
         for v in self.voices:
             var = tk.BooleanVar(value=v in current)
             self._voice_vars[v] = var
@@ -2052,13 +2294,25 @@ class WaveformController:
 
     # ------------------------------------------------------------------ Ctrl+click cursor
     def _on_ctrl_press(self, event):
+        """Ctrl+click: on a mark in a track band, add it to / remove it from
+        the selection; anywhere else, move the @cursor."""
         if self.audio_duration is None or self.view_end <= self.view_start:
             return "break"
+        zone, target = self._track_zone_at_y(event.y)
+        if zone == "track" and not self._track_label_hit(target, event.x, event.y):
+            pool = [m for m in self.marks if m.get("track_id") == target]
+            hit, _edge = self._mark_and_edge_at_x(event.x, pool=pool)
+            if hit is not None:
+                self._ctrl_selecting = True
+                self.extend_selection(hit, toggle=True)
+                return "break"
+        self._ctrl_selecting = False
         self._set_cursor(self._time_at_x(event.x))
         return "break"
 
     def _on_ctrl_drag(self, event):
-        if self.audio_duration is None or self.view_end <= self.view_start:
+        if self.audio_duration is None or self.view_end <= self.view_start \
+                or getattr(self, "_ctrl_selecting", False):
             return "break"
         self._set_cursor(self._time_at_x(event.x), seek_playing=False)
         return "break"
@@ -2166,8 +2420,8 @@ class WaveformController:
         if self._analysis_busy or self.audio_duration is None:
             return
         if not aa.stems_are_fresh(self.filepath) and not aa.demucs_available():
-            self.append_info("\n{yellow}Stem separation needs demucs: pip install demucs "
-                             "(also installs torch; large download)\n")
+            self.append_info("\n{yellow}Stem separation needs demucs (not installed). "
+                             "Use the \u26a0 Install button in the upper right corner.\n")
             self.analysis_status_var.set("demucs not installed")
             if then:
                 then()
@@ -2186,7 +2440,7 @@ class WaveformController:
             self._set_analysis_busy(None)
             if error is not None:
                 self.analysis_status_var.set("Stems failed")
-                self.append_info(f"\n{{red}}Stem analysis error: {error}\n")
+                self.append_info(f"\n{{red}}Stem analysis error: " + _explained(error, "Stem separation") + "\n")
                 debug(1, f"{{red}}waveform_tab stems failed: {error}")
             else:
                 regions, reused = value
@@ -2280,8 +2534,7 @@ class WaveformController:
             if here is not None:
                 name = self.STEM_TRACK_NAMES.get(here["kind"], here["kind"])
                 menu.add_command(
-                    label=f"New range from the stem at @cursor ({name} "
-                          f"{th.format_time_ms(here['start'])}\u2013{th.format_time_ms(here['end'])})",
+                    label="New range from @cursor",
                     command=self.range_from_current_stem)
                 menu.add_separator()
             menu.add_command(label="New timing track from:", state="disabled")
@@ -2379,8 +2632,8 @@ class WaveformController:
                 self._report_genre_mood(cached, cached=True)
                 return
         if not aa.genre_mood_available():
-            messagebox.showinfo("Genre / mood", "This needs librosa (ISC license):\n\n  pip install librosa\n\n"
-                                                "then restart trackED.")
+            messagebox.showinfo("Genre / mood", "This needs librosa, which isn't installed.\n\n"
+                                                "Use the \u26a0 Install button in the upper right corner.")
             return
         lyrics = " ".join(m.get("label", "") for m in self.marks if m.get("label"))
         self._set_analysis_busy("mood")
@@ -2393,7 +2646,7 @@ class WaveformController:
             self._set_analysis_busy(None)
             if error is not None:
                 self.analysis_status_var.set("Genre/mood failed")
-                self.append_info(f"{{red}}Genre/mood error: {error}\n")
+                self.append_info(f"{{red}}Genre/mood error: " + _explained(error, "The genre/mood estimate") + "\n")
                 return
             th.save_genre_mood(self.filepath, value)
             self._report_genre_mood(value, elapsed)
@@ -2503,9 +2756,8 @@ class WaveformController:
         if not aa.whisper_backends():
             messagebox.showinfo(
                 "Transcribe",
-                "No Whisper backend is installed.\n\nInstall one of:\n"
-                "  pip install faster-whisper   (recommended, MIT)\n"
-                "  pip install openai-whisper   (MIT)\n\nthen restart trackED.")
+                "Transcription needs faster-whisper, which isn't installed.\n\n"
+                "Use the \u26a0 Install button in the upper right corner.")
             return
         if mark is None or self._analysis_busy:
             return
@@ -2538,7 +2790,7 @@ class WaveformController:
             self._set_analysis_busy(None)
             if error is not None:
                 self.analysis_status_var.set("Transcription failed")
-                self.append_info(f"{{red}}Transcription error: {error}\n")
+                self.append_info(f"{{red}}Transcription error: " + _explained(error, "Transcription") + "\n")
                 debug(1, f"{{red}}waveform_tab transcribe failed: {error}")
                 return
             target = self.mark_by_id(mark_id)
@@ -2664,6 +2916,7 @@ class WaveformController:
 
     def _on_play_btn_release(self, event):
         self._shift_on_play = bool(event.state & SHIFT_MASK)
+        self._ctrl_on_play = bool(event.state & CONTROL_MASK)
 
     def _set_play_cursor(self, shift):
         try:
@@ -2698,9 +2951,16 @@ class WaveformController:
             pass
 
     def toggle_play(self):
-        """Main Play/Pause button. Shift+click: (re)start as a loop."""
+        """Main Play/Pause button.
+          stopped: play from the @cursor
+          playing: pause
+          paused:  start again from the starting point (where Play started,
+                   or the @cursor if it was moved while paused);
+                   Ctrl+click resumes from the paused spot instead
+          Shift+click: (re)start as a loop."""
         loop = self._shift_on_play
-        self._shift_on_play = False
+        resume = getattr(self, "_ctrl_on_play", False)
+        self._shift_on_play = self._ctrl_on_play = False
         if loop:
             if self._play_state == "playing":
                 self._halt_engine()
@@ -2708,8 +2968,35 @@ class WaveformController:
             self.start_play(loop=True)
         elif self._play_state == "playing":
             self.pause_play()
+        elif self._play_state == "paused":
+            if resume:
+                self.start_play(loop=None)
+            else:
+                self.replay_from_start()
         else:
-            self.start_play(loop=None if self._play_state == "paused" else False)
+            self.start_play(loop=False)
+
+    def cursor_moved_while_paused(self):
+        paused_at = getattr(self, "_paused_at", None)
+        return paused_at is not None and abs(self.cursor_time - paused_at) > 1e-6
+
+    def replay_from_start(self):
+        """Paused + Play: play again from the starting point -- the same
+        loop or card span, from its start -- or, if the @cursor was moved
+        while paused, plainly from there."""
+        if self._play_state != "paused":
+            return self.start_play(loop=False)
+        moved = self.cursor_moved_while_paused()
+        loop, mark_id, seg_end = self._loop, self._play_mark_id, self._play_seg_end
+        self._play_state = "stopped"
+        self._paused_at = None
+        if moved:
+            self._play_mark_id = None
+            return self.start_play(loop=False)
+        self.cursor_time = self._play_origin
+        if loop or mark_id is not None:
+            return self.start_play(loop=loop, segment=(self._play_origin, seg_end), mark_id=mark_id)
+        return self.start_play(loop=False)
 
     def loop_segment(self):
         """Shift+Play: loop from the @cursor to the end of the selected range
@@ -2732,7 +3019,7 @@ class WaveformController:
 
         - From stopped: plays [cursor, end of audio] -- or, with loop=True,
           loop_segment(); or an explicit `segment` (a card's mark). The
-          position Play started from is remembered for Reset.
+          position Play started from is remembered (paused + Play returns there).
         - From paused (loop=None): resumes from the @cursor (which the skip
           buttons / Ctrl+click may have moved while paused)."""
         if self.audio_duration is None or not self.filepath or self._play_state == "playing":
@@ -2752,7 +3039,7 @@ class WaveformController:
                 seg_end = None
             self._play_seg_start, self._play_seg_end = seg_start, seg_end
             self.cursor_time = seg_start
-            self._play_origin = seg_start    # Reset returns here
+            self._play_origin = seg_start    # paused + Play returns here
         else:
             # The cursor may have been moved while paused.
             t = self.cursor_time
@@ -2774,6 +3061,7 @@ class WaveformController:
         pos = self.current_play_position()
         self._halt_engine()
         self.cursor_time = pos
+        self._paused_at = pos
         self._play_state = "paused"
         self._update_play_controls()
         self.render_waveform()
@@ -3039,17 +3327,6 @@ class WaveformController:
         fg = MOD_HINT_COLORS["shift"] if "shift" in current_modifiers() else normal
         self.play_btn.configure(text="\u275a\u275a" if self._play_state == "playing" else "\u25b6",
                                 fg=fg, activeforeground=fg)
-        # Stop (reset) is only offered while paused.
-        try:
-            if self._play_state == "paused":
-                if not getattr(self.play_stop_btn, "_shown", False):
-                    self.play_stop_btn.pack(side="left", padx=(0, 2), after=self.play_btn)
-                    self.play_stop_btn._shown = True
-            elif getattr(self.play_stop_btn, "_shown", True):
-                self.play_stop_btn.pack_forget()
-                self.play_stop_btn._shown = False
-        except tk.TclError:
-            pass
         if self._play_state == "stopped":
             if not th.PLAYBACK_MISSING:
                 self.play_status_var.set("")
@@ -3098,7 +3375,9 @@ class WaveformController:
 
     def _is_highlighted(self, kind, item_id):
         target = (kind, item_id)
-        return self.selected == target or self._hover == target
+        if self.selected == target or self._hover == target:
+            return True
+        return kind == "mark" and len(getattr(self, "_multi", ())) > 1 and item_id in self.selected_mark_ids()
 
     def _track_label_hit(self, track_id, x, y):
         bbox = self._track_label_regions.get(track_id)
@@ -3232,6 +3511,10 @@ class WaveformController:
                 return
             pool = [m for m in self.marks if m.get("track_id") == target]
             hit_mark, edge = self._mark_and_edge_at_x(event.x, pool=pool)
+            if hit_mark is not None and event.state & SHIFT_MASK:
+                self.extend_selection(hit_mark, toggle=False)      # Shift+click: a run of marks
+                return
+            self._multi = []
             if hit_mark is not None:
                 self.selected = ("mark", hit_mark["id"])
                 self._move_drag = {
@@ -3508,7 +3791,9 @@ class WaveformController:
         if not self.selected:
             return "break"
         kind, sel_id = self.selected
-        if kind == "mark":
+        if kind == "mark" and len(self.selected_mark_ids()) > 1:
+            self.delete_selection()
+        elif kind == "mark":
             mark = next((m for m in self.marks if m["id"] == sel_id), None)
             if mark is not None:
                 self._delete_mark(mark)
@@ -3519,6 +3804,7 @@ class WaveformController:
         return "break"
 
     def _on_key_escape(self, event):
+        self._multi = []
         if self.selected is not None:
             self.selected = None
             self.render_waveform()
@@ -3699,6 +3985,8 @@ class WaveformController:
             c.drop_target_register(DND_FILES)
         except Exception:
             return False
+        c._own_drop = True                 # tracked.py doesn't re-register it
+        c.dnd_bind("<<DropEnter>>", lambda e: getattr(e, "action", "copy") or "copy")
         c.dnd_bind("<<DropPosition>>", self._on_drop_position)
         c.dnd_bind("<<DropLeave>>", lambda e: self._set_drop_hover(False))
         c.dnd_bind("<<Drop>>", self._on_file_drop)
@@ -3759,6 +4047,11 @@ class WaveformController:
             if zone == "track":
                 pool = [m for m in self.marks if m.get("track_id") == target]
                 mark, _edge = self._mark_and_edge_at_x(event.x, pool=pool)
+                if mark is None and _MARK_CLIPBOARD["marks"]:
+                    menu = tk.Menu(self.canvas, tearoff=False)
+                    self._add_paste_items(menu, target)
+                    menu.tk_popup(event.x_root, event.y_root)
+                    return
         if mark is None:
             hit_id = None
             for mark_id, bbox in self._mark_hit_regions.items():
@@ -3773,9 +4066,15 @@ class WaveformController:
             mark = next((m for m in self.marks if m["id"] == hit_id), None)
             if mark is None:
                 return
+        if mark["id"] not in self.selected_mark_ids():
+            self._multi = []
         if self.selected != ("mark", mark["id"]):
             self.selected = ("mark", mark["id"])
             self.render_waveform()
+        group = self.selected_mark_ids()
+        if len(group) > 1:
+            self._show_group_menu(group, event)
+            return
 
         is_range = mark["type"] == "range" and mark.get("end") is not None
         cur = self.cursor_position()
@@ -3809,16 +4108,207 @@ class WaveformController:
         if mark.get("track_id") is None:
             menu.add_command(label="Set Duration...", command=lambda: self._set_mark_duration(mark))
         menu.add_separator()
+        self._add_clipboard_items(menu, [mark["id"]])
+        menu.add_separator()
         menu.add_command(label="Delete Mark", command=lambda: self._delete_mark(mark))
         menu.add_command(label="Delete All Marks", command=self._delete_all_marks)
         menu.tk_popup(event.x_root, event.y_root)
+
+    # ------------------------------------------------------------------ multi-select / clipboard
+    def selected_mark_ids(self):
+        """The selected marks: the Ctrl/Shift+click group (marks of one
+        track) when the selected mark is in it, else just that mark."""
+        sel = self.selected_mark_id()
+        if sel is None:
+            return []
+        multi = [mid for mid in getattr(self, "_multi", []) if self.mark_by_id(mid) is not None]
+        return multi if sel in multi else [sel]
+
+    def extend_selection(self, mark, toggle):
+        """toggle=True (Ctrl+click): add/remove one mark; toggle=False
+        (Shift+click): every mark of the track from the selected one to
+        this one. The group stays within one track."""
+        track_id = mark.get("track_id")
+        current = [mid for mid in self.selected_mark_ids()
+                   if (self.mark_by_id(mid) or {}).get("track_id") == track_id]
+        if toggle:
+            ids = list(current)
+            if mark["id"] in ids:
+                ids.remove(mark["id"])
+            else:
+                ids.append(mark["id"])
+            primary = mark["id"] if mark["id"] in ids else (ids[-1] if ids else None)
+        else:
+            anchor = self.mark_by_id(self.selected_mark_id())
+            ordered = sorted(self.track_marks(track_id), key=lambda m: (m["start"], m["id"]))
+            order = [m["id"] for m in ordered]
+            if anchor is None or anchor.get("track_id") != track_id or anchor["id"] not in order:
+                ids = [mark["id"]]
+            else:
+                i, j = sorted((order.index(anchor["id"]), order.index(mark["id"])))
+                ids = order[i:j + 1]
+            primary = mark["id"]
+        self._multi = ids
+        self.selected = ("mark", primary) if primary else (("track", track_id) if track_id else None)
+        self.render_waveform()
+
+    def _selected_marks(self, ids=None):
+        ids = self.selected_mark_ids() if ids is None else ids
+        return [m for m in (self.mark_by_id(i) for i in ids) if m is not None]
+
+    def copy_selection(self, ids=None):
+        marks = self._selected_marks(ids)
+        if not marks:
+            return 0
+        _MARK_CLIPBOARD["marks"] = copy.deepcopy(sorted(marks, key=lambda m: m["start"]))
+        n = len(marks)
+        self.play_status_var.set(f"Copied {n} mark{'s' if n != 1 else ''}")
+        return n
+
+    def cut_selection(self, ids=None):
+        n = self.copy_selection(ids)
+        if n:
+            self.delete_selection(ids)
+            self.play_status_var.set(f"Cut {n} mark{'s' if n != 1 else ''}")
+        return n
+
+    def delete_selection(self, ids=None):
+        """Delete the selected marks (one undo step); the track keeps the focus."""
+        marks = self._selected_marks(ids)
+        if not marks:
+            return 0
+        gone = {m["id"] for m in marks}
+        track_id = marks[0].get("track_id")
+        self.marks = [m for m in self.marks if m["id"] not in gone]
+        self._multi = []
+        self.selected = ("track", track_id) if track_id else None
+        self._mark_changed()
+        self.render_waveform()
+        return len(gone)
+
+    def _target_track_id(self):
+        """Where Ctrl+V pastes: the selected track, or the selected mark's track."""
+        if not self.selected:
+            return None
+        kind, sel_id = self.selected
+        if kind == "track":
+            return sel_id
+        mark = self.mark_by_id(sel_id)
+        return mark.get("track_id") if mark else None
+
+    def _ask_track(self, track_id):
+        """track_id, or "new": ask for a name and make the track (no undo step)."""
+        if track_id != "new":
+            return track_id
+        name = simpledialog.askstring("New Timing Track", "Track name:")
+        if not (name and name.strip()):
+            return None
+        return self._new_track(name.strip(), record_history=False)["id"]
+
+    def paste_marks(self, track_id=None, at_cursor=False):
+        """Paste the copied marks into a track (Ctrl+V: the selected
+        track), at their own times -- or, at_cursor, shifted so the first
+        starts at the @cursor. The pasted marks become the selection."""
+        src = _MARK_CLIPBOARD["marks"]
+        if not src or self.audio_duration is None:
+            return []
+        track_id = self._target_track_id() if track_id is None else self._ask_track(track_id)
+        if track_id is None or self.track_by_id(track_id) is None:
+            self.play_status_var.set("Select a track to paste into")
+            return []
+        offset = (self.cursor_position() or 0.0) - src[0]["start"] if at_cursor else 0.0
+        limit = self.max_mark_time()
+        new = [m for m in th.copy_marks(src, track_id, lambda: uuid.uuid4().hex[:8], offset)
+               if 0.0 <= m["start"] <= limit]
+        for m in new:
+            if m.get("end") is not None:
+                m["end"] = min(m["end"], limit)
+            m["source"] = "user"
+        if not new:
+            return []
+        self.marks.extend(new)
+        self._multi = [m["id"] for m in new]
+        self.selected = ("mark", new[0]["id"])
+        self._mark_changed()
+        self.render_waveform()
+        self.play_status_var.set(f"Pasted {len(new)} mark{'s' if len(new) != 1 else ''}")
+        return new
+
+    def move_selection_to_track(self, track_id, ids=None, keep=False):
+        """Move (keep=False) or copy (keep=True) marks to another track
+        ("new": ask for a name). One undo step."""
+        marks = self._selected_marks(ids)
+        if not marks:
+            return []
+        track_id = self._ask_track(track_id)
+        if track_id is None:
+            return []
+        if keep:
+            moved = th.copy_marks(marks, track_id, lambda: uuid.uuid4().hex[:8])
+            self.marks.extend(moved)
+        else:
+            for m in marks:
+                m["track_id"] = track_id
+            moved = marks
+        self._multi = [m["id"] for m in moved]
+        self.selected = ("mark", moved[0]["id"])
+        self._mark_changed()
+        self.render_waveform()
+        return moved
+
+    def _track_submenu(self, menu, label, ids, keep):
+        sub = tk.Menu(menu, tearoff=False, bg="#ffffff", fg="#1e1e1e")
+        own = {(self.mark_by_id(i) or {}).get("track_id") for i in ids}
+        for tr in self.tracks:
+            sub.add_command(label=tr["name"], state="disabled" if tr["id"] in own and len(own) == 1 else "normal",
+                            command=lambda t=tr["id"]: self.move_selection_to_track(t, ids, keep))
+        if self.tracks:
+            sub.add_separator()
+        sub.add_command(label="New track...", command=lambda: self.move_selection_to_track("new", ids, keep))
+        menu.add_cascade(label=label, menu=sub)
+
+    def _add_clipboard_items(self, menu, ids):
+        n = len(ids)
+        what = f"{n} Marks" if n > 1 else "Mark"
+        menu.add_command(label=f"Cut {what}", accelerator="Ctrl+X", command=lambda: self.cut_selection(ids))
+        menu.add_command(label=f"Copy {what}", accelerator="Ctrl+C", command=lambda: self.copy_selection(ids))
+        self._track_submenu(menu, f"Move {what} to Track", ids, keep=False)
+        self._track_submenu(menu, f"Copy {what} to Track", ids, keep=True)
+
+    def _add_paste_items(self, menu, track_id):
+        n = len(_MARK_CLIPBOARD["marks"])
+        state = "normal" if n else "disabled"
+        what = f"{n} mark{'s' if n != 1 else ''}" if n else "marks"
+        menu.add_separator()
+        menu.add_command(label=f"Paste {what} here (same times)", accelerator="Ctrl+V", state=state,
+                         command=lambda: self.paste_marks(track_id))
+        menu.add_command(label=f"Paste {what} at @cursor", state=state,
+                         command=lambda: self.paste_marks(track_id, at_cursor=True))
+
+    def _show_group_menu(self, ids, event):
+        menu = tk.Menu(self.canvas, tearoff=False)
+        menu.add_command(label=f"{len(ids)} marks selected", state="disabled")
+        menu.add_separator()
+        self._add_clipboard_items(menu, ids)
+        menu.add_separator()
+        menu.add_command(label=f"Delete {len(ids)} Marks", command=lambda: self.delete_selection(ids))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def export_per_voice(self, track):
+        marks = [m for m in self.marks if m.get("track_id") == track["id"]]
+        if not marks:
+            messagebox.showinfo("Export per Voice", f"Track \"{track['name']}\" has no timing marks to export.")
+            return
+        VoiceExportDialog(self.canvas, self, track, marks)
 
     def _show_track_menu(self, track, event):
         menu = tk.Menu(self.canvas, tearoff=False)
         menu.add_command(label="Rename Track...", command=lambda: self._rename_track(track))
         menu.add_command(label="Change Color...", command=lambda: self._change_track_color(track))
         menu.add_separator()
-        menu.add_command(label="Export Timing...", command=lambda: self.export_timing_track(track))
+        menu.add_command(label="Export Combined...", command=lambda: self.export_timing_track(track))
+        menu.add_command(label="Export per Voice...", command=lambda: self.export_per_voice(track))
+        self._add_paste_items(menu, track["id"])
         menu.add_separator()
         menu.add_command(label="Delete Track", command=lambda: self._delete_track(track))
         menu.tk_popup(event.x_root, event.y_root)
@@ -4345,27 +4835,16 @@ def onload(filepath: str, canvas=None, text=None, tab=None):
     engine_name = "sounddevice (trackED's own)" if th.ACTIVE_ENGINE == "sounddevice" else "ffplay (Sequence Editor's original)"
     descr += f"{{blue}}Playback engine: {{cyan}}{engine_name}\n"
 
-    if th.PLAYBACK_MISSING or th.OPTIONAL_MISSING:
-        descr += "\n{yellow}Missing packages (use the Install button, or pip install):\n"
-        for pkg in th.PLAYBACK_MISSING.values():
-            descr += f"{{red}}  - {pkg}  (playback)\n"
-        notes = {"tinytag": "metadata above", "miniaudio": "MP3 decode fallback, optional"}
-        for key, pkg in th.OPTIONAL_MISSING.items():
-            descr += f"{{yellow}}  - {pkg}  ({notes.get(key, 'optional')})\n"
+    missing = deps.missing()
+    if missing:
+        descr += ("\n{yellow}Missing dependencies: " + ", ".join(d["key"] for d in missing)
+                  + ".\n{yellow}Use the \u26a0 Install button in the upper right corner to install them.\n")
     else:
-        descr += "\n{green}All recommended packages are present.\n"
-
-    # Optional analysis features (not in the Install button: torch alone is
-    # a multi-GB download, so these are left as an explicit choice).
+        descr += "\n{green}All optional packages are present.\n"
     whisper = aa.whisper_backends()
-    descr += (
-        f"{{blue}}Stem separation: "
-        + ("{cyan}demucs\n" if aa.demucs_available() else "{yellow}not installed (pip install demucs)\n")
-        + "{blue}Transcription: "
-        + (f"{{cyan}}{', '.join(whisper)}  (auto model: {aa.default_whisper_model()}, "
-           f"{aa.available_ram_gb():.1f} GB free)\n" if whisper
-           else "{yellow}not installed (pip install faster-whisper)\n")
-    )
+    if whisper:
+        descr += (f"{{blue}}Transcription: {{cyan}}{', '.join(whisper)}  (auto model: "
+                  f"{aa.default_whisper_model()}, {aa.available_ram_gb():.1f} GB free)\n")
 
     descr += (
         "\n{blue}Mouse: {cyan}click{blue}=move the @cursor  {cyan}double-click{blue} or {cyan}M{blue}=new point mark  "
@@ -4378,6 +4857,9 @@ def onload(filepath: str, canvas=None, text=None, tab=None):
         " for a new track;\n{blue}      a card's {cyan}Split \u25be{blue} splits at the cursor, a selected phrase, "
         "or into words (timed by syllables)\n"
         "{blue}      {cyan}drag a mark{blue}=move/resize  {cyan}drag into a track band{blue}=assign it\n"
+        "{blue}      in a track: {cyan}Ctrl+click{blue}=add/remove a mark from the selection  "
+        "{cyan}Shift+click{blue}=select a run;\n{blue}      {cyan}Ctrl+C/X/V{blue}=copy/cut/paste marks "
+        "(paste goes into the selected track, same times); right-click for Move/Copy to Track\n"
         "{blue}      {cyan}double-click{blue}=edit label  {cyan}right-click{blue}=mark/track menu "
         "(split / merge / transcribe)\n"
         "{blue}      {cyan}Ctrl+click{blue}=move the @cursor (= playhead)  {cyan}Shift+Play{blue}=loop\n"

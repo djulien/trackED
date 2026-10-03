@@ -1,7 +1,10 @@
-#use this if Linux desktop doesn't show icon
+# Linux desktop entry: edit the two paths, then copy to ~/.local/share/applications/
+# (trackED.sh sets up Python and the packages on first run)
 
 [Desktop Entry]
 Name=Track Editor
-Exec=/usr/bin/python3 /path/to/tracked.py
+Exec=/path/to/trackED.sh %F
 Icon=/path/to/app_icon.png
+Terminal=false
 Type=Application
+Categories=AudioVideo;Audio;

@@ -41,10 +41,11 @@ import os
 import re
 import shutil
 import struct
+import copy
 import subprocess
 import threading
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Callable, Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Optional third-party playback dependencies (probed once, degrade gracefully)
@@ -1532,6 +1533,86 @@ def paren_voice_name(voices: Optional[List[str]]) -> str:
         if m:
             highest = max(highest, int(m.group(1)))
     return f"{VOICE_PREFIX}{highest + 1}"
+
+
+ALL_VOICES_NAME = "All voices"   # a card with no voice set is sung by all voices
+ANY_VOICE = "(every card)"        # voice_export_tracks: one track with every card
+
+
+def effective_voices(mark: Dict[str, Any]) -> List[str]:
+    """The voices a card is for: its own voices; with none set, the voice
+    its lyrics imply when they're all in parentheses (backing vocals);
+    otherwise [] -- meaning all voices."""
+    voices = list(mark.get("voices") or [])
+    if voices:
+        return voices
+    label = mark.get("label") or ""
+    if label.strip() and in_parentheses(label, (0, len(label))):
+        return [paren_voice_name([])]
+    return []
+
+
+def voices_in(marks: List[Dict[str, Any]], known: Optional[List[str]] = None) -> List[str]:
+    """Voices the marks use, in the file's voice order (known) first."""
+    used: List[str] = []
+    for m in marks:
+        for v in effective_voices(m):
+            if v not in used:
+                used.append(v)
+    order = [v for v in (known or []) if v in used]
+    return order + [v for v in used if v not in order]
+
+
+def voice_export_tracks(track_name: str, marks: List[Dict[str, Any]], outputs: List[str],
+                        all_voices_in_each: bool = True) -> List[Tuple[str, List[Dict[str, Any]]]]:
+    """Timing tracks for "Export per voice": one (name, marks) per entry
+    of outputs, in that order, empty ones left out.
+      a voice name      -> "<track> - <voice>": cards for that voice, plus
+                           the cards for all voices if all_voices_in_each
+      ALL_VOICES_NAME   -> "<track> - All voices": only the all-voices cards
+      ANY_VOICE         -> "<track>": every card"""
+    out = []
+    for want in outputs:
+        if want == ANY_VOICE:
+            picked, name = list(marks), track_name
+        elif want == ALL_VOICES_NAME:
+            picked, name = [m for m in marks if not effective_voices(m)], f"{track_name} - {ALL_VOICES_NAME}"
+        else:
+            picked = [m for m in marks if want in effective_voices(m)
+                      or (all_voices_in_each and not effective_voices(m))]
+            name = f"{track_name} - {want}"
+        picked.sort(key=lambda m: (m["start"], m.get("end") or m["start"]))
+        if picked:
+            out.append((name, picked))
+    return out
+
+
+def overlap_count(marks: List[Dict[str, Any]]) -> int:
+    """How many marks start before the previous one (in time order) ends --
+    xLights timing tracks can't hold overlapping marks."""
+    ordered = sorted(marks, key=lambda m: m["start"])
+    n, end = 0, None
+    for m in ordered:
+        if end is not None and m["start"] < end - 1e-6:
+            n += 1
+        this_end = m["end"] if m.get("type") == "range" and m.get("end") is not None else m["start"]
+        end = this_end if end is None else max(end, this_end)
+    return n
+
+
+def copy_marks(marks: List[Dict[str, Any]], track_id: Optional[str], new_id: Callable[[], str],
+               offset: float = 0.0) -> List[Dict[str, Any]]:
+    """Copies of marks (new ids) for track_id, shifted by offset seconds."""
+    out = []
+    for m in marks:
+        c = copy.deepcopy(m)
+        c["id"] = new_id()
+        c["track_id"] = track_id
+        c["start"] = m["start"] + offset
+        if c.get("end") is not None:
+            c["end"] = m["end"] + offset
+        out.append(c)
+    return out
 
 
 def find_span(text: str, piece: str, start: int = 0) -> Optional[Tuple[int, int]]:

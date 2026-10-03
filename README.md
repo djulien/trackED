@@ -4,6 +4,25 @@ Audio timing track editor.  Can be used to (help) create timing tracks for Audac
 # Status
 UNDER CONSTRUCTION
 
+# Running it
+- **Windows:** double-click `trackED.cmd`.
+- **Linux / macOS:** run `./trackED.sh`.
+
+The first run asks before installing anything missing (Python itself, Tk,
+ffmpeg), makes trackED's own Python environment in `~/.tracked/venv`, and
+installs the small core packages. The larger optional parts -- stem
+separation (demucs + PyTorch, several GB), transcription (faster-whisper)
+and the mood estimate (librosa) -- are offered by the **⚠ Install** button
+in the upper right corner of an audio tab; pick the ones you want.
+
+Running `python3 tracked.py` directly also works if the packages are
+installed some other way.
+
+# Checking the audio features
+    python selfcheck.py song.mp3 [--lyrics expected-words.txt]
+runs demucs / Whisper / librosa for real on an excerpt and prints checks
+plus times to confirm by listening.
+
 # License
 This project is licensed under the Community Source License, Version 1.0.
 This is a source-available license and is not an OSI-approved Open Source license.  See LICENSE.md.

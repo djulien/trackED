@@ -644,6 +644,7 @@ def install_fake_ml(vocal_window=(2.0, 6.0)):
         def numpy(self): return np.asarray(self)
 
     torch.wrap = lambda a: np.asarray(a).view(T)
+    torch.from_numpy = torch.wrap
     torch.cuda = types.SimpleNamespace(is_available=lambda: False)
 
     class _NoGrad:
@@ -1245,7 +1246,7 @@ def test_timing_panel(th, wt, media):
 
     card = panel.cards[m1["id"]]
     card["text"].icursor(len("hello"))
-    panel._split(m1["id"])
+    panel._split(m1["id"], how="text")
     first, second = ctl.track_marks(tr["id"])[:2]
     check((first["label"], second["label"]) == ("hello", "there world again"),
           "Split uses the text cursor position in the card")
@@ -1337,14 +1338,20 @@ def test_cursor_playhead_model(th, wt, media):
     time.sleep(ctl.SEEK_CLICK_WINDOW + 0.05)
     ctl.toggle_play()
     check(ctl.engine.calls[-1][0] == round(paused_at + 5.0, 3), "Play resumes from the (moved) @cursor")
+    start2 = round(paused_at + 5.0, 3)
+    time.sleep(0.05)
+    ctl.toggle_play()                                  # pause again
+    paused2 = ctl.cursor_time
+    ctl._ctrl_on_play = True
     ctl.toggle_play()
-    ctl.stop_play()
-    check(ctl._play_state == "stopped" and abs(ctl.cursor_time - 15.0) < 1e-9,
-          "Reset puts the @cursor back where Play was first pressed")
-    ctl.toggle_play()
-    check(ctl.engine.calls[-1] == (15.0, None), "pause -> Reset -> Play restarts from the starting position")
+    check(ctl.engine.calls[-1][0] == round(paused2, 3), "while paused, Ctrl+Play resumes from the paused spot")
+    time.sleep(0.05)
+    ctl.toggle_play()                                  # pause
+    ctl.toggle_play()                                  # bare Play
+    check(ctl._play_state == "playing" and ctl.engine.calls[-1][0] == start2,
+          "while paused, bare Play starts again from where Play started")
     ctl.toggle_play(); ctl.stop_play()
-    check(ctl.play_stop_btn.cget("text") == "\u25a0", "the Reset button keeps its square glyph")
+    check(not hasattr(ctl, "play_stop_btn"), "there is no Reset button any more")
 
     ctl.engine.calls.clear()
     ctl.cursor_time = 98.0
@@ -1563,14 +1570,17 @@ def test_toolbar_layout(th, wt, media):
     ctl.play_btn.fire("<Enter>", Event())
     check(ctl.play_btn.cget("bg") == wt.TB_HOVER, "toolbar buttons highlight on hover")
     ctl.play_btn.fire("<Leave>", Event())
-    saved = dict(th.OPTIONAL_MISSING)
-    th.OPTIONAL_MISSING.clear(); th.OPTIONAL_MISSING["tinytag"] = "tinytag"
+    real_missing = wt.deps.missing
+    wt.deps.missing = lambda include_broken=False: [wt.deps.BY_KEY["demucs"], wt.deps.BY_KEY["librosa"]]
     ctl._refresh_playback_availability()
-    shown = ctl.install_btn.packed and "tinytag" in ctl._install_tip.text
-    th.OPTIONAL_MISSING.clear()
+    shown = (ctl.install_btn.packed and "demucs" in ctl._install_tip.text and "librosa" in ctl._install_tip.text
+             and "Install" in ctl.install_btn.cget("text"))
+    wt.deps.missing = lambda include_broken=False: []
+    saved_pm = dict(th.PLAYBACK_MISSING); th.PLAYBACK_MISSING.clear()
     ctl._refresh_playback_availability()
     hidden = not ctl.install_btn.packed
-    th.OPTIONAL_MISSING.update(saved)
+    th.PLAYBACK_MISSING.update(saved_pm)
+    wt.deps.missing = real_missing
     check(shown and hidden, "the warning button only appears when packages are missing, naming them")
     ctl.model_var.set("medium"); ctl._on_model_changed()
     check(ctl._selected_model() == "medium", "choosing a model in the Transcribe menu selects it")
@@ -1740,26 +1750,29 @@ def test_round5(th, wt, media):
     card = panel.cards[a["id"]]
     kids = card["frame"].winfo_children()
     order = [k._cfg.get("text") for k in kids]
-    check(kids.index(card["play"]) < kids.index(card["start"]) and kids.index(card["stop"]) < kids.index(card["start"]),
-          "a card's Play (and Stop) sit left of the Start/End times")
+    check(kids.index(card["play"]) < kids.index(card["start"]) and "stop" not in card,
+          "a card's Play sits left of the Start/End times (no Stop button)")
     right = [kids.index(card["split"]), kids.index(card["merge"]), kids.index(card["delete"])]
     check(min(right) > kids.index(card["end_rsnap"]), "Split / Merge / Delete stay on the right")
     check(getattr(card["play"], "_loop_hover", False), "card Play buttons are marked for the Shift-key loop cursor")
 
-    # Stop buttons only while paused
-    check(not ctl.play_stop_btn.packed, "the main Stop button is hidden while stopped")
+    # card Play: pause, then bare Play restarts the card, Ctrl+Play resumes
     card["play"]._cfg["command"]()
-    check(not ctl.play_stop_btn.packed and not getattr(card["stop"], "_gridded", False),
-          "...and while playing")
+    check(ctl._play_state == "playing" and ctl._play_mark_id == a["id"], "a card's Play plays its mark")
     card["play"]._cfg["command"]()      # pause
-    check(ctl.play_stop_btn.packed, "the main Stop button appears while paused")
-    check(getattr(card["stop"], "_gridded", False), "the paused card shows its Stop button")
+    check(ctl._play_state == "paused", "...and pauses it")
     at = [it for it in canvas.items if it["kind"] == "text" and "cursor_at" in (it.get("tags") or ())]
     check(at and abs(at[0]["coords"][0] - ctl._play_position / 100 * 800) < 1.0,
           "while paused, the '@' tag sits at the playhead")
-    card["stop"]._cfg["command"]()
-    check(ctl._play_state == "stopped" and not ctl.play_stop_btn.packed and not card["stop"]._gridded,
-          "a card's Stop resets playback and the Stop buttons hide again")
+    panel._ctrl_on_play = True
+    card["play"]._cfg["command"]()
+    check(ctl._play_state == "playing" and ctl.engine.calls[-1][0] == round(ctl._paused_at, 3),
+          "Ctrl+Play on the paused card resumes it")
+    card["play"]._cfg["command"]()      # pause
+    card["play"]._cfg["command"]()      # bare Play
+    check(ctl._play_state == "playing" and ctl.engine.calls[-1][0] == round(a["start"], 3),
+          "bare Play on the paused card starts it again from its start")
+    ctl.stop_play()
 
     # Shift key while already hovering a card's Play button
     top = ctl.canvas.winfo_toplevel()
@@ -1914,8 +1927,8 @@ def test_round7(th, aa, wt, media):
     ctl.cursor_time = 12.0
     ctl.stems_menu.entries.clear()
     ctl._fill_stems_menu()
-    entry = next(e for e in ctl.stems_menu.entries if e["label"].startswith("New range from the stem at @cursor"))
-    check("Instrumental" in entry["label"], "the Stems menu offers a range from the stem under the @cursor")
+    entry = next(e for e in ctl.stems_menu.entries if e["label"] == "New range from @cursor")
+    check(entry["label"] == "New range from @cursor", "the Stems menu offers \"New range from @cursor\"")
     entry["command"]()
     m = ctl.mark_by_id(ctl.selected[1])
     check((m["type"], m["start"], m["end"], m["track_id"]) == ("range", 9.0, 20.0, None),
@@ -2086,9 +2099,11 @@ def test_round9(th, aa, wt, media):
     menu = card["split_menu"]
     menu.entries.clear()
     ctl.panel._fill_split_menu(mk["id"], menu)
-    check([e["label"] for e in menu.entries] == ["Split at cursor", "Split selected phrase", "Split into words (5)"]
+    labels = [e["label"] for e in menu.entries]
+    check(labels[0].startswith("Split at @cursor") and labels[1].startswith("Split at text cursor")
+          and labels[2:] == ["Split in half", "Split selected phrase", "Split into words (5)"]
           and menu.entry("Split selected phrase").get("state") == "normal",
-          "Split \u25be offers cursor / selected phrase / words")
+          "Split \u25be offers @cursor / text cursor / half / selected phrase / words")
     menu.entry("Split selected phrase")["command"]()
     pieces = ctl.track_marks(tr["id"])
     check([p["label"] for p in pieces] == ["one two", "three four", "five"],
@@ -2614,8 +2629,9 @@ def test_voices(th, wt, media):
           "right-clicking a range shows its voices in the menu")
     vmenu = cascade["menu"]
     checks = [e for e in vmenu.entries if e.get("kind") == "check"]
-    check([e["label"] for e in checks] == ctl.voices and checks[0]["variable"].get() is True,
-          "...with a check item per voice (checked when assigned)")
+    check([e["label"] for e in checks] == ["All voices"] + ctl.voices and checks[0]["variable"].get() is False
+          and checks[1]["variable"].get() is True,
+          "...with \"All voices\" and a check item per voice (checked when assigned)")
     check(any(l.startswith("New voice") for l in vmenu.labels()), "...and New voice...")
     vmenu.invoke_label("Lead")
     check(ctl.mark_voices(b["id"]) == [], "unchecking a voice there removes it from the range")
@@ -2627,23 +2643,23 @@ def test_voices(th, wt, media):
     card = panel.cards[b["id"]]
     check(card["voice"].cget("text") == "Lead \u25be", "the card's Voice button shows its voices")
     ctl.set_mark_voices(b["id"], [])
-    check(panel.cards[b["id"]]["voice"].cget("text") == "Voice \u25be", "...and follows changes")
+    check(panel.cards[b["id"]]["voice"].cget("text") == "All voices \u25be", "...and follows changes (none set: All voices)")
     ctl.set_mark_voices(b["id"], ["Lead"])
     panel._fill_voice_menu(b["id"], card["voice_menu"])
-    check([e["label"] for e in card["voice_menu"].entries if e.get("kind") == "check"] == ctl.voices,
-          "the Voice \u25be menu lists the voices")
+    check([e["label"] for e in card["voice_menu"].entries if e.get("kind") == "check"] == ["All voices"] + ctl.voices,
+          "the Voice \u25be menu lists All voices and the voices")
     ctl.set_mark_voices(ctl.track_marks(tr["id"])[0]["id"], [])     # one card without a voice
     shown_all = list(panel.cards)
     panel.voice_filter_var.set("Lead"); panel._on_voice_filter()
     check(list(panel.cards) == [m["id"] for m in ctl.track_marks(tr["id"]) if "Lead" in (m.get("voices") or [])]
           and len(panel.cards) < len(shown_all), "Show: <voice> limits the cards to that voice")
     check("of" in panel._header_label.cget("text"), "...and the header says how many are shown")
-    panel.voice_filter_var.set("(no voice)")
+    panel.voice_filter_var.set("All voices")
     panel._on_voice_filter()
     check(len(panel.cards) == 1 and all(not ctl.mark_by_id(mid).get("voices") for mid in panel.cards),
-          "Show: (no voice) shows the unassigned cards")
-    panel.voice_filter_var.set("All voices"); panel._on_voice_filter()
-    check(list(panel.cards) == shown_all, "All voices shows every card again")
+          "Show: All voices shows the cards with no voice set (they're for all voices)")
+    panel.voice_filter_var.set("All cards"); panel._on_voice_filter()
+    check(list(panel.cards) == shown_all, "Show: All cards shows every card again")
 
 
 def test_word_panel(th, wt, media):
@@ -3718,7 +3734,7 @@ def test_round11(th, wt, media):
           and card["start"].cget("bg") == tp.ENTRY_BG, "cards are dark (light text), like the panel around them")
 
     # #5 voice button
-    check(tp.voice_button_text([], "hello") == "Voice \u25be", "no voice: plain Voice button")
+    check(tp.voice_button_text([], "hello") == "All voices \u25be", "no voice set: the card is for All voices")
     check(tp.voice_button_text([], "(ooh ooh)") == "voice 2 \u25be", "all in parentheses: the implied voice 2")
     check(tp.voice_button_text([], "love (you)") == "voice 1+ \u25be", "mixed: \"+\" after the (implied) voice")
     check(tp.voice_button_text(["Lead"], "love (you)") == "Lead+ \u25be", "...after an assigned voice too")
@@ -3856,8 +3872,8 @@ def test_round13(th, wt, media):
     app = types.SimpleNamespace(status=FakeWidget())
     tracked.EditorApp.set_status(app, "Auto-saved x")
     shown = app.status.cget("text")
-    check(re.match(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d  Auto-saved x$", shown) is not None,
-          "status messages start with the date and time they appeared")
+    check(re.match(r"^Auto-saved x   \(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\)$", shown) is not None,
+          "status messages end with the date and time they appeared")
     app._update_title = lambda: None
     tracked.EditorApp._on_tab_modified(app, types.SimpleNamespace(dirty=True))
     check(app.status.cget("text") == "", "...and the Auto-saved one still clears on new changes")
@@ -4158,6 +4174,258 @@ def test_dialog_colors():
           "the app installs them right after creating the root window")
 
 
+def test_round14(th, aa, wt, media):
+    print("\n-- round 14: deps/Install, restart, drops, stems decode, play, split, multi-select, voices --")
+    import deps
+    import tracked
+    import timing_panel as tp
+
+    # deps registry (#4/#7/#8/#11)
+    keys = [d["key"] for d in deps.DEPENDENCIES]
+    check(all(k in keys for k in ("demucs", "librosa", "faster-whisper", "tkinterdnd2", "psutil", "ffmpeg")),
+          "the Install list includes demucs, librosa, faster-whisper, tkinterdnd2, psutil and ffmpeg")
+    check(all(d.get("purpose") and d.get("size") for d in deps.DEPENDENCIES), "each entry says what it's for and its size")
+    real_spec = deps._importable
+    deps._importable = lambda name: name not in ("librosa", "demucs")
+    names = [d["key"] for d in deps.missing()]
+    deps._importable = real_spec
+    check("librosa" in names and "demucs" in names and "numpy" not in names, "missing() reports what isn't importable")
+    check("--no-warn-script-location" in deps.pip_args(["x"]) and deps.pip_args(["x"])[0] == sys.executable,
+          "pip runs with this Python and without the not-on-PATH warning (PATH is left alone)")
+    check("trackED.sh" in deps.explain_pip_failure("error: externally-managed-environment"),
+          "a system-managed Python gets a plain explanation")
+    cmd, manual = deps.program_install_command(deps.BY_KEY["ffmpeg"])
+    check(bool(manual), "ffmpeg has an install command or instructions on this system")
+    ok, failed = deps.install(["nonexistent-key"])
+    check(ok == [] and failed == [], "unknown keys are ignored")
+
+    # Install dialog + restart offer (#6, #8)
+    p = fresh_copy(media, "r14_install")
+    ctl, canvas, text, tab = open_controller(wt, p)
+    real_missing = deps.missing
+    deps.missing = lambda include_broken=False: [deps.BY_KEY["librosa"], deps.BY_KEY["ffmpeg"]]
+    try:
+        dlg = wt.InstallDialog(canvas)
+        check(dlg.selected() == ["librosa", "ffmpeg"], "the dialog lists each missing package, all checked")
+        dlg.vars["ffmpeg"].set(False); dlg._sync_all()
+        check(dlg.selected() == ["librosa"] and dlg.all_var.get() is False, "...each can be unchecked (multi-select)")
+        dlg.all_var.set(True); dlg._toggle_all()
+        check(dlg.selected() == ["librosa", "ffmpeg"], "...and \"All missing\" checks them all again")
+        ctl._refresh_playback_availability()
+        check(ctl.install_btn.packed and ctl.install_btn.cget("text") == "\u26a0 Install",
+              "the toolbar button reads \u26a0 Install")
+        restarts = []
+        canvas.restart = lambda: restarts.append(1)
+        ctl._install_finished(["librosa"], [])
+        check(restarts == [1], "after an install, trackED offers to restart (Yes restarts)")
+        check(ctl.install_btn.cget("text") == "\u27f3 Restart", "...and the button becomes Restart")
+        ctl._on_install_clicked()
+        check(restarts == [1, 1], "clicking Restart restarts")
+    finally:
+        deps.missing = real_missing
+    deps.missing = lambda include_broken=False: [deps.BY_KEY["librosa"]]
+    try:
+        ctl_i, _ci, text_i, _ti = open_controller(wt, fresh_copy(media, "r14_info"))
+        info = text_i.get("1.0", "end")
+    finally:
+        deps.missing = real_missing
+    check("Missing dependencies: librosa." in info and "Install button in the upper right corner" in info,
+          "the text panel says briefly what's missing and where the Install button is")
+    from pathlib import Path
+    check(tracked.restart_command(["tracked.py", "-debug", "3", "song.mp3", "-fresh"])[1:]
+          == [str(Path(tracked.__file__).resolve()), "-debug", "3"],
+          "restart keeps the options but not file names or -fresh (the session reopens files)")
+
+    # drops (#2)
+    opened = []
+    app = types.SimpleNamespace(tk=types.SimpleNamespace(splitlist=lambda d: d.split("|")),
+                                open_file=lambda p_: opened.append(p_))
+    ev = types.SimpleNamespace(data=p + "|/no/such/file", action="copy")
+    check(tracked.EditorApp._on_drop(app, ev) == "copy" and opened == [p],
+          "a drop opens the file and returns the copy action (Windows needs one)")
+    reg = []
+    w1 = types.SimpleNamespace(_own_drop=True, drop_target_register=lambda *a: reg.append("own"))
+    w2 = types.SimpleNamespace(drop_target_register=lambda *a: reg.append("w2"), dnd_bind=lambda *a: None)
+    app2 = types.SimpleNamespace(_on_drop=None)
+    old_has = tracked.HAS_DND
+    tracked.HAS_DND = True
+    tracked.DND_FILES = "DND_Files"
+    tracked.EditorApp._register_drops(app2, w1)
+    tracked.EditorApp._register_drops(app2, w2)
+    tracked.EditorApp._register_drops(app2, w2)
+    tracked.HAS_DND = old_has
+    check(reg == ["w2"], "each tab widget is registered once; the waveform canvas keeps its own drop handling")
+
+    # stems without ffprobe (#12)
+    err = FileNotFoundError(2, "The system cannot find the file specified")
+    text_ = aa.explain_error(err, "Stem separation")
+    check("ffmpeg" in text_ and "Install" in text_, "WinError 2 is explained: ffmpeg missing, use Install")
+    check("can't be found" in aa.explain_error(FileNotFoundError(2, "x", "/a/song.mp3")),
+          "...a missing audio file is named as such")
+    data = aa.decode_for_demucs(media, 8000, 2)
+    check(data.shape[0] == 2 and abs(data.shape[1] / 8000 - 10.0) < 0.1, "stems decode the audio themselves")
+    import shutil as _sh
+    real_which = aa.shutil.which
+    aa.shutil.which = lambda name: None
+    try:
+        wav = make_media("r14_wav", 2.0)
+        data2 = aa.decode_for_demucs(wav, 8000, 2)
+        check(data2.shape[0] == 2 and abs(data2.shape[1] / 8000 - 2.0) < 0.05,
+              "...and without ffmpeg/ffprobe on PATH they fall back to soundfile (+ resample)")
+    finally:
+        aa.shutil.which = real_which
+    src = open(os.path.join(HERE, "audio_analysis.py")).read()
+    check("AudioFile(" not in src, "demucs' ffprobe-based AudioFile reader is no longer used")
+
+    # dirty first (#1, defensive)
+    ctl2, _c2, _t2, tab2 = bare_controller(wt, fresh_copy(media, "r14_dirty"), 20.0)
+    tab2.dirty = False
+    real_push = ctl2._push_mark_history
+    ctl2._push_mark_history = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    ctl2._add_mark("point", 1.0, None)
+    ctl2._push_mark_history = real_push
+    check(tab2.dirty, "a change marks the tab unsaved even if undo bookkeeping fails")
+
+    # play (#14)
+    ctl3, c3, _t3, _tab3 = bare_controller(wt, fresh_copy(media, "r14_play"), 100.0)
+    ctl3.cursor_time = 10.0
+    ctl3.toggle_play(); time.sleep(0.05); ctl3.toggle_play()
+    paused = ctl3.cursor_time
+    ctl3.cursor_time = 40.0                                    # moved while paused
+    ctl3.toggle_play()
+    check(ctl3.engine.calls[-1][0] == 40.0, "paused + Play after moving the @cursor plays from the @cursor")
+    ctl3.stop_play()
+
+    # Split menu (#10)
+    tr = ctl3._new_track("Lyrics")
+    mk = ctl3._add_mark("range", 10.0, 20.0, label="one two three four", track_id=tr["id"])
+    ctl3.selected = ("track", tr["id"]); ctl3.render_waveform(); run_afters()
+    ctl3.cursor_time = 12.5
+    ctl3.panel._split(mk["id"], how="time")
+    first = ctl3.mark_by_id(mk["id"])
+    check(abs(first["end"] - 12.5) < 1e-9, "Split at @cursor splits at the @cursor, whatever the text cursor")
+    ctl3.panel._split(mk["id"], how="half")
+    check(abs(ctl3.mark_by_id(mk["id"])["end"] - 11.25) < 0.5, "Split in half splits in the middle")
+    panel_src = open(os.path.join(HERE, "timing_panel.py")).read()
+    check("Nudge size:" in panel_src and "Step (s):" not in panel_src, "the header says Nudge size:")
+    check("Ctrl+click the waveform to place @cursor and Split" not in panel_src, "the misleading hint is gone")
+
+    # merge with the next visible card (A1)
+    ctl4, _c4, _t4, _tab4 = bare_controller(wt, fresh_copy(media, "r14_merge"), 100.0)
+    tr4 = ctl4._new_track("V")
+    a = ctl4._add_mark("range", 1.0, 2.0, label="a", track_id=tr4["id"])
+    b = ctl4._add_mark("range", 2.0, 3.0, label="b", track_id=tr4["id"])
+    c = ctl4._add_mark("range", 3.0, 4.0, label="c", track_id=tr4["id"])
+    ctl4.set_mark_voices(a["id"], ["Lead"]); ctl4.set_mark_voices(c["id"], ["Lead"])
+    ctl4.selected = ("track", tr4["id"]); ctl4.render_waveform(); run_afters()
+    ctl4.panel.voice_filter_var.set("Lead"); ctl4.panel._on_voice_filter()
+    ctl4.panel._merge_next(a["id"])
+    check(ctl4.mark_by_id(c["id"]) is None and ctl4.mark_by_id(b["id"]) is not None
+          and ctl4.mark_by_id(a["id"])["label"] == "a c", "Merge \u2193 merges with the next visible card")
+
+    # multi-select, copy/cut/paste/move (#15)
+    ctl5, c5, _t5, tab5 = bare_controller(wt, fresh_copy(media, "r14_multi"), 100.0)
+    src_t = ctl5._new_track("Lead")
+    dst_t = ctl5._new_track("Backup")
+    ms = [ctl5._add_mark("range", float(i), i + 0.8, label=f"w{i}", track_id=src_t["id"]) for i in range(1, 6)]
+    ctl5.selected = ("mark", ms[1]["id"])
+    ctl5.extend_selection(ms[3], toggle=False)
+    check(ctl5.selected_mark_ids() == [m["id"] for m in ms[1:4]], "Shift+click selects a run of marks in the track")
+    ctl5.extend_selection(ms[2], toggle=True)
+    check(ms[2]["id"] not in ctl5.selected_mark_ids() and len(ctl5.selected_mark_ids()) == 2,
+          "Ctrl+click toggles one mark")
+    check(ctl5._is_highlighted("mark", ms[1]["id"]) and ctl5._is_highlighted("mark", ms[3]["id"]),
+          "every selected mark is highlighted")
+    n = ctl5.copy_selection()
+    ctl5.selected = ("track", dst_t["id"])
+    pasted = ctl5.paste_marks()
+    check(n == 2 and [(m["start"], m["label"], m["track_id"]) for m in pasted]
+          == [(2.0, "w2", dst_t["id"]), (4.0, "w4", dst_t["id"])] and len({m["id"] for m in pasted} & {m["id"] for m in ms}) == 0,
+          "Ctrl+C / Ctrl+V copies marks into the selected track at the same times (new ids)")
+    ctl5.cursor_time = 50.0
+    at = ctl5.paste_marks(dst_t["id"], at_cursor=True)
+    check(at[0]["start"] == 50.0 and at[1]["start"] == 52.0, "Paste at @cursor shifts them to start there")
+    hist = ctl5._mark_history_index
+    ctl5.selected = ("mark", ms[0]["id"]); ctl5._multi = [ms[0]["id"], ms[4]["id"]]
+    moved = ctl5.move_selection_to_track(dst_t["id"])
+    check(all(m["track_id"] == dst_t["id"] for m in moved) and ctl5._mark_history_index == hist + 1,
+          "Move to Track moves the selected marks (one undo step)")
+    ctl5.undo_marks()
+    check(ctl5.mark_by_id(ms[0]["id"])["track_id"] == src_t["id"], "...and undo moves them back")
+    ctl5.selected = ("mark", ms[0]["id"]); ctl5._multi = [ms[0]["id"], ms[1]["id"]]
+    copies = ctl5.move_selection_to_track(dst_t["id"], keep=True)
+    check(len(copies) == 2 and ctl5.mark_by_id(ms[0]["id"])["track_id"] == src_t["id"],
+          "Copy to Track leaves the originals")
+    ctl5.selected = ("mark", ms[0]["id"]); ctl5._multi = [ms[0]["id"], ms[1]["id"]]
+    tab5.dirty = False
+    ctl5.cut_selection()
+    check(ctl5.mark_by_id(ms[0]["id"]) is None and len(wt._MARK_CLIPBOARD["marks"]) == 2 and tab5.dirty,
+          "Cut removes the marks and keeps them for pasting")
+    ctl5.selected = ("mark", ms[2]["id"]); ctl5._multi = [ms[2]["id"], ms[3]["id"]]
+    ctl5._on_key_delete(Event())
+    check(ctl5.mark_by_id(ms[2]["id"]) is None and ctl5.mark_by_id(ms[3]["id"]) is None, "Delete removes the whole selection")
+    layout = ctl5._track_layout()
+    lead_y = None
+    for zone_y in range(0, 400):
+        z, t_ = ctl5._track_zone_at_y(zone_y)
+        if z == "track" and t_ == src_t["id"]:
+            lead_y = zone_y + 2
+            break
+    ctl5.selected = ("mark", ms[4]["id"]); ctl5._multi = []
+    before = ctl5.cursor_time
+    ctl5._on_ctrl_press(Event(x=int(ms[4]["start"] / 100 * 800) + 3, y=lead_y))
+    check(ctl5.cursor_time == before, "Ctrl+click on a mark in a track selects instead of moving the @cursor")
+    ctl5._on_ctrl_press(Event(x=int(80 / 100 * 800), y=lead_y))
+    check(abs(ctl5.cursor_time - 80.0) < 0.5, "Ctrl+click on an empty part still moves the @cursor")
+
+    # per-voice export (A2)
+    marks = [
+        {"id": "1", "type": "range", "start": 0.0, "end": 1.0, "label": "all sing"},
+        {"id": "2", "type": "range", "start": 1.0, "end": 2.0, "label": "lead line", "voices": ["Lead"]},
+        {"id": "3", "type": "range", "start": 2.0, "end": 3.0, "label": "(ooh)"},
+        {"id": "4", "type": "range", "start": 3.0, "end": 4.0, "label": "both", "voices": ["Lead", "voice 2"]},
+    ]
+    check(th.effective_voices(marks[0]) == [] and th.effective_voices(marks[2]) == ["voice 2"],
+          "no voice set = all voices; all-parentheses text implies voice 2")
+    out = th.voice_export_tracks("Lyrics", marks, ["Lead", "voice 2", th.ALL_VOICES_NAME, th.ANY_VOICE])
+    got = {name: [m["id"] for m in ms_] for name, ms_ in out}
+    check(got == {"Lyrics - Lead": ["1", "2", "4"], "Lyrics - voice 2": ["1", "3", "4"],
+                  "Lyrics - All voices": ["1"], "Lyrics": ["1", "2", "3", "4"]},
+          "per-voice tracks: a voice's cards plus the All-voices cards; All voices only; every card")
+    out2 = th.voice_export_tracks("Lyrics", marks, ["Lead"], all_voices_in_each=False)
+    check([m["id"] for m in out2[0][1]] == ["2", "4"], "...or a voice's own cards only")
+    check(th.overlap_count([marks[0], dict(marks[1], start=0.5)]) == 1 and th.overlap_count(marks) == 0,
+          "overlapping cards in an exported track are counted (xLights warning)")
+    ctl6, c6, _t6, _tab6 = bare_controller(wt, fresh_copy(media, "r14_voices"), 10.0)
+    tr6 = ctl6._new_track("Lyrics")
+    for m in marks:
+        ctl6._add_mark("range", m["start"], m["end"], label=m["label"], track_id=tr6["id"])
+        if m.get("voices"):
+            ctl6.set_mark_voices(ctl6.marks[-1]["id"], m["voices"])
+    captured = []
+    orig = wt.tk.Menu
+
+    class Capture(orig):
+        def __init__(self, *args, **kw):
+            super().__init__(*args, **kw)
+            captured.append(self)
+    wt.tk.Menu = Capture
+    try:
+        ctl6._show_track_menu(tr6, Event(x_root=0, y_root=0))
+    finally:
+        wt.tk.Menu = orig
+    labels = captured[0].labels()
+    check("Export Combined..." in labels and "Export per Voice..." in labels,
+          "the track menu offers Export Combined and Export per Voice")
+    dlg = wt.VoiceExportDialog(c6, ctl6, tr6, ctl6.track_marks(tr6["id"]))
+    check([k for k, v in dlg.vars if v.get()] == ["Lead", "voice 2"], "the dialog checks one track per voice by default")
+    path = os.path.join(TMP, "r14-voices.xtiming")
+    check(dlg.export(path) and os.path.exists(path), "Export per Voice writes the file")
+    import xml.etree.ElementTree as ET
+    names = [t.get("name") for t in ET.parse(path).getroot()]
+    check(names == ["Lyrics - Lead", "Lyrics - voice 2"], "...one xLights timing track per voice")
+
+
 # ---------------------------------------------------------------------------
 
 def main():
@@ -4227,6 +4495,7 @@ def main():
         test_round8(th, aa, wt, media)
         test_round9(th, aa, wt, media)
         test_stems_and_transcription(th, aa, wt, media)
+        test_round14(th, aa, wt, media)
 
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n{'=' * 50}")

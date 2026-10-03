@@ -89,8 +89,9 @@ NUDGE_REPEAT_INTERVAL_MS = 80
 
 
 SHIFT_MASK = 0x0001
+CONTROL_MASK = 0x0004
 PLAY_GLYPH, PAUSE_GLYPH = "\u25b6", "\u275a\u275a"
-ALL_VOICES = "All voices"
+SHOW_ALL = "All cards"      # Show: filter -- every card
 MULTI_CARD_LINES = 3      # card text fields grow to at most this many lines when a track has several cards
 LIST_BG = "#1e1e1e"       # the card list's background (between cards)
 CARD_GAP = 3              # pixels between cards
@@ -105,7 +106,7 @@ REST_BTN_WIDTH = 11
 JOIN_MODES = ("off", "group", "all")
 JOIN_TEXT = {"off": "<Join none", "group": "<Join group", "all": "<Join all"}
 JOIN_BTN_WIDTH = 11
-NO_VOICE = "(no voice)"
+ALL_VOICES = "All voices"    # a card with no voice set is for all voices (Show: filter too)
 WORD_TIP_DELAY_MS = 600
 VOICE_BTN_MAX_CHARS = 18
 
@@ -125,7 +126,7 @@ def voice_button_text(voices, label: str = "") -> str:
         elif mixed:
             voices = [th.VOICE_PREFIX + "1"]
     if not voices:
-        return "Voice \u25be"
+        return ALL_VOICES + " \u25be"
     text = ", ".join(voices)
     if len(text) > VOICE_BTN_MAX_CHARS:
         text = text[:VOICE_BTN_MAX_CHARS - 1] + "\u2026"
@@ -416,7 +417,7 @@ class TimingPanel:
         self.cards: Dict[str, Dict] = {}   # mark id -> widgets
         self.order: List[str] = []
         self.step_var = tk.StringVar(value="0.1")
-        self.voice_filter_var = tk.StringVar(value=ALL_VOICES)
+        self.voice_filter_var = tk.StringVar(value=SHOW_ALL)
         # "rest": End changes on a card also move the later marks -- "off",
         # "all" (every later mark) or "gap" (up to the first gap). One
         # setting shared by all cards; not saved.
@@ -480,9 +481,9 @@ class TimingPanel:
         """The track's marks, limited to the header's voice choice."""
         marks = self.ctl.track_marks(track_id)
         want = self.voice_filter_var.get()
-        if want == NO_VOICE:
+        if want == ALL_VOICES:
             return [m for m in marks if not m.get("voices")]
-        if want and want != ALL_VOICES and want in getattr(self.ctl, "voices", []):
+        if want and want != SHOW_ALL and want in getattr(self.ctl, "voices", []):
             return [m for m in marks if want in (m.get("voices") or [])]
         return marks
 
@@ -879,19 +880,22 @@ class TimingPanel:
         self._header_label = tk.Label(frame, text=self._header_text(track, marks),
                                       font=("TkDefaultFont", 10, "bold"), bg=HEADER_BG, fg=FG)
         self._header_label.pack(side="left")
-        tk.Label(frame, text="   Step (s):", bg=HEADER_BG, fg=FG).pack(side="left")
+        nudge = tk.Label(frame, text="   Nudge size:", bg=HEADER_BG, fg=FG)
+        nudge.pack(side="left")
         combo = ttk.Combobox(frame, textvariable=self.step_var, values=STEP_CHOICES, width=5)
         combo.pack(side="left", padx=(2, 10))
+        for widget in (nudge, combo):
+            _Tip(widget, "Seconds the \u2212 / + buttons (and Alt+arrows on a word) move a time")
         tk.Label(frame, text="Show:", bg=HEADER_BG, fg=FG).pack(side="left")
         voices = list(getattr(self.ctl, "voices", []))
-        if self.voice_filter_var.get() not in [ALL_VOICES, NO_VOICE] + voices:
-            self.voice_filter_var.set(ALL_VOICES)
+        if self.voice_filter_var.get() not in [SHOW_ALL, ALL_VOICES] + voices:
+            self.voice_filter_var.set(SHOW_ALL)
         vbox = ttk.Combobox(frame, textvariable=self.voice_filter_var, state="readonly", width=14,
-                            values=[ALL_VOICES] + voices + [NO_VOICE])
+                            values=[SHOW_ALL] + voices + [ALL_VOICES])
         vbox.pack(side="left", padx=(2, 10))
         vbox.bind("<<ComboboxSelected>>", self._on_voice_filter)
         self._voice_filter_box = vbox
-        hint = tk.Label(frame, text="Ctrl+click the waveform to place @cursor and Split",
+        hint = tk.Label(frame, text="Click the waveform to place the @cursor (Split \u25be can split there)",
                         fg=FG_DIM, bg=HEADER_BG)
         hint.pack(side="left")
         # Clicking the header's background also "clicks off" the cards.
@@ -930,19 +934,14 @@ class TimingPanel:
         # Shift+click loops this card's span (like the main Play button);
         # the pointer shows the loop cursor while Shift is held over it.
         play.bind("<ButtonRelease-1>",
-                  lambda ev: setattr(self, "_shift_on_play", bool(ev.state & SHIFT_MASK)), add="+")
+                  lambda ev: (setattr(self, "_shift_on_play", bool(ev.state & SHIFT_MASK)),
+                              setattr(self, "_ctrl_on_play", bool(ev.state & CONTROL_MASK))), add="+")
         for seq in ("<Enter>", "<Motion>"):
             play.bind(seq, lambda ev, b=play: b.configure(cursor="exchange" if ev.state & SHIFT_MASK
                                                            else "hand2"), add="+")
-        _Tip(play, "Play / pause this mark\nShift+click: loop it until stopped")
-        register_modifier_button(play, ("shift",))
-        stop = _style_button(tk.Button(f, text="\u25a0", width=2, padx=4, pady=0,
-                                       command=lambda: self.ctl.stop_play()))
-        stop.grid(row=0, column=col, padx=(1, 2))
-        stop.grid_remove()          # only while paused (see _update)
-        col += 1
-        w["stop"] = stop
-        _Tip(stop, "Reset: back to where Play started")
+        _Tip(play, "Play / pause this mark\nWhile paused: Play starts it again from its start;\n"
+                   "Ctrl+click resumes from the paused spot\nShift+click: loop it until paused")
+        register_modifier_button(play, ("shift", "control"))
 
         w["tbtns"] = []          # the Start/End buttons: they take the card's background
 
@@ -1221,7 +1220,10 @@ class TimingPanel:
     def _update_inner(self, track, marks, force: bool = False) -> None:
         # Called on every waveform render (10x/s during playback): skip
         # the widget work when nothing visible has changed.
-        sig = (track and track.get("name"), self.ctl.selected_mark_id(), tuple(getattr(self.ctl, "voices", ())),
+        sel_ids = (self.ctl.selected_mark_ids() if hasattr(self.ctl, "selected_mark_ids")
+                   else [self.ctl.selected_mark_id()])
+        sig = (track and track.get("name"), self.ctl.selected_mark_id(), tuple(sel_ids),
+               tuple(getattr(self.ctl, "voices", ())),
                bool(getattr(self.ctl, "regions", None)),
                getattr(self.ctl, "_play_state", None), getattr(self.ctl, "_play_mark_id", None),
                getattr(self.ctl, "_loop", False),
@@ -1238,7 +1240,7 @@ class TimingPanel:
         box = getattr(self, "_voice_filter_box", None)
         if box is not None:
             try:
-                box.configure(values=[ALL_VOICES] + list(getattr(self.ctl, "voices", [])) + [NO_VOICE])
+                box.configure(values=[SHOW_ALL] + list(getattr(self.ctl, "voices", [])) + [ALL_VOICES])
             except tk.TclError:
                 pass
         selected = self.ctl.selected_mark_id()
@@ -1275,15 +1277,12 @@ class TimingPanel:
                 glyph = PAUSE_GLYPH if state == "playing" else PLAY_GLYPH
                 if card["play"].cget("text") != glyph:
                     card["play"].configure(text=glyph)
-                if state == "paused":
-                    card["stop"].grid()
-                else:
-                    card["stop"].grid_remove()
                 rstate = "normal" if has_regions else "disabled"
                 for key in ("start_rsnap", "end_rsnap"):
                     if card[key].cget("state") != rstate:
                         card[key].configure(state=rstate)
-                bg = self._card_bg(selected=(m["id"] == selected), playing=(m["id"] == self.playing_mid))
+                bg = self._card_bg(selected=(m["id"] == selected or m["id"] in sel_ids),
+                                   playing=(m["id"] == self.playing_mid))
                 if card["frame"].cget("bg") != bg:
                     self._paint(card, bg)
             except tk.TclError:
@@ -1691,9 +1690,10 @@ class TimingPanel:
 
     def _toggle_play(self, mid):
         loop = getattr(self, "_shift_on_play", False)
-        self._shift_on_play = False
+        resume = getattr(self, "_ctrl_on_play", False)
+        self._shift_on_play = self._ctrl_on_play = False
         self._commit_all(mid)
-        self.ctl.toggle_mark_play(mid, loop=loop)
+        self.ctl.toggle_mark_play(mid, loop=loop, resume=resume)
 
     def _select_all_later(self, entry):
         """Clicking into a field selects its whole value (after Tk's own
@@ -1767,7 +1767,23 @@ class TimingPanel:
             menu.delete(0, "end")
         except tk.TclError:
             pass
-        menu.add_command(label="Split at cursor", command=lambda: self._split(mid))
+        pos = self.ctl.cursor_position()
+        is_range = mark["type"] == "range" and mark.get("end") is not None
+        at_ok = is_range and pos is not None and mark["start"] + th.MIN_RANGE <= pos <= mark["end"] - th.MIN_RANGE
+        at_label = (f"Split at @cursor ({th.format_time_ms(pos)})" if at_ok
+                    else "Split at @cursor (place it inside this card first)")
+        menu.add_command(label=at_label, state="normal" if at_ok else "disabled",
+                         command=lambda: self._split(mid, how="time"))
+        try:
+            ins = int(insert)
+        except (TypeError, ValueError):
+            ins = -1
+        text_ok = 0 < ins < len(label) and label[:ins].strip() and label[ins:].strip()
+        menu.add_command(label="Split at text cursor" + (f" (before \u201c{label[ins:].split()[0][:15]}\u201d)"
+                                                          if text_ok else " (click in the text first)"),
+                         state="normal" if text_ok else "disabled", command=lambda: self._split(mid, how="text"))
+        menu.add_command(label="Split in half", state="normal" if (is_range or n_words >= 2) else "disabled",
+                         command=lambda: self._split(mid, how="half"))
         menu.add_command(label="Split selected phrase", state="normal" if sel else "disabled",
                          command=lambda: self._split_phrase(mid))
         menu.add_command(label=f"Split into words ({n_words})", state="normal" if n_words >= 2 else "disabled",
@@ -1798,23 +1814,32 @@ class TimingPanel:
         if not mark or not self.ctl.split_mark_into(mid, th.word_spans(mark.get("label") or "")):
             self._flash_bad(mid)
 
-    def _split(self, mid):
+    def _split(self, mid, how="time"):
+        """how: "time" = at the @cursor, "text" = at the text cursor,
+        "half" = in the middle (by word weight)."""
         card = self.cards.get(mid)
         if not card:
             return
         ctx = getattr(self, "_split_ctx", None) or {}
-        try:
-            text_index = ctx["insert"] if ctx.get("mid") == mid else card["text"].index("insert")
-        except tk.TclError:
-            text_index = None
+        text_index = None
+        if how == "text":
+            try:
+                text_index = ctx["insert"] if ctx.get("mid") == mid else card["text"].index("insert")
+                text_index = int(text_index)
+            except (tk.TclError, TypeError, ValueError, KeyError):
+                text_index = None
         self._split_ctx = None
         self._commit_all(mid)
-        if not self.ctl.split_mark_by_id(mid, text_index=text_index):
+        at_time = self.ctl.cursor_position() if how == "time" else -1.0   # -1: outside -> middle
+        if not self.ctl.split_mark_by_id(mid, text_index=text_index, at_time=at_time):
             self._flash_bad(mid)
 
     def _merge_next(self, mid):
+        """Merge with the next card shown (the Show: filter hides others)."""
         self._commit_all(mid)
-        if not self.ctl.merge_mark_by_id(mid, direction=1):
+        mark = self.ctl.mark_by_id(mid)
+        pool = self.visible_marks(mark.get("track_id")) if mark else None
+        if not self.ctl.merge_mark_by_id(mid, direction=1, pool=pool):
             self._flash_bad(mid)
 
     # ------------------------------------------------------------------ voices

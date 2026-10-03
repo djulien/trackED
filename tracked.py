@@ -567,24 +567,52 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
 
     def _setup_drag_drop(self) -> None:
         if not HAS_DND:
+            debug(1, "{yellow}Drag-and-drop is off: tkinterdnd2 is not installed (use the Install button)")
             return
-        # Accept file drops on the whole window / notebook
-        self.drop_target_register(DND_FILES)
-        self.dnd_bind("<<Drop>>", self._on_drop)
-        self.notebook.drop_target_register(DND_FILES)
-        self.notebook.dnd_bind("<<Drop>>", self._on_drop)
+        # Accept file drops on the whole window / notebook (and each tab's
+        # own widgets, see _register_drops -- on Windows a drop goes to the
+        # widget under the pointer).
+        self._register_drops(self)
+        self._register_drops(self.notebook)
 
-    def _on_drop(self, event) -> None:
-        """Open every dropped file in its own tab."""
+    def _register_drops(self, widget) -> None:
+        """Make widget a file-drop target that opens dropped files, unless
+        it already handles drops itself (the waveform canvas sets
+        _own_drop) or was registered before. The Enter/Position handlers
+        return the action, so the source (Explorer, a file manager) shows a
+        copy cursor rather than "not allowed"."""
+        if not HAS_DND or widget is None or getattr(widget, "_own_drop", False) \
+                or getattr(widget, "_drop_registered", False):
+            return
         try:
-            paths = self.tk.splitlist(event.data)
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<DropEnter>>", lambda e: getattr(e, "action", "copy") or "copy")
+            widget.dnd_bind("<<DropPosition>>", lambda e: getattr(e, "action", "copy") or "copy")
+            widget.dnd_bind("<<Drop>>", self._on_drop)
+            widget._drop_registered = True
+        except (tk.TclError, AttributeError) as exc:
+            debug(2, f"drop target not registered on {widget}: {exc}")
+
+    def _register_tab_drops(self, tab) -> None:
+        for name in ("frame", "text", "canvas", "linenumbers"):
+            self._register_drops(getattr(tab, name, None))
+
+    def _on_drop(self, event) -> str:
+        """Open every dropped file in its own tab."""
+        data = getattr(event, "data", "")
+        debug(2, f"Drop: {data!r}")
+        try:
+            paths = self.tk.splitlist(data)
         except Exception:
-            paths = [event.data]
+            paths = [data]
         for p in paths:
-            p = p.strip("{}")  # Windows sometimes wraps paths in braces
+            p = str(p).strip("{}")  # Windows sometimes wraps paths in braces
             if p and Path(p).is_file():
                 self.open_file(p)
                 debug(2, f"Dropped file {p}")
+            elif p:
+                debug(1, f"{{yellow}}Dropped item is not a file: {p}")
+        return getattr(event, "action", "copy") or "copy"
 
     # ------------------------------------------------------------------ Tab reordering
     def _setup_tab_reordering(self) -> None:
@@ -1043,7 +1071,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         appeared (it stays until replaced)."""
         stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
-            self.status.configure(text=f"{stamp}  {message}" if message else "")
+            self.status.configure(text=f"{message}   ({stamp})" if message else "")
         except tk.TclError:
             pass
 
@@ -1065,6 +1093,8 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         if isinstance(cur, EditorTab):
             cur.restore_selection_state()
         self._last_tab = cur
+        if isinstance(cur, EditorTab):
+            self._register_tab_drops(cur)
         self._update_title()
 
     def _update_title(self) -> None:
@@ -1333,9 +1363,18 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         data["recent"] = load_recent()
         return data
 
+    def restart(self) -> None:
+        """Save (asking about unsaved changes as for Quit), close, and start
+        trackED again -- e.g. after the Install button added packages,
+        which only a fresh Python process picks up. The open files come
+        back through the saved session."""
+        self._restart_requested = True
+        self.on_quit()
+
     def _quit_cancelled(self) -> None:
         """The user stayed (Cancel in a close question): a later Ctrl+C
         asks again rather than exiting at once."""
+        self._restart_requested = False
         guard = getattr(self, "_interrupt_guard", None)
         if guard is not None:
             guard.reset()
@@ -1407,6 +1446,38 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         except Exception:
             self.destroy()
         debug(2, f"quit: destroy {1000 * (time.monotonic() - t1):.0f} ms, total {1000 * (time.monotonic() - t0):.0f} ms")
+
+
+def restart_command(argv: List[str]) -> List[str]:
+    """The command that starts trackED again: the same Python and options,
+    without file names and -fresh (the saved session reopens the files)."""
+    script = str(Path(__file__).resolve())
+    opts = []
+    skip_next = False
+    for i, arg in enumerate(argv[1:], start=1):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "-fresh" or not arg.startswith("-"):
+            continue
+        opts.append(arg)
+        if arg in ("-debug", "-debug-default") and i + 1 < len(argv) and argv[i + 1].isdigit():
+            opts.append(argv[i + 1])
+            skip_next = True
+    return [sys.executable, script] + opts
+
+
+def relaunch(argv: List[str]) -> None:
+    """Replace this process with a fresh trackED (Windows: start a new
+    one and exit -- os.execv there doesn't keep the console attached)."""
+    cmd = restart_command(argv)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if sys.platform.startswith("win"):
+        import subprocess
+        subprocess.Popen(cmd, close_fds=True)
+        os._exit(0)
+    os.execv(cmd[0], cmd)
 
 
 def parse_args(argv: List[str]):
@@ -1643,5 +1714,7 @@ if __name__ == "__main__":
     app = EditorApp(files_to_open=files, fresh=fresh, debug_level=dbg)
     InterruptGuard(app)
     app.mainloop()
+    if getattr(app, "_restart_requested", False):
+        relaunch(sys.argv)
 
 #eof

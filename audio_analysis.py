@@ -70,6 +70,13 @@ def _importable(name: str) -> bool:
     return _probe_cache[name]
 
 
+def clear_probe_cache() -> None:
+    """Forget the import checks (after the Install button added packages)."""
+    import importlib
+    _probe_cache.clear()
+    importlib.invalidate_caches()
+
+
 def demucs_available() -> bool:
     """Cheap check (doesn't import torch): are demucs and torch installed?"""
     return _importable("demucs") and _importable("torch")
@@ -111,6 +118,72 @@ def stems_are_fresh(filepath: str) -> bool:
     return True
 
 
+def decode_for_demucs(path: str, sr: int, channels: int):
+    """The whole file as float32 [channels, samples] at sr. demucs' own
+    reader (demucs.audio.AudioFile) runs ffprobe, which is often missing on
+    Windows ("[WinError 2] The system cannot find the file specified"), so
+    decode here instead: ffmpeg if it's on PATH, else soundfile, else
+    miniaudio. Raises RuntimeError naming what's needed."""
+    if np is None:
+        raise RuntimeError("numpy not installed")
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        proc = subprocess.run([ffmpeg, "-v", "error", "-i", path, "-vn", "-ac", str(channels), "-ar", str(sr),
+                               "-f", "f32le", "-"], capture_output=True, timeout=1800)
+        if proc.returncode == 0 and proc.stdout:
+            return np.frombuffer(proc.stdout, dtype=np.float32).reshape(-1, channels).T.copy()
+    data = None
+    if sf is not None:
+        try:
+            data, file_sr = sf.read(path, dtype="float32", always_2d=True)
+            data = data.T
+        except Exception:
+            data = None
+    if data is None:
+        try:
+            import miniaudio
+            dec = miniaudio.decode_file(path, output_format=miniaudio.SampleFormat.FLOAT32,
+                                        nchannels=channels, sample_rate=sr)
+            return np.asarray(dec.samples, dtype=np.float32).reshape(-1, channels).T.copy()
+        except ImportError:
+            pass
+        except Exception as exc:
+            raise RuntimeError(f"couldn't decode {Path(path).name}: {exc}")
+        raise RuntimeError(f"can't decode {Path(path).name} without ffmpeg (or soundfile/miniaudio)")
+    if data.shape[0] != channels:
+        data = np.repeat(data.mean(axis=0, keepdims=True), channels, axis=0)
+    if file_sr != sr and data.shape[1]:
+        n_out = int(round(data.shape[1] * sr / file_sr))
+        x_old = np.arange(data.shape[1], dtype=np.float64)
+        x_new = np.linspace(0, data.shape[1] - 1, n_out)
+        data = np.stack([np.interp(x_new, x_old, ch) for ch in data]).astype(np.float32)
+    return np.ascontiguousarray(data, dtype=np.float32)
+
+
+def explain_error(error: BaseException, what: str = "this") -> str:
+    """One readable line plus what to do about it, for errors from stem
+    separation / transcription / mood (shown in the text panel)."""
+    msg = str(error) or error.__class__.__name__
+    if isinstance(error, FileNotFoundError):
+        name = getattr(error, "filename", None)
+        if name and Path(str(name)).suffix.lower() in (".mp3", ".wav", ".flac", ".m4a", ".mp4", ".ogg"):
+            return f"{msg}\n  The audio file {name} can't be found (moved or renamed?)."
+        prog = Path(str(name)).name if name else "a helper program (most likely ffmpeg or ffprobe)"
+        return (f"{msg}\n  {what} needed {prog}, which isn't on this computer's PATH. "
+                "Install ffmpeg with the \u26a0 Install button (or from ffmpeg.org) and restart trackED.")
+    low = msg.lower()
+    if isinstance(error, MemoryError) or "out of memory" in low or "cuda out of memory" in low:
+        return f"{msg}\n  Not enough memory. Close other programs, or pick a smaller Whisper model."
+    if isinstance(error, PermissionError):
+        return f"{msg}\n  trackED couldn't write next to the audio file; check that folder's permissions."
+    if "no module named" in low:
+        return f"{msg}\n  A package is missing: use the \u26a0 Install button in the upper right corner."
+    if "urlopen" in low or "connection" in low or "download" in low:
+        return (f"{msg}\n  The first run downloads a model from the internet; "
+                "check the network connection and try again.")
+    return msg
+
+
 def separate_stems(filepath: str, progress_cb: ProgressCb = None) -> Tuple[Any, Any, int]:
     """Run demucs htdemucs and save <stem>-vocals.wav / <stem>-non_vocals.wav.
     Returns (vocals_mono, non_vocals_mono, sample_rate) as numpy arrays
@@ -128,7 +201,6 @@ def separate_stems(filepath: str, progress_cb: ProgressCb = None) -> Tuple[Any, 
     import torch
     from demucs.pretrained import get_model
     from demucs.apply import apply_model
-    from demucs.audio import AudioFile
 
     report("Loading demucs model... (5%)")
     model = get_model("htdemucs")
@@ -138,7 +210,7 @@ def separate_stems(filepath: str, progress_cb: ProgressCb = None) -> Tuple[Any, 
         model.cuda()
 
     report("Decoding audio for demucs... (15%)")
-    wav = AudioFile(filepath).read(streams=0, samplerate=model.samplerate, channels=model.audio_channels)
+    wav = torch.from_numpy(decode_for_demucs(filepath, int(model.samplerate), int(model.audio_channels)))
     ref = wav.mean(0)
     wav = (wav - ref.mean()) / (ref.std() + 1e-8)
     audio_len = int(wav.shape[-1])
