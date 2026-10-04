@@ -460,18 +460,27 @@ DLG_LOG_BG = "#1e1e1e"
 DLG_LOG_FG = "#d4d4d4"
 
 
+DLG_BUSY_BG = "#fff3b0"      # the row being installed
+DLG_OK_FG = "#2e7d32"
+DLG_BAD_FG = "#b00020"
+
+
 class InstallDialog:
     """The \u26a0 Install button's window: every missing dependency (see
     deps.py) with what it's for and its download size, a check box each,
-    and "All missing". Installs in a worker thread with pip's output in a
-    log box; afterwards offers to restart trackED (new packages are only
-    picked up by a fresh start). Classic Tk widgets with explicit colors
-    (the desktop theme's light default text would be invisible here)."""
+    and "All missing". Installs them one by one in a worker thread, the
+    row being installed highlighted and pip's output in a log box; each
+    row then shows \u2713 or \u2717. The result -- and a Restart button
+    (new packages are only picked up by a fresh start) -- appear in this
+    window rather than in a separate message box that could end up behind
+    it. Classic Tk widgets with explicit colors."""
 
-    def __init__(self, parent, on_done=None):
+    def __init__(self, parent, on_done=None, restart=None):
         self.on_done = on_done
+        self.restart = restart
         self.items = deps.missing(include_broken=False)
         self.vars = {}
+        self.rows = {}
         self.busy = False
         top = self.top = tk.Toplevel(parent)
         top.title("Install optional packages")
@@ -480,9 +489,10 @@ class InstallDialog:
             top.transient(parent.winfo_toplevel())
         except tk.TclError:
             pass
-        tk.Label(top, text="These packages are missing. Pick the ones you want; trackED works without\n"
-                           "them, but the features listed next to each need them.",
-                 bg=DLG_BG, fg=DLG_FG, justify="left").pack(anchor="w", padx=12, pady=(10, 6))
+        self.header = tk.Label(top, text="These packages are missing. Pick the ones you want; trackED works "
+                                         "without them,\nbut the features listed next to each need them.",
+                               bg=DLG_BG, fg=DLG_FG, justify="left", anchor="w")
+        self.header.pack(fill="x", padx=12, pady=(10, 6))
         box = tk.Frame(top, bg=DLG_BG)
         box.pack(fill="x", padx=12)
         self.all_var = tk.BooleanVar(value=True)
@@ -492,15 +502,20 @@ class InstallDialog:
         for row, dep in enumerate(self.items, start=1):
             var = tk.BooleanVar(value=True)
             self.vars[dep["key"]] = var
-            tk.Checkbutton(box, text=dep["key"], variable=var, command=self._sync_all,
-                           bg=DLG_BG, fg=DLG_FG, activebackground=DLG_BG, activeforeground=DLG_FG,
-                           selectcolor="#ffffff").grid(row=row, column=0, sticky="w", padx=(16, 8))
-            tk.Label(box, text=dep["purpose"], bg=DLG_BG, fg=DLG_FG, anchor="w").grid(row=row, column=1, sticky="w")
-            tk.Label(box, text=dep["size"], bg=DLG_BG, fg=DLG_DIM, anchor="w").grid(row=row, column=2,
-                                                                                 sticky="w", padx=(12, 0))
+            check = tk.Checkbutton(box, text=dep["key"], variable=var, command=self._sync_all,
+                                   bg=DLG_BG, fg=DLG_FG, activebackground=DLG_BG, activeforeground=DLG_FG,
+                                   selectcolor="#ffffff")
+            check.grid(row=row, column=0, sticky="w", padx=(16, 8))
+            purpose = tk.Label(box, text=dep["purpose"], bg=DLG_BG, fg=DLG_FG, anchor="w")
+            purpose.grid(row=row, column=1, sticky="w")
+            size = tk.Label(box, text=dep["size"], bg=DLG_BG, fg=DLG_DIM, anchor="w")
+            size.grid(row=row, column=2, sticky="w", padx=(12, 0))
+            state = tk.Label(box, text="", bg=DLG_BG, fg=DLG_FG, anchor="w", width=14)
+            state.grid(row=row, column=3, sticky="w", padx=(8, 0))
+            self.rows[dep["key"]] = (check, purpose, size, state)
         broken = [(d, deps.status(d)[1]) for d in deps.DEPENDENCIES if deps.status(d)[0] == "broken"]
         for dep, note in broken:
-            tk.Label(top, text=f"{dep['key']}: {note}", bg=DLG_BG, fg="#b00020",
+            tk.Label(top, text=f"{dep['key']}: {note}", bg=DLG_BG, fg=DLG_BAD_FG,
                      justify="left").pack(anchor="w", padx=12, pady=(6, 0))
         self.log = tk.Text(top, height=10, width=90, bg=DLG_LOG_BG, fg=DLG_LOG_FG, insertbackground=DLG_LOG_FG,
                            wrap="word", state="disabled")
@@ -513,11 +528,14 @@ class InstallDialog:
         self.install_btn = tk.Button(btns, text="Install selected", command=self.install, bg="#2e7d32", fg="#ffffff",
                                      activebackground="#388e3c", activeforeground="#ffffff")
         self.install_btn.pack(side="right", padx=(0, 8))
+        self.restart_btn = tk.Button(btns, text="\u27f3 Restart trackED now", command=self._restart,
+                                     bg="#1565c0", fg="#ffffff", activebackground="#1976d2", activeforeground="#ffffff")
         top.protocol("WM_DELETE_WINDOW", self.close)
 
     def _toggle_all(self):
-        for var in self.vars.values():
-            var.set(bool(self.all_var.get()))
+        for key, var in self.vars.items():
+            if str(self.rows[key][0].cget("state")) != "disabled":
+                var.set(bool(self.all_var.get()))
 
     def _sync_all(self):
         self.all_var.set(all(v.get() for v in self.vars.values()))
@@ -534,6 +552,26 @@ class InstallDialog:
         except tk.TclError:
             pass
 
+    def _row_state(self, key, state):
+        """Highlight the row being installed; then \u2713 / \u2717."""
+        row = self.rows.get(key)
+        if row is None:
+            return
+        check, purpose, size, label = row
+        bg = DLG_BUSY_BG if state == "start" else DLG_BG
+        text, fg = {"start": ("installing...", DLG_FG), "ok": ("\u2713 installed", DLG_OK_FG),
+                    "failed": ("\u2717 failed", DLG_BAD_FG)}[state]
+        try:
+            for w in row:
+                w.configure(bg=bg)
+            check.configure(activebackground=bg)
+            label.configure(text=text, fg=fg)
+            if state == "ok":
+                self.vars[key].set(False)
+                check.configure(state="disabled")
+        except tk.TclError:
+            pass
+
     def install(self):
         keys = self.selected()
         if self.busy or not keys:
@@ -541,27 +579,33 @@ class InstallDialog:
         self.busy = True
         self.install_btn.configure(state="disabled", text="Installing...")
         self._log("Installing " + ", ".join(keys) + " -- large packages can take several minutes.")
-        lines = []
+        events = []
         lock = threading.Lock()
 
         def log(line):                     # worker thread: queue only, never touch Tk
             with lock:
-                lines.append(line)
+                events.append(("log", line))
+
+        def on_step(key, state):
+            with lock:
+                events.append(("step", key, state))
 
         def worker():
-            result = deps.install(keys, log=log)
+            result = deps.install(keys, log=log, on_step=on_step)
             with lock:
-                lines.append(None)
-                self._result = result
+                events.append(("done", result))
 
         def pump():
             with lock:
-                batch, lines[:] = list(lines), []
-            for line in batch:
-                if line is None:
-                    self._finished(*self._result)
+                batch, events[:] = list(events), []
+            for ev in batch:
+                if ev[0] == "log":
+                    self._log(ev[1])
+                elif ev[0] == "step":
+                    self._row_state(ev[1], ev[2])
+                else:
+                    self._finished(*ev[1])
                     return
-                self._log(line)
             try:
                 self.top.after(150, pump)
             except tk.TclError:
@@ -576,9 +620,22 @@ class InstallDialog:
             self._log(f"NOT installed: {key} -- {why}")
         if ok:
             self._log("Installed: " + ", ".join(ok))
-        self.install_btn.configure(state="normal", text="Install selected")
+        still = [k for k in self.vars if k not in ok]
+        self.install_btn.configure(state="normal" if still else "disabled", text="Install selected")
+        if ok:
+            msg = ("\u2713 Installed: " + ", ".join(ok) + ".\nRestart trackED to use "
+                   + ("it." if len(ok) == 1 else "them.") + (f"  Not installed: {', '.join(k for k, _ in failed)}."
+                                                            if failed else ""))
+            self.header.configure(text=msg, fg=DLG_OK_FG, font=("TkDefaultFont", 10, "bold"))
+            self.restart_btn.pack(side="left")
+        elif failed:
+            self.header.configure(text="Nothing was installed -- see the log below.", fg=DLG_BAD_FG)
         if self.on_done:
             self.on_done(ok, failed)
+
+    def _restart(self):
+        if self.restart:
+            self.restart()
 
     def close(self):
         if self.busy and not messagebox.askyesno(
@@ -642,9 +699,8 @@ class VoiceExportDialog:
                                 parent=self.top)
             return False
         if path is None:
-            path = filedialog.asksaveasfilename(parent=self.top, title="Export per Voice",
-                                                initialfile=f"{self.track['name']}-voices.xtiming",
-                                                defaultextension=".xtiming", filetypes=WaveformController._EXPORT_FILETYPES)
+            path = self.ctl.ask_export_path("Export per Voice", f"{self.track['name']}-voices.xtiming",
+                                            parent=self.top)
         if not path:
             return False
         overlaps = [(name, th.overlap_count(ms)) for name, ms in tracks]
@@ -655,6 +711,8 @@ class VoiceExportDialog:
             messagebox.showerror("Export per Voice", f"Could not export:\n{exc}", parent=self.top)
             return False
         debug(1, f"{{green}}Exported {len(tracks)} voice track(s) of '{self.track['name']}' to {path}")
+        if hasattr(self.ctl, "_exported"):
+            self.ctl._exported(len(tracks), path)
         if overlaps:
             messagebox.showwarning("Export per Voice",
                                    "Exported, but these tracks have overlapping cards, which xLights shows "
@@ -923,6 +981,12 @@ class WaveformController:
                                 "loudness and spectrum; lyrics from Transcribe help). Needs librosa.\n"
                                 "The result is cached with the file until the audio file changes;\n"
                                 "Shift+click to re-run anyway (e.g. after adding lyrics).")
+        # Beats \u25be: bars / beats / metronome timing tracks.
+        self.beats_btn, self.beats_menu = _tb_menubutton(right, "Beats \u25be")
+        self.beats_btn.pack(side="left", padx=(0, 6))
+        self.beats_menu.configure(postcommand=self._fill_beats_menu)
+        _Tooltip(self.beats_btn, "Bars / beats as a new timing track (beat detection needs librosa).\n"
+                                 "Uses the selected range, or from the @cursor to the end.")
         self.transcribe_btn = _tb_button(right, "Transcribe", self.transcribe_selected)
         self.transcribe_btn.pack(side="left", padx=(0, 1))
         _Tooltip(self.transcribe_btn, "Transcribe with Whisper:\n"
@@ -1049,13 +1113,17 @@ class WaveformController:
             return
         if getattr(self, "_install_dialog", None) is not None:
             try:
-                self._install_dialog.top.lift()
-                return
+                if self._install_dialog.top.winfo_exists():
+                    self._install_dialog.top.lift()
+                    return
             except tk.TclError:
                 pass
-        self._install_dialog = InstallDialog(self.canvas, on_done=self._install_finished)
+        self._install_dialog = InstallDialog(self.canvas, on_done=self._install_finished,
+                                             restart=lambda: _restart_app(self.canvas))
 
     def _install_finished(self, ok, failed):
+        """The dialog shows the result and its own Restart button; here the
+        toolbar button turns into \u27f3 Restart."""
         aa.clear_probe_cache()
         if not ok:
             self.play_status_var.set("Install failed")
@@ -1063,12 +1131,6 @@ class WaveformController:
         self._restart_pending = True
         self._refresh_playback_availability()
         self.play_status_var.set("Installed -- restart to use the new packages")
-        parent = getattr(getattr(self, "_install_dialog", None), "top", None)
-        if messagebox.askyesno("Restart trackED",
-                               "Installed: " + ", ".join(ok) + "\n\nRestart trackED now to use them?\n"
-                               "(Your changes are saved first and your open files reopened.)",
-                               parent=parent):
-            _restart_app(self.canvas)
 
     def _configure_canvas(self):
         c = self.canvas
@@ -1097,6 +1159,8 @@ class WaveformController:
         c.bind("<Left>", self._on_key_left)
         c.bind("<Right>", self._on_key_right)
         c.bind("<Delete>", self._on_key_delete)
+        c.bind("<Home>", lambda e: (self.select_end_mark(last=False), "break")[1])
+        c.bind("<End>", lambda e: (self.select_end_mark(last=True), "break")[1])
         for key in ("<Key-m>", "<Key-M>"):
             c.bind(key, lambda e: (self.add_point_at(self.cursor_position() or 0.0), "break")[1])
         c.bind("<BackSpace>", self._on_key_delete)
@@ -1369,6 +1433,18 @@ class WaveformController:
     def _mark_snapshot(self):
         return (copy.deepcopy(self.marks), copy.deepcopy(self.tracks), list(self.voices))
 
+    def _one_step(self, fn):
+        """Run fn (several mark edits) as one undo step."""
+        self._batch_depth = getattr(self, "_batch_depth", 0) + 1
+        try:
+            result = fn()
+        finally:
+            self._batch_depth -= 1
+        if self._batch_depth == 0:
+            self._mark_changed()
+            self.render_waveform()
+        return result
+
     def _mark_changed(self, record_history=True):
         """Marks/tracks changed: flag the tab as having unsaved changes
         (tab label "*"). They're written to the media file's combined
@@ -1376,6 +1452,8 @@ class WaveformController:
         prompt -- all through tab.save_hook = save_marks_now. The audio
         file itself is never written. Without a tab (standalone use) they
         are saved immediately, as before."""
+        if getattr(self, "_batch_depth", 0):
+            record_history = False           # _one_step records the whole batch once
         # The unsaved flag comes first, so a failure in the bookkeeping
         # below (logged) can't leave a change looking saved.
         mark_dirty = getattr(self.tab, "mark_dirty", None) if self.tab is not None else None
@@ -1534,12 +1612,41 @@ class WaveformController:
         self._mark_changed(record_history=record_history)
         return mark
 
+    def _ensure_tracks_fit(self):
+        """A new track band must be visible: if the waveform panel is too
+        short for the waveform (60 px) + every track band, make it taller
+        (the tab's sash), up to 75% of the window."""
+        paned = getattr(self.tab, "paned", None) if self.tab is not None else None
+        if paned is None:
+            return False
+        try:
+            canvas_h = int(self.canvas.winfo_height())
+            sash = int(paned.sashpos(0))
+            window_h = int(self.canvas.winfo_toplevel().winfo_height())
+        except (tk.TclError, TypeError, ValueError, AttributeError):
+            return False
+        need = 60 + self.STATUS_ROW_HEIGHT + len(self.tracks) * self.TRACK_HEIGHT + 4
+        if canvas_h >= need:
+            return False
+        new = min(sash + (need - canvas_h), int(window_h * 0.75))
+        if new <= sash:
+            return False
+        try:
+            paned.sashpos(0, new)
+            return True
+        except tk.TclError:
+            return False
+
     def _new_track(self, name, color=None, source="user", record_history=True):
         if color is None:
             color = self.TRACK_PALETTE[len(self.tracks) % len(self.TRACK_PALETTE)]
         track = {"id": uuid.uuid4().hex[:8], "name": name, "color": color, "source": source}
         self.tracks.append(track)
         self._mark_changed(record_history=record_history)
+        try:
+            self.canvas.after_idle(self._ensure_tracks_fit)   # after the new band is laid out
+        except (tk.TclError, AttributeError):
+            pass
         return track
 
     def delete_track(self, track, record_history=True):
@@ -2043,6 +2150,7 @@ class WaveformController:
         if plan is None:
             return False
         (ls, le, ltext), (rs, re_, rtext) = plan["left"], plan["right"]
+        pieces, before_ids = mark.pop("pieces", None), {m["id"] for m in self.marks}
         label = mark.get("label") or ""
         lv = self._voices_for_piece(mark, label, th.find_span(label, ltext, 0))
         rv = self._voices_for_piece(mark, label, th.find_span(label, rtext, len(ltext)))
@@ -2059,6 +2167,7 @@ class WaveformController:
             else:
                 m_.pop("voices", None)
         self.marks.append(new)
+        self._carry_pieces(mark, before_ids, pieces)
         self._mark_changed()
         self.render_waveform()
         return True
@@ -2079,6 +2188,7 @@ class WaveformController:
         voices = [self._voices_for_piece(mark, label, sp) for sp in piece_spans]
         if len(voices) != len(plan):
             voices = [list(mark.get("voices") or [])] * len(plan)
+        pieces, before_ids = mark.pop("pieces", None), {m["id"] for m in self.marks}
         (s0, e0, t0), rest = plan[0], plan[1:]
         mark["start"], mark["end"], mark["label"] = s0, e0, t0
         mark["type"] = "range" if e0 is not None else "point"
@@ -2095,10 +2205,59 @@ class WaveformController:
             if v1:
                 piece["voices"] = v1
             self.marks.append(piece)
+        self._carry_pieces(mark, before_ids, pieces)
         self.selected = ("mark", mark_id)
         self._mark_changed()
         self.render_waveform()
         return True
+
+    def unmerge_mark_by_id(self, mark_id):
+        """Split a merged card back into the cards it was merged from
+        (th.unmerge_plan): their own times and texts when nothing changed
+        since; otherwise fitted to the card as it is now. One undo step.
+        Returns (number of cards, how) or (0, "")."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None:
+            return 0, ""
+        plan, how = th.unmerge_plan(mark)
+        if not plan:
+            return 0, ""
+        first, rest = plan[0], plan[1:]
+        mark.pop("pieces", None)
+        mark["start"], mark["end"], mark["label"] = first["start"], first.get("end"), first.get("label", "")
+        mark["type"] = "range" if first.get("end") is not None else "point"
+        if first.get("voices"):
+            mark["voices"] = list(first["voices"])
+        else:
+            mark.pop("voices", None)
+        for p in rest:
+            piece = {"id": uuid.uuid4().hex[:8], "type": "range" if p.get("end") is not None else "point",
+                     "start": p["start"], "end": p.get("end"), "label": p.get("label", ""),
+                     "track_id": mark.get("track_id"), "source": mark.get("source", "user")}
+            if p.get("voices"):
+                piece["voices"] = list(p["voices"])
+            self.marks.append(piece)
+        self.selected = ("mark", mark_id)
+        self._mark_changed()
+        self.render_waveform()
+        notes = {"exact": "", "moved": " (moved with the card)",
+                 "text": " (edited text shared out)", "moved+text": " (fitted to new times; edited text shared out)"}
+        self.play_status_var.set(f"Unmerged into {len(plan)} cards{notes.get(how, '')}")
+        return len(plan), how
+
+    def _carry_pieces(self, mark, before_ids, pieces):
+        """After a merged card was split by hand, each part keeps the
+        remembered pieces within its own span (so it can still be unmerged)."""
+        if not pieces:
+            return
+        parts = [mark] + [m for m in self.marks if m["id"] not in before_ids]
+        for part in parts:
+            end = part["end"] if part.get("end") is not None else part["start"]
+            kept = th.pieces_for_span(pieces, part["start"], end)
+            if kept:
+                part["pieces"] = kept
+            else:
+                part.pop("pieces", None)
 
     def merge_mark_by_id(self, mark_id, direction=1, pool=None):
         """Merge a mark with its next (+1) / previous (-1) neighbor in the
@@ -2114,6 +2273,7 @@ class WaveformController:
         start, end, label = th.merged_fields(mark, other)
         if end - start < th.MIN_RANGE:
             return False
+        mark["pieces"] = th.merged_pieces(mark, other)      # for Unmerge later
         mark["start"], mark["end"], mark["label"], mark["type"] = start, end, label, "range"
         voices = th.merge_voice_lists(mark.get("voices"), other.get("voices"))
         if voices:
@@ -2371,7 +2531,10 @@ class WaveformController:
     def _set_analysis_busy(self, what):
         self._analysis_busy = what
         state = "disabled" if what else "normal"
-        for btn in (self.stems_btn, self.transcribe_btn, self.model_btn, self.mood_btn):
+        for btn in (self.stems_btn, self.transcribe_btn, self.model_btn, self.mood_btn,
+                    getattr(self, "beats_btn", None)):
+            if btn is None:
+                continue
             try:
                 btn.configure(state=state)
             except tk.TclError:
@@ -2849,8 +3012,7 @@ class WaveformController:
             messagebox.showinfo("Export Timing", "There are no timing marks to export.")
             return
         initial = Path(self.filepath).stem + ".xtiming"
-        path = filedialog.asksaveasfilename(title="Export Timing", initialfile=initial,
-                                             defaultextension=".xtiming", filetypes=self._EXPORT_FILETYPES)
+        path = self.ask_export_path("Export Timing", initial)
         if not path:
             return
         try:
@@ -2858,21 +3020,53 @@ class WaveformController:
             debug(1, f"{{green}}Exported {len(tracks_with_marks)} timing track(s) to {path}")
         except Exception as e:
             messagebox.showerror("Export Timing", f"Could not export timing:\n{e}")
+            self.announce(f"Export failed: {e}")
+            return
+        self._exported(len(tracks_with_marks), path)
+
+    def ask_export_path(self, title, initialfile, parent=None):
+        """The Save dialog for exports: it opens in the audio file's folder
+        and asks before replacing an existing file."""
+        folder = str(Path(self.filepath).resolve().parent) if self.filepath else None
+        kwargs = dict(title=title, initialfile=initialfile, defaultextension=".xtiming",
+                      filetypes=self._EXPORT_FILETYPES, confirmoverwrite=True)
+        if folder:
+            kwargs["initialdir"] = folder
+        if parent is not None:
+            kwargs["parent"] = parent
+        return filedialog.asksaveasfilename(**kwargs)
+
+    def announce(self, message):
+        """A message on the app's status bar (and the audio toolbar)."""
+        self.play_status_var.set(message)
+        try:
+            app = self.canvas.winfo_toplevel()
+            if callable(getattr(app, "set_status", None)):
+                app.set_status(message)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _exported(self, n_tracks, path):
+        self.announce(f"Exported {n_tracks} timing track{'s' if n_tracks != 1 else ''} to {Path(path).name} "
+                      f"(in {Path(path).parent})")
 
     def export_timing_track(self, track):
         marks = [m for m in self.marks if m.get("track_id") == track["id"]]
         if not marks:
             messagebox.showinfo("Export Timing", f"Track \"{track['name']}\" has no timing marks to export.")
-            return
-        path = filedialog.asksaveasfilename(title="Export Timing", initialfile=f"{track['name']}.xtiming",
-                                             defaultextension=".xtiming", filetypes=self._EXPORT_FILETYPES)
+            return False
+        path = self.ask_export_path("Export Timing", f"{track['name']}.xtiming")
         if not path:
-            return
+            return False
         try:
             th.export_timing_tracks(path, [(track["name"], marks)])
             debug(1, f"{{green}}Exported timing track '{track['name']}' to {path}")
         except Exception as e:
             messagebox.showerror("Export Timing", f"Could not export timing:\n{e}")
+            self.announce(f"Export failed: {e}")
+            return False
+        self._exported(1, path)
+        return True
 
     # ------------------------------------------------------------------ playback
     def _run_engine_from(self, t):
@@ -4107,7 +4301,15 @@ class WaveformController:
             menu.add_command(label="Add Label...", command=lambda: self._edit_mark_label(mark))
         if mark.get("track_id") is None:
             menu.add_command(label="Set Duration...", command=lambda: self._set_mark_duration(mark))
+        track_labels = [m.get("label", "") for m in self.track_marks(mark.get("track_id"))] \
+            if mark.get("track_id") else []
+        n_pieces = len(mark.get("pieces") or [])
+        if n_pieces >= 2:
+            menu.add_command(label=f"Unmerge into {n_pieces} Cards", command=lambda: self.unmerge_mark_by_id(mark["id"]))
+        if th.numbering_cycle(track_labels) is not None:
+            menu.add_command(label="Renumber from Here...", command=lambda: self.renumber_from_mark(mark["id"]))
         menu.add_separator()
+        self._add_shift_items(menu, [mark["id"]])
         self._add_clipboard_items(menu, [mark["id"]])
         menu.add_separator()
         menu.add_command(label="Delete Mark", command=lambda: self._delete_mark(mark))
@@ -4285,9 +4487,101 @@ class WaveformController:
         menu.add_command(label=f"Paste {what} at @cursor", state=state,
                          command=lambda: self.paste_marks(track_id, at_cursor=True))
 
+    # ------------------------------------------------------------------ card actions on selections
+    def merge_selection(self, ids=None):
+        """Merge the selected marks (one track) into one card, in time
+        order -- remembering the originals for Unmerge. One undo step."""
+        marks = sorted(self._selected_marks(ids), key=lambda m: (m["start"], m["id"]))
+        if len(marks) < 2:
+            return False
+        first = marks[0]
+
+        def run():
+            for other in marks[1:]:
+                start, end, label = th.merged_fields(first, other)
+                first["pieces"] = th.merged_pieces(first, other)
+                first["start"], first["end"], first["label"], first["type"] = start, end, label, "range"
+                voices = th.merge_voice_lists(first.get("voices"), other.get("voices"))
+                if voices:
+                    first["voices"] = voices
+                self.marks = [m for m in self.marks if m["id"] != other["id"]]
+            self._multi = []
+            self.selected = ("mark", first["id"])
+            return True
+        return self._one_step(run)
+
+    def split_selection(self, how, ids=None):
+        """Split each selected card: how = "half" | "words" | "cursor".
+        One undo step for all of them."""
+        marks = self._selected_marks(ids)
+        if not marks:
+            return 0
+        pos = self.cursor_position()
+
+        def run():
+            done = 0
+            for m in marks:
+                label = m.get("label") or ""
+                if how == "words":
+                    spans = th.word_spans(label)
+                    ok = len(spans) >= 2 and self.split_mark_into(m["id"], spans)
+                elif how == "cursor":
+                    ok = pos is not None and self.split_mark_by_id(m["id"], at_time=pos)
+                else:
+                    ok = self.split_mark_by_id(m["id"], at_time=-1.0)
+                done += bool(ok)
+            self._multi = []
+            return done
+        return self._one_step(run)
+
+    def unmerge_selection(self, ids=None):
+        marks = [m for m in self._selected_marks(ids) if len(m.get("pieces") or []) >= 2]
+        return self._one_step(lambda: sum(bool(self.unmerge_mark_by_id(m["id"])[0]) for m in marks)) if marks else 0
+
+    def _add_card_items(self, menu, ids):
+        """Split / merge / unmerge for the selected card(s)."""
+        marks = self._selected_marks(ids)
+        if not marks:
+            return
+        pos = self.cursor_position()
+        n = len(marks)
+        if n == 1:
+            m = marks[0]
+            is_range = m["type"] == "range" and m.get("end") is not None
+            inside = is_range and pos is not None and m["start"] + th.MIN_RANGE <= pos <= m["end"] - th.MIN_RANGE
+            n_words = len(th.word_spans(m.get("label") or ""))
+            menu.add_command(label="Split at @cursor", state="normal" if inside else "disabled",
+                             command=lambda: self.split_selection("cursor", [m["id"]]))
+            menu.add_command(label="Split in half", state="normal" if is_range else "disabled",
+                             command=lambda: self.split_selection("half", [m["id"]]))
+            menu.add_command(label=f"Split into words ({n_words})", state="normal" if n_words >= 2 else "disabled",
+                             command=lambda: self.split_selection("words", [m["id"]]))
+            pool = self.track_marks(m.get("track_id")) if m.get("track_id") else \
+                [x for x in self.marks if x.get("track_id") is None]
+            prev_m, next_m = th.neighbor_mark(pool, m, -1), th.neighbor_mark(pool, m, 1)
+            menu.add_command(label="Merge with Previous", state="normal" if prev_m else "disabled",
+                             command=lambda: self.merge_mark_by_id(m["id"], -1))
+            menu.add_command(label="Merge with Next", state="normal" if next_m else "disabled",
+                             command=lambda: self.merge_mark_by_id(m["id"], 1))
+        else:
+            menu.add_command(label=f"Merge {n} into One Card", command=lambda: self.merge_selection(ids))
+            menu.add_command(label=f"Split Each at @cursor  (where it's inside)", state="normal" if pos is not None
+                             else "disabled", command=lambda: self.split_selection("cursor", ids))
+            menu.add_command(label="Split Each in Half", command=lambda: self.split_selection("half", ids))
+            menu.add_command(label="Split Each into Words", command=lambda: self.split_selection("words", ids))
+        merged = sum(1 for m in marks if len(m.get("pieces") or []) >= 2)
+        if merged:
+            label = (f"Unmerge into {len(marks[0]['pieces'])} Cards" if n == 1
+                     else f"Unmerge {merged} Merged Card{'s' if merged != 1 else ''}")
+            menu.add_command(label=label, command=lambda: self.unmerge_selection(ids))
+
     def _show_group_menu(self, ids, event):
         menu = tk.Menu(self.canvas, tearoff=False)
         menu.add_command(label=f"{len(ids)} marks selected", state="disabled")
+        menu.add_separator()
+        self._add_card_items(menu, ids)
+        menu.add_separator()
+        self._add_shift_items(menu, ids)
         menu.add_separator()
         self._add_clipboard_items(menu, ids)
         menu.add_separator()
@@ -4301,10 +4595,360 @@ class WaveformController:
             return
         VoiceExportDialog(self.canvas, self, track, marks)
 
+    # ------------------------------------------------------------------ copy track / renumber
+    def copy_track(self, track):
+        """A new track with copies of all of this track's marks (one undo step)."""
+        names = [t["name"] for t in self.tracks]
+        new = self._new_track(th.unique_track_name(f"{track['name']} copy", names), record_history=False)
+        self.marks.extend(th.copy_marks(self.track_marks(track["id"]), new["id"], lambda: uuid.uuid4().hex[:8]))
+        self.selected = ("track", new["id"])
+        self._mark_changed()
+        self.render_waveform()
+        return new
+
+    def _current_track_id(self):
+        """The track being worked on: the selected track, the selected
+        mark's track, or the one the card editor shows."""
+        if self.selected:
+            kind, sel_id = self.selected
+            if kind == "track":
+                return sel_id
+            mark = self.mark_by_id(sel_id)
+            if mark is not None:
+                return mark.get("track_id")
+        return self.panel_track_id() if hasattr(self, "panel_track_id") else None
+
+    def select_end_mark(self, last=False):
+        """Home / End on the waveform: the first / last mark of the current
+        track (or of the unassigned marks when no track is current)."""
+        track_id = self._current_track_id()
+        pool = [m for m in self.marks if m.get("track_id") == track_id]
+        if not pool:
+            return None
+        mark = (max if last else min)(pool, key=lambda m: (m["start"], m["id"]))
+        self._multi = []
+        self.select_mark(mark["id"])
+        return mark
+
+    def shift_marks(self, ids, seconds):
+        """Move these marks by seconds (+ later, - earlier) as one block,
+        one undo step. The amount is limited so none starts before 0:00 or
+        ends past the allowed end (lengths kept). Returns the amount used."""
+        marks = [m for m in (self.mark_by_id(i) for i in ids) if m is not None]
+        if not marks or not seconds:
+            return 0.0
+        first = min(m["start"] for m in marks)
+        last = max((m.get("end") if m.get("end") is not None else m["start"]) for m in marks)
+        seconds = max(seconds, -first)
+        seconds = min(seconds, self.max_mark_time() - last)
+        if abs(seconds) < 1e-9:
+            return 0.0
+        for m in marks:
+            m["start"] = round(m["start"] + seconds, 6)
+            if m.get("end") is not None:
+                m["end"] = round(m["end"] + seconds, 6)
+            for p in m.get("pieces") or []:
+                p["start"] = round(p["start"] + seconds, 6)
+                if p.get("end") is not None:
+                    p["end"] = round(p["end"] + seconds, 6)
+        self._mark_changed()
+        self.render_waveform()
+        return seconds
+
+    def _delta_to_cursor(self, ids):
+        """Seconds that put the earliest of these marks' Start on the @cursor."""
+        marks = [m for m in (self.mark_by_id(i) for i in ids) if m is not None]
+        pos = self.cursor_position()
+        if not marks or pos is None:
+            return None
+        return pos - min(m["start"] for m in marks)
+
+    def shift_selection_to_cursor(self, ids=None):
+        """The (first) selected mark starts at the @cursor; the other
+        selected marks move by the same amount."""
+        ids = self.selected_mark_ids() if ids is None else ids
+        delta = self._delta_to_cursor(ids)
+        if delta is None:
+            return 0.0
+        return self._report_shift(self.shift_marks(ids, delta), delta)
+
+    def shift_track_to_cursor(self, track):
+        """The whole track moves so its first selected mark (or its first
+        mark) starts at the @cursor."""
+        mine = [i for i in self.selected_mark_ids() if (self.mark_by_id(i) or {}).get("track_id") == track["id"]]
+        ref = mine or [m["id"] for m in self.track_marks(track["id"])]
+        delta = self._delta_to_cursor(ref)
+        if delta is None:
+            return 0.0
+        return self._report_shift(self.shift_marks([m["id"] for m in self.track_marks(track["id"])], delta), delta)
+
+    def _report_shift(self, done, wanted):
+        if abs(done - wanted) > 1e-6:
+            self.play_status_var.set(f"Shifted by {done:+.3f} s (limited by the start/end of the audio)")
+        elif done:
+            self.play_status_var.set(f"Shifted by {done:+.3f} s")
+        return done
+
+    def _ask_seconds(self, title, what):
+        text = simpledialog.askstring(
+            title, f"Move {what} by how many seconds?\n(positive = later, negative = earlier; e.g. 0.25 or -1.5)",
+            initialvalue=str(get_preference("shift_track_seconds", "0.1")))
+        if text is None:
+            return None
+        try:
+            seconds = float(text.strip().replace(",", ".").rstrip("s").strip())
+        except ValueError:
+            messagebox.showinfo(title, f"Couldn\u2019t read \u201c{text}\u201d as seconds.")
+            return None
+        set_preference("shift_track_seconds", text.strip())
+        return seconds
+
+    def ask_shift_selection(self, ids=None):
+        ids = self.selected_mark_ids() if ids is None else ids
+        n = len(ids)
+        seconds = self._ask_seconds("Shift Marks", f"the {n} selected mark{'s' if n != 1 else ''}")
+        if seconds is None:
+            return None
+        return self._report_shift(self.shift_marks(ids, seconds), seconds)
+
+    def _add_shift_items(self, menu, ids):
+        n = len(ids)
+        what = f"{n} Marks" if n > 1 else "Mark"
+        at_ok = self.cursor_position() is not None
+        menu.add_command(label=f"Shift {what} to @cursor" + ("  (first one starts there)" if n > 1 else ""),
+                         state="normal" if at_ok else "disabled",
+                         command=lambda: self.shift_selection_to_cursor(ids))
+        menu.add_command(label=f"Shift {what}...", command=lambda: self.ask_shift_selection(ids))
+
+    def show_selection_menu(self, event, ids=None):
+        """Right-click on selected cards (card editor) or marks: what can be
+        done with them -- shift, cut/copy/move/copy to a track, unmerge,
+        delete."""
+        ids = self.selected_mark_ids() if ids is None else ids
+        if not ids:
+            return None
+        menu = tk.Menu(self.canvas, tearoff=False)
+        n = len(ids)
+        menu.add_command(label=f"{n} mark{'s' if n != 1 else ''} selected", state="disabled")
+        menu.add_separator()
+        self._add_card_items(menu, ids)
+        menu.add_separator()
+        self._add_shift_items(menu, ids)
+        menu.add_separator()
+        self._add_clipboard_items(menu, ids)
+        menu.add_separator()
+        menu.add_command(label=f"Delete {n} Mark{'s' if n != 1 else ''}", command=lambda: self.delete_selection(ids))
+        try:
+            menu.tk_popup(getattr(event, "x_root", 0), getattr(event, "y_root", 0))
+        except tk.TclError:
+            pass
+        return menu
+
+    def shift_track(self, track, seconds):
+        """Move every mark of the track by seconds (+ later, - earlier), one
+        undo step. Marks that would start before 0:00 are kept at 0:00
+        (their length kept); the amount is limited so none ends past the
+        allowed end."""
+        return self.shift_marks([m["id"] for m in self.track_marks(track["id"])], seconds)
+
+    def ask_shift_track(self, track):
+        seconds = self._ask_seconds("Shift Track", f"every mark of \u201c{track['name']}\u201d")
+        if seconds is None:
+            return None
+        return self._report_shift(self.shift_track(track, seconds), seconds)
+
+    def renumber_from_mark(self, mark_id, first=None):
+        """Bars/Beats-style tracks: relabel from this mark on, counting up
+        from `first` (asked for); a Beats track's numbers wrap as before."""
+        mark = self.mark_by_id(mark_id)
+        if mark is None or not mark.get("track_id"):
+            return False
+        marks = sorted(self.track_marks(mark["track_id"]), key=lambda m: m["start"])
+        labels = [m.get("label", "") for m in marks]
+        cycle = th.numbering_cycle(labels)
+        if cycle is None:
+            return False
+        if first is None:
+            first = simpledialog.askinteger("Renumber", "Number for this mark (the ones after it count up"
+                                            + (f", wrapping after {cycle}" if cycle else "") + "):",
+                                            initialvalue=1, minvalue=0 if not cycle else 1,
+                                            maxvalue=cycle or 1000000)
+            if first is None:
+                return False
+        new = th.renumber_from(labels, marks.index(mark), int(first), cycle or 0)
+        for m, label in zip(marks, new):
+            m["label"] = label
+        self._mark_changed()
+        self.render_waveform()
+        return True
+
+    # ------------------------------------------------------------------ bars / beats
+    BEAT_TRACK_NAMES = {"beats": "Beats", "bars": "Bars"}
+
+    def beats_per_bar(self):
+        try:
+            return max(1, min(16, int(get_preference("beats_per_bar", 4))))
+        except (TypeError, ValueError):
+            return 4
+
+    def _fill_beats_menu(self):
+        menu = self.beats_menu
+        try:
+            menu.delete(0, "end")
+        except tk.TclError:
+            pass
+        bpb = self.beats_per_bar()
+        need = "" if aa.beats_available() else "  (needs librosa)"
+        state = "normal" if aa.beats_available() else "disabled"
+        menu.add_command(label="All beats" + need, state=state, command=lambda: self.run_beats("beats"))
+        menu.add_command(label="Downbeats (beat 1)" + need, state=state, command=lambda: self.run_beats("beat", 1))
+        sub = tk.Menu(menu, tearoff=False, bg="#ffffff", fg="#1e1e1e")
+        for n in range(2, bpb + 1):
+            sub.add_command(label=f"Beat {n}", command=lambda k=n: self.run_beats("beat", k))
+        menu.add_cascade(label="Beat N of each bar" + need, menu=sub, state=state if bpb > 1 else "disabled")
+        menu.add_command(label="Bars (numbered)" + need, state=state, command=lambda: self.run_beats("bars"))
+        menu.add_separator()
+        menu.add_command(label="Metronome...", command=self.run_metronome)
+        menu.add_separator()
+        per_bar = tk.Menu(menu, tearoff=False, bg="#ffffff", fg="#1e1e1e")
+        self._bpb_var = tk.IntVar(value=bpb)
+        for n in (2, 3, 4, 5, 6, 7, 8, 12):
+            per_bar.add_radiobutton(label=str(n), variable=self._bpb_var, value=n,
+                                    command=lambda k=n: set_preference("beats_per_bar", k))
+        menu.add_cascade(label=f"Beats per bar: {bpb}", menu=per_bar)
+        if not aa.beats_available():
+            menu.add_command(label="Install librosa: \u26a0 Install button (upper right)", state="disabled")
+
+    def analysis_range(self):
+        """The selected range mark's span, else @cursor .. the end."""
+        return self.analysis_range_why()[:2]
+
+    def analysis_range_why(self):
+        """(start, end, where it came from) -- for messages."""
+        mark = self.mark_by_id(self.selected_mark_id())
+        if mark and mark["type"] == "range" and mark.get("end") is not None:
+            label = (mark.get("label") or "").strip()
+            what = f"the selected {'card' if mark.get('track_id') else 'range'}" + (
+                f" \u201c{label[:30]}\u201d" if label else "")
+            return mark["start"], mark["end"], what
+        start = self.cursor_position() or 0.0
+        return start, self.audio_duration or start, "from the @cursor to the end"
+
+    def _beat_track_name(self, mode, which=1, interval=None):
+        if mode == "beat":
+            base = "Downbeats" if which == 1 else f"Beat {which}"
+        elif mode == "metronome":
+            bpm = 60.0 / interval
+            base = f"Metronome {bpm:.0f} BPM" if abs(bpm - round(bpm)) < 0.05 else f"Metronome {interval:g} s"
+        else:
+            base = self.BEAT_TRACK_NAMES[mode]
+        return th.unique_track_name(base, [t["name"] for t in self.tracks])
+
+    def _add_marks_track(self, name, specs):
+        """One new track holding these {start, end, label} marks (one undo step)."""
+        track = self._new_track(name, record_history=False)
+        for sp in specs:
+            self.marks.append({"id": uuid.uuid4().hex[:8], "type": "range", "start": sp["start"],
+                               "end": sp["end"], "label": sp["label"], "track_id": track["id"],
+                               "source": "beats"})
+        self.selected = ("track", track["id"])
+        self._mark_changed()
+        self.render_waveform()
+        return track
+
+    def run_beats(self, mode, which=1):
+        """Detect beats (once per file; cached while it's open), then make
+        a track for the range (selected range, or @cursor to the end)."""
+        if self._analysis_busy or self.audio_duration is None:
+            return
+        if not aa.beats_available():
+            messagebox.showinfo("Beats", "Beat detection needs librosa, which isn't installed.\n\n"
+                                         "Use the \u26a0 Install button in the upper right corner.")
+            return
+        start, end, self._beat_range_why = self.analysis_range_why()
+        cached = getattr(self, "_beat_cache", None)
+        try:
+            st = Path(self.filepath).stat()
+            stamp = (st.st_mtime, st.st_size)
+        except OSError:
+            stamp = None
+        if cached and cached.get("stamp") == stamp:
+            return self._make_beat_track(cached["result"], mode, which, start, end)
+        self._set_analysis_busy("beats")
+        self.append_info("\n{yellow}Finding beats in the background...\n")
+
+        def work(progress):
+            return aa.detect_beats(self.filepath, progress)
+
+        def done(result, error, elapsed):
+            self._set_analysis_busy(None)
+            self.analysis_status_var.set("")
+            if error is not None:
+                self.append_info("{red}Beat detection error: " + _explained(error, "Beat detection") + "\n")
+                debug(1, f"{{red}}waveform_tab beats failed: {error}")
+                return
+            self._beat_cache = {"stamp": stamp, "result": result}
+            self.append_info(f"{{green}}Found {len(result['beats'])} beats, about {result['tempo']:.0f} BPM "
+                             f"({elapsed:.1f}s).\n")
+            self._make_beat_track(result, mode, which, start, end)
+        self._run_in_thread(work, done, progress_prefix="Beats: ")
+
+    def _make_beat_track(self, result, mode, which, start, end):
+        bpb = self.beats_per_bar()
+        phase = th.downbeat_phase(result["strength"], result["bass"], bpb)
+        specs = th.beat_marks(result["beats"], start, end, bpb, phase, mode, which)
+        in_range = sum(1 for t in result["beats"] if start - 1e-9 <= t < end)
+        why = getattr(self, "_beat_range_why", "")
+        debug(2, f"beats: mode={mode} which={which} range {start:.3f}-{end:.3f} ({why}); "
+                 f"{len(result['beats'])} beats, {in_range} in range, phase {phase}, {len(specs)} marks")
+        if not specs:
+            span = f"{th.format_time_ms(start)}\u2013{th.format_time_ms(end)}"
+            if in_range == 0:
+                reason = f"none of the {len(result['beats'])} beats is in {span} ({why})"
+            else:
+                reason = (f"{in_range} beat{'s' if in_range != 1 else ''} in {span} ({why}), but no "
+                          f"{'bar start' if mode == 'bars' else f'beat {which}'} among them")
+            self.append_info(f"{{yellow}}No track made: {reason}. Press Esc to clear the selection and use "
+                             "the @cursor (or select a longer range).\n")
+            return None
+        track = self._add_marks_track(self._beat_track_name(mode, which), specs)
+        self.append_info(f"{{blue}}Track \u201c{track['name']}\u201d: {len(specs)} marks "
+                         f"({th.format_time_ms(start)}\u2013{th.format_time_ms(end)}, {bpb} beats per bar). "
+                         "Which beat starts a bar is a guess: right-click a mark > Renumber from Here.\n")
+        return track
+
+    def run_metronome(self, text=None):
+        """Evenly spaced ticks at an interval the user types (seconds or BPM)."""
+        if self.audio_duration is None:
+            return None
+        if text is None:
+            text = simpledialog.askstring("Metronome", "Interval: seconds (e.g. 0.5) or BPM (e.g. 120 bpm):",
+                                          initialvalue=str(get_preference("metronome_interval", "120 bpm")))
+            if text is None:
+                return None
+        interval = th.parse_interval(text)
+        if interval is None:
+            messagebox.showinfo("Metronome", f"Couldn't read \u201c{text}\u201d. Try 0.5, 500 ms or 120 bpm.")
+            return None
+        set_preference("metronome_interval", text.strip())
+        start, end = self.analysis_range()
+        specs = th.metronome_marks(start, end, interval, self.beats_per_bar())
+        if not specs:
+            return None
+        return self._add_marks_track(self._beat_track_name("metronome", interval=interval), specs)
+
     def _show_track_menu(self, track, event):
         menu = tk.Menu(self.canvas, tearoff=False)
         menu.add_command(label="Rename Track...", command=lambda: self._rename_track(track))
         menu.add_command(label="Change Color...", command=lambda: self._change_track_color(track))
+        menu.add_command(label="Copy Track", command=lambda: self.copy_track(track))
+        menu.add_command(label="Shift Track...", command=lambda: self.ask_shift_track(track))
+        menu.add_command(label="Shift Track to @cursor  (its first selected mark starts there)",
+                         state="normal" if self.cursor_position() is not None else "disabled",
+                         command=lambda: self.shift_track_to_cursor(track))
+        sel = [i for i in self.selected_mark_ids() if (self.mark_by_id(i) or {}).get("track_id") == track["id"]]
+        if sel:
+            self._add_shift_items(menu, sel)
         menu.add_separator()
         menu.add_command(label="Export Combined...", command=lambda: self.export_timing_track(track))
         menu.add_command(label="Export per Voice...", command=lambda: self.export_per_voice(track))
@@ -4366,7 +5010,7 @@ class WaveformController:
     def _view_state(self):
         """What's remembered between sessions: the selection and the
         waveform's zoom/scroll (rounded to the millisecond)."""
-        return (self.selected, round(self.view_start, 3), round(self.view_end, 3))
+        return (self.selected, tuple(self.selected_mark_ids()), round(self.view_start, 3), round(self.view_end, 3))
 
     def _remember_selection_later(self):
         """Selection or zoom/scroll changed: it's saved to the sidecar
@@ -4407,7 +5051,9 @@ class WaveformController:
         if self.audio_duration is None:
             return
         sel = list(self.selected) if self.selected and self.selected[0] in ("track", "mark") else None
-        th.update_cache(self.filepath, selection=sel, view=[round(self.view_start, 3), round(self.view_end, 3)])
+        group = self.selected_mark_ids()
+        th.update_cache(self.filepath, selection=sel, selection_group=group if len(group) > 1 else None,
+                        view=[round(self.view_start, 3), round(self.view_end, 3)])
 
     def restore_view(self):
         """Reopening a file: the zoom and scroll position it had (if still
@@ -4435,12 +5081,15 @@ class WaveformController:
         """Reopening a file: select the track or card that was selected
         when it was last open (and, with reveal, bring it into view --
         not when last session's zoom/scroll was restored)."""
-        saved = th.load_cache(self.filepath).get("selection")
+        cache = th.load_cache(self.filepath)
+        saved = cache.get("selection")
         if not saved or len(saved) != 2:
             return False
         kind, ident = saved
         if kind == "mark" and self.mark_by_id(ident) is not None:
             self.selected = ("mark", ident)
+            group = [i for i in (cache.get("selection_group") or []) if self.mark_by_id(i) is not None]
+            self._multi = group if ident in group and len(group) > 1 else []
             if reveal:
                 self._ensure_mark_visible(self.mark_by_id(ident))
         elif kind == "track" and self.track_by_id(ident) is not None:
@@ -4809,10 +5458,31 @@ class WaveformController:
 # Plugin entry point
 # ---------------------------------------------------------------------------
 
+_BACKED_UP = set()      # sidecars already backed up in this run of the app
+
+
+def backup_sidecar_once(media_path):
+    """Preference "Back up sidecar files": the first time this run opens a
+    file (the session's files at startup), copy its "-tracked.json" to a
+    timestamped .bak (only the newest backup is kept)."""
+    if not get_preference("backup_sidecars", False):
+        return None
+    cache = th.cache_path(media_path)
+    if cache in _BACKED_UP:
+        return None
+    _BACKED_UP.add(cache)
+    dest = th.backup_sidecar(cache)
+    if dest:
+        debug(2, f"{{blue}}Backed up {Path(cache).name} -> {Path(dest).name}")
+    return dest
+
+
 def onload(filepath: str, canvas=None, text=None, tab=None):
     p = Path(filepath)
     if p.suffix.lower() not in AUDIO_EXTS:
         return False
+    if canvas is not None:
+        backup_sidecar_once(str(p.resolve()))
 
     descr = (
         f"{{cyan}}[waveform_tab]\n"
@@ -4871,8 +5541,12 @@ def onload(filepath: str, canvas=None, text=None, tab=None):
         "{blue}      {cyan}right-click a word{blue} or {cyan}Alt+\u2191/\u2193{blue} (syllables), "
         "{cyan}Alt+\u2192/\u2190{blue} (time) to adjust: writes {cyan}word {+1}{blue} / "
         "{cyan}word {-0.1s}{blue} into the text\n"
+        "{blue}      card keys: {cyan}Enter{blue}=next card  {cyan}Ctrl+Enter{blue}=split at the text cursor  "
+        "{cyan}Backspace{blue} at the start / {cyan}Delete{blue} at the end=merge  {cyan}Ctrl+Space{blue}=play/pause  "
+        "{cyan}Ctrl+[{blue} / {cyan}Ctrl+]{blue}=Start/End to @cursor  {cyan}Tab{blue}=same field, next card (wraps)  {cyan}Ctrl+Home/End{blue}=first/last card\n"
         "{blue}Keys:  {cyan}Up/Down{blue}=move selection between tracks  {cyan}Left/Right{blue}=nudge by one grid step\n"
         "{blue}       {cyan}Tab/Shift+Tab{blue}=select next/prev mark  {cyan}Delete{blue}=delete selection\n"
+        "{blue}       {cyan}Home/End{blue}=first/last mark of the track  (Help > Keyboard Shortcuts lists them all)\n"
         "{blue}       {cyan}Ctrl+Z/Ctrl+Y{blue}=undo/redo marks (while the waveform has focus)\n"
         "{blue}       {cyan}wheel{blue}=zoom\n"
         "{blue}Export Timing (xLights/LRC/Audacity): right-click a track's label.\n"

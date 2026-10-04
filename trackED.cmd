@@ -12,6 +12,10 @@ rem optional packages (demucs, Whisper, librosa) are offered by the app's
 rem Install button.
 rem
 rem   trackED.cmd --reinstall     rebuild the environment
+rem   trackED.cmd --check         if the window doesn't open: checks Python, Tk,
+rem                               the packages and trackED's files, and shows the
+rem                               last error (also in %USERPROFILE%\.tracked\console.log)
+rem   trackED.cmd --console       run with a console window, to see messages
 rem   set TRACKED_CONSOLE=1       run with a console window (to see messages)
 rem   set TRACKED_VENV=C:\dir     use another environment folder
 
@@ -25,6 +29,22 @@ set "ARGS=%*"
 if /I "%~1"=="--reinstall" (
     if exist "%VENV%" rmdir /s /q "%VENV%"
     set "ARGS="
+)
+if /I "%~1"=="--console" (
+    set "TRACKED_CONSOLE=1"
+    set "ARGS="
+)
+if /I "%~1"=="--check" (
+    if not exist "%PY%" (
+        echo trackED's environment %VENV% doesn't exist yet: run trackED.cmd once to set it up.
+        pause
+        exit /b 1
+    )
+    "%PY%" "%HERE%tracked.py" --check
+    echo.
+    echo Python's own record of the last start without a console: %USERPROFILE%\.tracked\console.log
+    pause
+    exit /b 0
 )
 if exist "%PY%" goto run
 
@@ -70,12 +90,31 @@ if errorlevel 1 (
         if not errorlevel 2 winget install -e --id Gyan.FFmpeg --accept-source-agreements --accept-package-agreements
     )
 )
-echo Setup done. Optional extras (stems, transcription, mood) are offered by the Install button.
+echo Setup done. If the trackED window doesn't appear, run:  trackED.cmd --check
+echo Optional extras (stems, transcription, mood) are offered by the Install button.
 
 :run
 if "%TRACKED_CONSOLE%"=="1" (
     "%PY%" "%HERE%tracked.py" %ARGS%
+    if errorlevel 1 pause
     exit /b %errorlevel%
+)
+if not exist "%PYW%" (
+    echo %PYW% is missing; running with a console instead.
+    "%PY%" "%HERE%tracked.py" %ARGS%
+    if errorlevel 1 pause
+    exit /b %errorlevel%
+)
+rem Quick check that Tk works in this environment before starting without
+rem a console (an error there would otherwise be invisible).
+"%PY%" -c "import tkinter; tkinter.Tcl()" 2>"%TEMP%\tracked-tk-check.txt"
+if errorlevel 1 (
+    echo trackED can't start: Tk doesn't work in %VENV%.
+    type "%TEMP%\tracked-tk-check.txt"
+    echo.
+    echo Try:  trackED.cmd --reinstall     or, for details:  trackED.cmd --check
+    pause
+    exit /b 1
 )
 start "" "%PYW%" "%HERE%tracked.py" %ARGS%
 exit /b 0

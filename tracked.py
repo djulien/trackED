@@ -31,6 +31,8 @@ python main.py -debug          # level 1
 python main.py -debug 5
 python main.py -debug=20
 python main.py -nodebug        # off (same as -debug 0)
+python main.py -actions        # log every key press / click / menu pick ("ACTION", see UserActionLog)
+python main.py -busy           # print "trackED: busy" diagnostics (Preferences has a setting too)
 # Change the stored default (and use it now):
 python main.py -debug-default 3
 python main.py -debug-default=0
@@ -324,6 +326,25 @@ DIALOG_OPTIONS = (
 
 
 PREF_INPUT_METHODS = "use_input_methods"
+PREF_BUSY_REPORTS = "busy_reports"     # "trackED: busy -- ..." lines on the terminal (off by default)
+BUSY_REPORTS_CLI = {"on": None}        # -busy on the command line turns them on for that run
+
+
+PREF_LOG_ACTIONS = "log_user_actions"
+USER_ACTION_LEVEL = 3          # debug level for "ACTION ..." lines (keys, clicks, menu picks)
+LOG_ACTIONS_CLI = {"on": None}  # -actions on the command line
+
+
+def log_actions_on() -> bool:
+    if LOG_ACTIONS_CLI["on"] is not None:
+        return LOG_ACTIONS_CLI["on"]
+    return bool(get_preference(PREF_LOG_ACTIONS, False))
+
+
+def busy_reports_on() -> bool:
+    if BUSY_REPORTS_CLI["on"] is not None:
+        return BUSY_REPORTS_CLI["on"]
+    return bool(get_preference(PREF_BUSY_REPORTS, False))
 
 
 def apply_input_methods(root) -> bool:
@@ -413,7 +434,10 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
 #        self.notebook.bind("<<NotebookTabClosed>>", self._on_notebook_tab_closed)
 
         self.status = ttk.Label(self, text="Ready", relief="sunken", anchor="w")
-        self.status.pack(side="bottom", fill="x")
+        # Packed before the notebook: when the window shrinks, pack takes
+        # space from the widgets packed last, so the notebook gives way and
+        # the status bar stays visible.
+        self.status.pack(side="bottom", fill="x", before=self.notebook)
 
     def _set_window_icon(self) -> None:
         """Set the window decoration icon (title bar / taskbar)."""
@@ -529,6 +553,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
 
         # ----- Help -----
         help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Keyboard Shortcuts", accelerator="F1", command=self.show_shortcuts)
         help_menu.add_command(label="Documentation / Tutorials", command=self.open_docs)
         help_menu.add_command(label="Check for Updates", command=self.check_updates)
         help_menu.add_separator()
@@ -538,6 +563,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         self.config(menu=menubar)
 
     def _bind_shortcuts(self) -> None:
+        self.bind_all("<F1>", lambda e: self.show_shortcuts())
         self.bind_all("<Control-n>", lambda e: self.new_file())
         self.bind_all("<Control-o>", lambda e: self.open_file())
         self.bind_all("<Control-s>", lambda e: self.save_file())
@@ -623,6 +649,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         try:
             index = self.notebook.index(f"@{event.x},{event.y}")
             self.notebook.insert(index, child=self.notebook.select())
+            self._keep_debug_last()          # nothing goes right of debug.log
         except tk.TclError:
             pass  # mouse is not over a tab
 
@@ -670,12 +697,14 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         # 4. Debug tab is created LAST so it appears as the rightmost tab
         if get_debug_level() > 0:
             self._open_debug_tab()
+        self._keep_debug_last()
 #            opened_any = True
 
         # Restore which tab had focus (EditorTabs only)
         try:
             # skip debug tab if it is first
-            real_tabs = [t for t in self.tabs if isinstance(t, EditorTab)]
+            # the same list _collect_session counted: tabs with a file
+            real_tabs = [t for t in self.tabs if isinstance(t, EditorTab) and t.filepath]
             if real_tabs and 0 <= active_index < len(real_tabs):
                 self.notebook.select(real_tabs[active_index].frame)
                 real_tabs[active_index].focus()
@@ -695,6 +724,11 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         if not Path(path).exists():
             Path(path).write_text("", encoding="utf-8")
+        already = self._debug_log_tab()
+        if already is not None:              # reopened by the session: adopt it
+            self._debug_tab = already
+            self._keep_debug_last()
+            return
         # Reuse open_file so EditorTab + debug_tab.onload run
         before = list(self.tabs)
         self.open_file(path)
@@ -736,9 +770,30 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         self._new_file_impl()
         self._keep_debug_last()
 
-    def _keep_debug_last(self) -> None:
-        """The debug log tab (with debugging on) is always the right-most."""
+    def _debug_log_tab(self):
+        """The tab showing debug.log: the app's own debug tab, or debug.log
+        opened as a file (e.g. reopened by the last session)."""
         dbg = getattr(self, "_debug_tab", None)
+        if dbg is not None and dbg in self.tabs:
+            return dbg
+        try:
+            target = str(Path(debug_log_path()).resolve())
+        except Exception:
+            return None
+        for t in self.tabs:
+            path = getattr(t, "filepath", None)
+            if path:
+                try:
+                    if str(Path(path).resolve()) == target:
+                        return t
+                except OSError:
+                    pass
+        return None
+
+    def _keep_debug_last(self) -> None:
+        """Whenever debug.log is open, its tab is the right-most."""
+        finder = getattr(self, "_debug_log_tab", None)
+        dbg = finder() if callable(finder) else getattr(self, "_debug_tab", None)
         if dbg is None:
             return
         try:
@@ -1195,7 +1250,34 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
                             " possibly dead-key/Compose accents -- fully applies after a restart)",
                   foreground="#666666").grid(row=12, column=0, columnspan=2, sticky="w")
 
+        act_var = tk.BooleanVar(value=bool(get_preference(PREF_LOG_ACTIONS, False)))
+        ttk.Checkbutton(frm, text="Log my keys, clicks and menu picks to the debug log (\"ACTION\" lines)",
+                        variable=act_var).grid(row=19, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(frm, text=f"(for reproducing a problem: filter the log for ACTION; logged at level "
+                            f"{USER_ACTION_LEVEL}, so the debug level must be {USER_ACTION_LEVEL} or more)",
+                  foreground="#666666").grid(row=20, column=0, columnspan=2, sticky="w")
+        busy_var = tk.BooleanVar(value=bool(get_preference(PREF_BUSY_REPORTS, False)))
+        ttk.Checkbutton(frm, text="Print busy reports on the terminal (for diagnosing slowness)",
+                        variable=busy_var).grid(row=13, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(frm, text="(\"trackED: busy -- main loop ...\"; also -busy on the command line.\n"
+                            " Reports of a frozen window are always printed.)",
+                  foreground="#666666").grid(row=14, column=0, columnspan=2, sticky="w")
+
+        bak_var = tk.BooleanVar(value=bool(get_preference("backup_sidecars", False)))
+        ttk.Checkbutton(frm, text="Back up each audio file's sidecar (-tracked.json) when it's first opened",
+                        variable=bak_var).grid(row=15, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(frm, text="(e.g. song-tracked-20261003-141500.json; only the newest backup is kept)",
+                  foreground="#666666").grid(row=16, column=0, columnspan=2, sticky="w")
+        repo_var = tk.StringVar(value=str(get_preference("update_repo", "") or ""))
+        ttk.Label(frm, text="Updates from GitHub repository (owner/name; empty = default):").grid(
+            row=17, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(frm, textvariable=repo_var, width=28).grid(row=17, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+
         def on_ok():
+            set_preference(PREF_BUSY_REPORTS, bool(busy_var.get()))
+            set_preference(PREF_LOG_ACTIONS, bool(act_var.get()))
+            set_preference("backup_sidecars", bool(bak_var.get()))
+            set_preference("update_repo", repo_var.get().strip())
             try:
                 val = int(max_var.get())
                 val = max(1, min(val, 100))
@@ -1236,7 +1318,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             win.destroy()
 
         btn_frm = ttk.Frame(frm)
-        btn_frm.grid(row=13, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        btn_frm.grid(row=21, column=0, columnspan=2, pady=(12, 0), sticky="e")
         ttk.Button(btn_frm, text="OK", command=on_ok).pack(side="right", padx=(4, 0))
         ttk.Button(btn_frm, text="Cancel", command=on_cancel).pack(side="right")
 
@@ -1324,6 +1406,34 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             messagebox.showinfo("Replace", "No occurrences found.")
 
     # ------------------------------------------------------------------ Help
+    def show_shortcuts(self) -> None:
+        """Help > Keyboard Shortcuts (F1): the cheat sheet in a window."""
+        win = getattr(self, "_shortcuts_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.lift()
+                return
+        except tk.TclError:
+            pass
+        win = self._shortcuts_win = tk.Toplevel(self)
+        win.title("Keyboard Shortcuts")
+        win.configure(bg="#ffffff")
+        text = tk.Text(win, width=92, height=34, wrap="word", bg="#ffffff", fg="#1e1e1e", relief="flat",
+                       padx=12, pady=8, font=("TkDefaultFont", 10))
+        bar = ttk.Scrollbar(win, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+        text.tag_configure("head", font=("TkDefaultFont", 11, "bold"), spacing1=8, spacing3=2, foreground="#0b5394")
+        text.tag_configure("key", font=("TkFixedFont", 10, "bold"))
+        for section, rows in SHORTCUTS:
+            text.insert("end", section + "\n", "head")
+            for keys, what in rows:
+                text.insert("end", f"  {keys:<26}", "key")
+                text.insert("end", what + "\n")
+        text.configure(state="disabled")
+        win.bind("<Escape>", lambda e: win.destroy())
+
     def show_about(self) -> None:
         extra = ""
         if not HAS_DND:
@@ -1332,22 +1442,93 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             extra += f"\n\nDebug level: {get_debug_level()}"
         messagebox.showinfo("About", about_text() + extra)
 
+    def _in_background(self, work, done) -> None:
+        """Run work() in a thread; done(result, error) on the Tk thread."""
+        box = {}
+
+        def run():
+            try:
+                box["result"] = work()
+            except Exception as exc:
+                box["error"] = exc
+            box["done"] = True
+        threading.Thread(target=run, daemon=True).start()
+
+        def poll():
+            if box.get("done"):
+                done(box.get("result"), box.get("error"))
+            else:
+                self.after(150, poll)
+        self.after(150, poll)
+
     def check_updates(self) -> None:
-        messagebox.showinfo(
-            "Check for Updates",
-            f"You are running {APP_NAME} version {VERSION}.\n\n"
-            "No automatic update server is configured yet.\n"
-            "Check the project page for newer releases.",
-        )
+        """Help > Check for Updates: compare VERSION with the GitHub
+        repository's (Preferences: owner/name); if newer, offer to update
+        the program files, then to restart."""
+        import updater
+        repo = updater.default_repo(str(get_preference("update_repo", "") or ""), str(Path(__file__).resolve().parent))
+        if not updater.valid_repo(repo):
+            repo = simpledialog.askstring(
+                "Check for Updates", "GitHub repository to update from (owner/name, e.g. someone/trackED):",
+                parent=self) or ""
+            repo = repo.strip().replace("https://github.com/", "").strip("/")
+            if not updater.valid_repo(repo):
+                return
+            set_preference("update_repo", repo)
+        branch = str(get_preference("update_branch", "") or updater.UPDATE_BRANCH)
+        self.set_status(f"Checking {repo} for updates...")
+
+        def got_version(remote, error):
+            if error is not None:
+                self.set_status("Update check failed")
+                messagebox.showerror("Check for Updates", f"Couldn't read the version from {repo} ({branch}):\n"
+                                                          f"{error}", parent=self)
+                return
+            if not updater.is_newer(remote, VERSION):
+                self.set_status(f"{APP_NAME} {VERSION} is up to date")
+                messagebox.showinfo("Check for Updates", f"You have the latest version ({VERSION}).", parent=self)
+                return
+            if not messagebox.askyesno(
+                    "Check for Updates", f"Version {remote} is available (you have {VERSION}).\n\n"
+                                         f"Update the program files from {repo} now?\n"
+                                         "(The files it replaces are backed up in ~/.tracked first.)", parent=self):
+                return
+            self.set_status(f"Downloading {APP_NAME} {remote}...")
+            app_dir = str(Path(__file__).resolve().parent)
+            self._in_background(lambda: updater.apply_zip(updater.download(repo, branch), app_dir),
+                                lambda res, err: applied(remote, res, err))
+
+        def applied(remote, result, error):
+            if error is not None:
+                self.set_status("Update failed")
+                messagebox.showerror("Check for Updates", f"The update failed:\n{error}", parent=self)
+                return
+            changed, backup = result
+            self.set_status(f"Updated to {remote}: {len(changed)} file(s)")
+            debug(1, f"{{green}}Updated {len(changed)} file(s) to {remote}; backup: {backup}")
+            if not changed:
+                messagebox.showinfo("Check for Updates", "All files were already up to date.", parent=self)
+                return
+            msg = (f"Updated {len(changed)} file(s) to version {remote}." +
+                   (f"\nPrevious files: {backup}" if backup else ""))
+            if updater.needs_restart(changed):
+                if messagebox.askyesno("Check for Updates", msg + "\n\nRestart trackED now to use them?",
+                                       parent=self):
+                    self.restart()
+            else:
+                messagebox.showinfo("Check for Updates", msg, parent=self)
+        self._in_background(lambda: updater.remote_version(repo, branch), got_version)
 
     def open_docs(self) -> None:
         webbrowser.open(documentation_url())
 
     # ------------------------------------------------------------------ Quit / session
-    def _collect_session(self) -> dict:
+    def _collect_session(self, active=None) -> dict:
+        """active: the tab to reopen as the current one (default: the one
+        selected now)."""
         open_files = []
         active_index = 0
-        cur = self.current_tab()
+        cur = active if active is not None else self.current_tab()
         idx = 0
         for t in self.tabs:
             if isinstance(t, EditorTab) and t.filepath:
@@ -1380,6 +1561,10 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
             guard.reset()
 
     def on_quit(self) -> None:
+        # The tab the user was on: the questions below select other tabs
+        # (to show which file they're about), which mustn't change what
+        # the next start reopens as the current tab.
+        active = self.current_tab()
         # Ask about every dirty tab
         for tab in list(self.tabs):
             hook = getattr(tab, "before_close_hook", None)
@@ -1410,7 +1595,7 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
 
         # Remember open files for next launch
         self._save_window_geometry()
-        save_session_data(self._collect_session())
+        save_session_data(self._collect_session(active=active))
         debug(1, "{{pink}}Session saved, exiting")
         self._teardown_and_destroy()
 
@@ -1448,6 +1633,189 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
         debug(2, f"quit: destroy {1000 * (time.monotonic() - t1):.0f} ms, total {1000 * (time.monotonic() - t0):.0f} ms")
 
 
+# Help > Keyboard Shortcuts. Keep in step with the bindings (and the
+# tooltips that mention them): menus here, waveform_tab.py, timing_panel.py
+# (TimingPanel.KEY_HELP), image_tab.py.
+SHORTCUTS = [
+    ("Files and editing (menus)", [
+        ("Ctrl+N / Ctrl+O", "new tab / open a file"),
+        ("Ctrl+S / Ctrl+Shift+S", "save / save as"),
+        ("Ctrl+W", "close the tab"),
+        ("Ctrl+Z / Ctrl+Y", "undo / redo (marks too, in an audio tab)"),
+        ("Ctrl+X / Ctrl+C / Ctrl+V", "cut / copy / paste (text; marks when the waveform has the focus)"),
+        ("Ctrl+F / Ctrl+H", "find / replace"),
+        ("F1", "this list"),
+    ]),
+    ("Waveform (point at it to give it the focus)", [
+        ("click / Ctrl+click", "move the @cursor (Ctrl+click on a mark in a track: select it too)"),
+        ("drag", "new range;  Shift+click: range from the @cursor to here"),
+        ("M  or  double-click", "new point mark at the @cursor / there"),
+        ("Tab / Shift+Tab", "select the next / previous mark"),
+        ("Home / End", "first / last mark of the track"),
+        ("Up / Down", "move the selection between tracks"),
+        ("Left / Right", "nudge the selected mark by one grid step"),
+        ("Delete / Backspace", "delete the selected mark(s)"),
+        ("Escape", "clear the selection"),
+        ("Shift+click / Ctrl+click", "in a track band: select a run / add or remove one mark"),
+        ("Ctrl+C / Ctrl+X / Ctrl+V", "copy / cut / paste marks (paste into the selected track, same times)"),
+        ("mouse wheel", "zoom"),
+    ]),
+    ("Playback", [
+        ("Play", "play from the @cursor / pause"),
+        ("Play while paused", "start again from where Play started (or from a moved @cursor)"),
+        ("Ctrl+Play", "resume from the paused spot"),
+        ("Shift+Play", "loop"),
+        ("\u25c0\u25c0 / \u25b6\u25b6", "5 s;  Shift: stem region edge;  Ctrl: start / end of the audio"),
+    ]),
+    ("Timing cards (in a card's text or time fields)", [
+        ("Enter", "keep the text and go to the next card"),
+        ("Shift+Enter", "a line break in the text"),
+        ("Ctrl+Enter", "split the card at the text cursor"),
+        ("Backspace at the start", "merge with the previous card"),
+        ("Delete at the end", "merge with the next card"),
+        ("Tab / Shift+Tab", "same field of the next / previous card (wraps around in the track)"),
+        ("Ctrl+Home / Ctrl+End", "same field of the first / last card"),
+        ("Ctrl+Space", "play / pause / resume the card  (Ctrl+Shift+Space: loop)"),
+        ("Ctrl+[ / Ctrl+]", "Start / End to the @cursor"),
+        ("Alt+Up / Alt+Down", "one syllable more / less for the word at the text cursor"),
+        ("Alt+Right / Alt+Left", "more / less time for that word"),
+        ("Escape", "undo the typing in the field"),
+        ("Up / Down, Home / End", "(card list focused, not a field) previous / next, first / last card"),
+    ]),
+    ("Image tab", [
+        ("+ / - / 0 / 1", "zoom in / out / fit / 100%"),
+        ("Left / Right", "previous / next singing-face image"),
+        ("Ctrl+Z", "undo a pixel-editor stroke"),
+        ("Escape", "leave the box / pixel tool"),
+        ("right-click", "(pixel editor) pick the color under the pointer"),
+        ("middle-drag", "pan (while a tool is on)"),
+    ]),
+]
+
+
+class UserActionLog:
+    """Preferences > "Log my keys, clicks and menu picks" (or -actions):
+    every key press, mouse click / wheel and menu pick becomes an
+    "ACTION ..." line in the debug log (level USER_ACTION_LEVEL), naming
+    the widget it went to -- so the steps to a problem can be read back.
+    Plain typing is gathered into one "typed '...'" line per field. The
+    check for the setting is made per event, so turning it on or off in
+    Preferences takes effect at once."""
+
+    TYPING_FLUSH_MS = 1200
+
+    def __init__(self, root):
+        self.root = root
+        self._typed = []
+        self._typed_widget = None
+        self._flush_id = None
+        root.bind_all("<KeyPress>", self.on_key, add="+")
+        root.bind_all("<ButtonPress>", self.on_button, add="+")
+        root.bind_all("<MouseWheel>", self.on_wheel, add="+")
+        root.bind_class("Menu", "<<MenuSelect>>", self.on_menu_select, add="+")
+        root.bind_class("Menu", "<ButtonRelease-1>", self.on_menu_pick, add="+")
+        root.bind_class("Menu", "<KeyPress-Return>", self.on_menu_pick, add="+")
+        self._menu_label = ""
+
+    @staticmethod
+    def describe(widget) -> str:
+        """"Button 'Save'", "Entry (…card.start)", "Canvas (…waveform)"."""
+        try:
+            cls = widget.winfo_class()
+        except Exception:
+            return str(widget)
+        text = ""
+        try:
+            if cls in ("Button", "TButton", "Label", "TLabel", "Menubutton", "TMenubutton", "Checkbutton",
+                       "TCheckbutton", "Radiobutton", "TRadiobutton"):
+                text = str(widget.cget("text") or "")
+        except Exception:
+            pass
+        path = str(widget)
+        tail = ".".join(path.split(".")[-2:]) if path.count(".") > 1 else path
+        return f"{cls} '{text}'" if text else f"{cls} ({tail})"
+
+    @staticmethod
+    def key_name(event) -> str:
+        mods = []
+        state = getattr(event, "state", 0) or 0
+        if state & 0x0004:
+            mods.append("Ctrl")
+        if state & 0x0008 or state & 0x20000:
+            mods.append("Alt")
+        if state & 0x0001 and len(getattr(event, "keysym", "")) > 1:
+            mods.append("Shift")
+        return "+".join(mods + [getattr(event, "keysym", "?")])
+
+    def _log(self, text):
+        debug(USER_ACTION_LEVEL, "ACTION " + text)
+
+    def _flush(self):
+        self._flush_id = None
+        if self._typed:
+            self._log(f"typed {''.join(self._typed)!r} in {self.describe(self._typed_widget)}")
+        self._typed, self._typed_widget = [], None
+
+    def on_key(self, event):
+        if not log_actions_on():
+            return
+        ch = getattr(event, "char", "")
+        plain = ch and ch.isprintable() and not (getattr(event, "state", 0) & 0x000C)
+        if plain:
+            if self._typed_widget is not event.widget:
+                self._flush()
+                self._typed_widget = event.widget
+            self._typed.append(ch)
+            try:
+                if self._flush_id is not None:
+                    self.root.after_cancel(self._flush_id)
+                self._flush_id = self.root.after(self.TYPING_FLUSH_MS, self._flush)
+            except (tk.TclError, ValueError):
+                pass
+            return
+        if event.keysym in ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Meta_L", "Meta_R",
+                            "Super_L", "Super_R", "Caps_Lock", "ISO_Level3_Shift"):
+            return
+        self._flush()
+        self._log(f"key {self.key_name(event)} in {self.describe(event.widget)}")
+
+    def on_button(self, event):
+        if not log_actions_on():
+            return
+        self._flush()
+        names = {1: "click", 2: "middle-click", 3: "right-click", 4: "wheel up", 5: "wheel down"}
+        what = names.get(getattr(event, "num", 0), f"button {getattr(event, 'num', '?')}")
+        mods = self.key_name(event).rsplit("+", 1)[0] if "+" in self.key_name(event) else ""
+        where = f" at {event.x},{event.y}" if getattr(event, "widget", None) is not None \
+            and self._is_canvas(event.widget) else ""
+        self._log(f"{(mods + '+') if mods else ''}{what} on {self.describe(event.widget)}{where}")
+
+    @staticmethod
+    def _is_canvas(widget):
+        try:
+            return widget.winfo_class() == "Canvas"
+        except Exception:
+            return False
+
+    def on_wheel(self, event):
+        if not log_actions_on():
+            return
+        self._log(f"wheel {'up' if getattr(event, 'delta', 0) > 0 else 'down'} on {self.describe(event.widget)}")
+
+    def on_menu_select(self, event):
+        try:
+            idx = event.widget.index("active")
+            self._menu_label = event.widget.entrycget(idx, "label") if idx is not None else ""
+        except Exception:
+            self._menu_label = ""
+
+    def on_menu_pick(self, event):
+        if not log_actions_on() or not self._menu_label:
+            return
+        self._flush()
+        self._log(f"menu pick '{self._menu_label}'")
+
+
 def restart_command(argv: List[str]) -> List[str]:
     """The command that starts trackED again: the same Python and options,
     without file names and -fresh (the saved session reopens the files)."""
@@ -1480,6 +1848,62 @@ def relaunch(argv: List[str]) -> None:
     os.execv(cmd[0], cmd)
 
 
+def capture_output_if_windowless() -> Optional[str]:
+    """Started with pythonw.exe (trackED.cmd), there's no console: Python's
+    stdout/stderr are None and any error -- even one that stops trackED
+    from starting -- vanishes. Send them to ~/.tracked/console.log instead
+    (overwritten each start). Returns the log path when redirected."""
+    if sys.stderr is not None and sys.stdout is not None:
+        return None
+    try:
+        folder = Path.home() / ".tracked"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "console.log"
+        log = open(path, "w", encoding="utf-8", buffering=1, errors="replace")
+        log.write(f"trackED {VERSION} started {datetime.datetime.now():%Y-%m-%d %H:%M:%S} "
+                  f"with {sys.executable}\n")
+        sys.stdout = sys.stdout or log
+        sys.stderr = sys.stderr or log
+        return str(path)
+    except OSError:
+        return None
+
+
+def startup_check() -> int:
+    """`tracked.py --check` (trackED.cmd --check): print what trackED
+    needs and whether it's there, open and close a Tk window, and exit
+    -- for when the app window doesn't appear."""
+    import platform
+    ok = True
+    print(f"trackED {VERSION}")
+    print(f"Python {platform.python_version()} at {sys.executable}  ({platform.platform()})")
+    try:
+        root = tk.Tk()
+        print(f"  ok       tkinter (Tk {root.tk.call('info', 'patchlevel')})")
+        root.destroy()
+    except Exception as exc:
+        ok = False
+        print(f"  FAILED   tkinter / Tk window: {exc}")
+    try:
+        import deps
+        deps.main(["deps.py", "--list"])
+    except Exception as exc:
+        print(f"  FAILED   deps list: {exc}")
+    for mod in ("editor_tab", "waveform_tab", "timing_panel", "image_tab", "xlayout_tab", "logview_tab"):
+        try:
+            __import__(mod)
+            print(f"  ok       {mod}.py loads")
+        except Exception as exc:
+            ok = False
+            print(f"  FAILED   {mod}.py: {exc!r}")
+    log = Path.home() / ".tracked" / "console.log"
+    if log.exists():
+        print(f"\nLast windowless start's log ({log}):")
+        print("".join(log.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)[-25:]))
+    print("\nAll checks passed." if ok else "\nSome checks FAILED (see above).")
+    return 0 if ok else 1
+
+
 def parse_args(argv: List[str]):
     """Return (files, fresh, debug_level). debug_level is None when the
     command line doesn't set one (use the stored preference). The
@@ -1493,6 +1917,10 @@ def parse_args(argv: List[str]):
         arg = argv[i]
         if arg == "-fresh":
             fresh = True
+        elif arg == "-busy":
+            BUSY_REPORTS_CLI["on"] = True
+        elif arg == "-actions":
+            LOG_ACTIONS_CLI["on"] = True
         elif arg == "-nodebug":
             debug_level = 0
         elif arg == "-debug-default" or arg.startswith("-debug-default="):
@@ -1624,7 +2052,11 @@ class InterruptGuard:
     def _busy_watch(self, now):
         """Busy but not stuck (e.g. CPU at 100% while the window still
         responds): every BUSY_WINDOW seconds, if the main loop was busy more
-        than half that time, print which app steps ran how often."""
+        than half that time, print which app steps ran how often. Opt-in
+        (Preferences, or -busy); the stall report is always on."""
+        if not busy_reports_on():
+            self._busy_window_start = None
+            return
         start = getattr(self, "_busy_window_start", None)
         if start is None:
             self._busy_window_start, self._busy_at_start = now, getattr(self, "_busy", 0.0)
@@ -1709,12 +2141,34 @@ class InterruptGuard:
                 pass
 
 
-if __name__ == "__main__":
-    files, fresh, dbg = parse_args(sys.argv)
-    app = EditorApp(files_to_open=files, fresh=fresh, debug_level=dbg)
+def main() -> None:
+    if "--check" in sys.argv:
+        sys.exit(startup_check())
+    log = capture_output_if_windowless()
+    try:
+        files, fresh, dbg = parse_args(sys.argv)
+        app = EditorApp(files_to_open=files, fresh=fresh, debug_level=dbg)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        if log:                      # no console to show it: say where it went
+            try:
+                root = tk.Tk()
+                root.withdraw()
+                messagebox.showerror(APP_NAME, "trackED couldn't start.\n\nThe error is in:\n" + log
+                                     + "\n\nFor more checks, run:  trackED.cmd --check")
+                root.destroy()
+            except Exception:
+                pass
+        raise
     InterruptGuard(app)
+    app._action_log = UserActionLog(app)
     app.mainloop()
     if getattr(app, "_restart_requested", False):
         relaunch(sys.argv)
+
+
+if __name__ == "__main__":
+    main()
 
 #eof

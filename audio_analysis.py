@@ -685,6 +685,49 @@ def score_genre_mood(features: Dict[str, float], lyrics: str = "") -> Dict[str, 
             "palette": MOOD_PALETTES[mood]}
 
 
+def beats_available() -> bool:
+    """Bars/Beats detection uses librosa too."""
+    return genre_mood_available()
+
+
+def detect_beats(filepath: str, progress_cb: ProgressCb = None) -> Dict[str, Any]:
+    """Beat times for the whole file (librosa's beat tracker), with the
+    onset strength and the bass energy at each beat (used to guess which
+    beat starts a bar: timing_helpers.downbeat_phase).
+    Returns {"tempo", "beats", "strength", "bass"}. Slow-ish: run it in a
+    worker thread. Raises if librosa isn't installed."""
+    if not beats_available():
+        raise RuntimeError("librosa not installed")
+    import librosa
+
+    def report(msg):
+        if progress_cb:
+            progress_cb(msg)
+    report("Decoding audio... (10%)")
+    duration = None
+    try:
+        duration = librosa.get_duration(path=filepath)
+    except Exception:
+        pass
+    y = _decode_16k_mono(filepath, 0.0, duration or 36000.0, sr=GENRE_SR)
+    if len(y) == 0:
+        raise RuntimeError("no audio decoded")
+    sr, hop = GENRE_SR, 512
+    report("Finding beats... (40%)")
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    tempo, frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop, units="frames")
+    frames = np.asarray(frames, dtype=int)
+    report("Measuring bass at each beat... (75%)")
+    spec = np.abs(librosa.stft(y, hop_length=hop))
+    freqs = librosa.fft_frequencies(sr=sr)
+    low = spec[freqs < 150.0].sum(axis=0)
+    frames = frames[frames < len(onset_env)]
+    times = librosa.frames_to_time(frames, sr=sr, hop_length=hop)
+    return {"tempo": float(np.atleast_1d(tempo)[0]), "beats": [float(t) for t in times],
+            "strength": [float(onset_env[f]) for f in frames],
+            "bass": [float(low[min(f, len(low) - 1)]) for f in frames]}
+
+
 def estimate_genre_mood(filepath: str, lyrics: str = "", progress_cb: ProgressCb = None) -> Dict[str, Any]:
     """Decode the whole file (mono, 22.05 kHz), measure the features with
     librosa, and score them. Slow-ish (seconds to a minute): run it in a

@@ -40,6 +40,8 @@ DEPENDENCIES: List[Dict] = [
          purpose="drag and drop files into the window", license="MIT"),
     dict(key="psutil", pip="psutil", imports=("psutil",), core=True, size="~1 MB",
          purpose="free-memory check (Whisper model size) and diagnostics", license="BSD"),
+    dict(key="pillow", pip="pillow", imports=("PIL",), core=True, size="~5 MB",
+         purpose="images: JPEG/BMP/WebP, smooth zoom, singing faces, pixel editor", license="HPND (permissive)"),
     dict(key="ffmpeg", pip=None, program="ffmpeg", core=False, size="~100 MB",
          purpose="decoding MP3/MP4, fast deep zoom, stems and transcription input",
          license="external program (not linked)"),
@@ -50,7 +52,7 @@ DEPENDENCIES: List[Dict] = [
          size="~150 MB + model download on first use",
          purpose="Transcribe: lyrics from the vocals", license="MIT"),
     dict(key="librosa", pip="librosa", imports=("librosa",), core=False, size="~60 MB",
-         purpose="Mood: genre/mood estimate", license="ISC"),
+         purpose="Mood (genre/mood) and Beats (bars/beats)", license="ISC"),
 ]
 
 BY_KEY = {d["key"]: d for d in DEPENDENCIES}
@@ -202,34 +204,39 @@ def refresh_windows_path() -> None:
         pass
 
 
-def install(keys: List[str], log: LogCb = None) -> Tuple[List[str], List[Tuple[str, str]]]:
-    """Install these dependencies. Returns (installed_keys, [(key, error)]).
-    pip packages go in one pip run; programs one by one."""
+def install(keys: List[str], log: LogCb = None,
+            on_step: Optional[Callable[[str, str], None]] = None) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Install these dependencies one at a time (so a window can show which
+    one is being installed). on_step(key, "start" | "ok" | "failed") is
+    called around each. Returns (installed_keys, [(key, error)])."""
     deps = [BY_KEY[k] for k in keys if k in BY_KEY]
     ok: List[str] = []
     failed: List[Tuple[str, str]] = []
-    pip_deps = [d for d in deps if d.get("pip")]
-    if pip_deps:
-        code, tail = _run(pip_args([d["pip"] for d in pip_deps]), log)
-        if code == 0:
-            ok += [d["key"] for d in pip_deps]
-        else:
-            why = explain_pip_failure(tail) or f"pip failed (exit code {code}); see the log above."
-            failed += [(d["key"], why) for d in pip_deps]
-        importlib.invalidate_caches()
+
+    def step(key, state):
+        if on_step:
+            on_step(key, state)
     for d in deps:
-        if not d.get("program"):
-            continue
-        cmd, manual = program_install_command(d)
-        if cmd is None:
-            failed.append((d["key"], f"trackED can't install it here. Run: {manual}"))
-            continue
-        code, _tail = _run(cmd, log)
-        refresh_windows_path()
-        if code == 0 or shutil.which(d["program"]):
-            ok.append(d["key"])
+        step(d["key"], "start")
+        if d.get("pip"):
+            code, tail = _run(pip_args([d["pip"]]), log)
+            importlib.invalidate_caches()
+            if code == 0:
+                ok.append(d["key"])
+            else:
+                failed.append((d["key"], explain_pip_failure(tail) or f"pip failed (exit code {code}); see the log."))
         else:
-            failed.append((d["key"], f"the installer failed (exit code {code}). You can also run: {manual}"))
+            cmd, manual = program_install_command(d)
+            if cmd is None:
+                failed.append((d["key"], f"trackED can't install it here. Run: {manual}"))
+            else:
+                code, _tail = _run(cmd, log)
+                refresh_windows_path()
+                if code == 0 or shutil.which(d["program"]):
+                    ok.append(d["key"])
+                else:
+                    failed.append((d["key"], f"the installer failed (exit code {code}). You can also run: {manual}"))
+        step(d["key"], "ok" if d["key"] in ok else "failed")
     return ok, failed
 
 

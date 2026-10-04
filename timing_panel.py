@@ -107,6 +107,7 @@ JOIN_MODES = ("off", "group", "all")
 JOIN_TEXT = {"off": "<Join none", "group": "<Join group", "all": "<Join all"}
 JOIN_BTN_WIDTH = 11
 ALL_VOICES = "All voices"    # a card with no voice set is for all voices (Show: filter too)
+OVERLAPPING = "Overlapping"  # Show: filter -- cards whose time overlaps another card in the track
 WORD_TIP_DELAY_MS = 600
 VOICE_BTN_MAX_CHARS = 18
 
@@ -435,6 +436,8 @@ class TimingPanel:
             # the Text widget moving its cursor across the embedded cards)
             self.text.bind("<Up>", lambda e: self.select_adjacent_card(-1), add="+")
             self.text.bind("<Down>", lambda e: self.select_adjacent_card(1), add="+")
+            self.text.bind("<Home>", lambda e: self.select_end_card(False), add="+")
+            self.text.bind("<End>", lambda e: self.select_end_card(True), add="+")
         except tk.TclError:
             pass
 
@@ -483,9 +486,38 @@ class TimingPanel:
         want = self.voice_filter_var.get()
         if want == ALL_VOICES:
             return [m for m in marks if not m.get("voices")]
+        if want == OVERLAPPING:
+            ids = th.overlapping_ids(marks)
+            return [m for m in marks if m["id"] in ids]
         if want and want != SHOW_ALL and want in getattr(self.ctl, "voices", []):
             return [m for m in marks if want in (m.get("voices") or [])]
         return marks
+
+    def filter_groups(self):
+        """The Show: choices, in groups (a separator between groups)."""
+        voices = list(getattr(self.ctl, "voices", []))
+        return [g for g in ([SHOW_ALL], voices, [ALL_VOICES], [OVERLAPPING]) if g]
+
+    def _fill_filter_menu(self, menu):
+        try:
+            menu.delete(0, "end")
+        except tk.TclError:
+            pass
+        for i, group in enumerate(self.filter_groups()):
+            if i:
+                menu.add_separator()
+            for value in group:
+                menu.add_radiobutton(label=value, value=value, variable=self.voice_filter_var,
+                                     command=self._on_voice_filter)
+
+    def empty_note(self):
+        """What the card list says when it shows no cards."""
+        want = self.voice_filter_var.get()
+        if self.track_id and self.ctl.track_marks(self.track_id) and want != SHOW_ALL:
+            what = {ALL_VOICES: "are for all voices (no voice set)",
+                    OVERLAPPING: "overlap another card"}.get(want, f"are for {want}")
+            return f"(no cards in this track {what} -- Show: {SHOW_ALL} lists every card)"
+        return "(no marks in this track yet -- drag marks from the waveform into its band)"
 
     def _on_voice_filter(self, event=None):
         self.sync(force=True)
@@ -553,6 +585,8 @@ class TimingPanel:
         self.canvas.bind("<Button-1>", self._click_off, add="+")
         self.canvas.bind("<Up>", lambda e: self.select_adjacent_card(-1))
         self.canvas.bind("<Down>", lambda e: self.select_adjacent_card(1))
+        self.canvas.bind("<Home>", lambda e: self.select_end_card(False))
+        self.canvas.bind("<End>", lambda e: self.select_end_card(True))
         self._bind_wheel(self.canvas)
         self._bind_wheel(self.header_holder)
 
@@ -666,7 +700,7 @@ class TimingPanel:
             if self.building or waiting:
                 note = f"Loading track ... {len(self.cards) - waiting} of {len(self.order)} cards"
             elif not self.order:
-                note = "(no marks in this track yet -- drag marks from the waveform into its band)"
+                note = self.empty_note()
             if note:
                 self.canvas.create_text(10, y + 8, text=note, anchor="nw", fill=FG_DIM, tags=("listnote",))
                 y += 30
@@ -888,13 +922,22 @@ class TimingPanel:
             _Tip(widget, "Seconds the \u2212 / + buttons (and Alt+arrows on a word) move a time")
         tk.Label(frame, text="Show:", bg=HEADER_BG, fg=FG).pack(side="left")
         voices = list(getattr(self.ctl, "voices", []))
-        if self.voice_filter_var.get() not in [SHOW_ALL, ALL_VOICES] + voices:
+        if self.voice_filter_var.get() not in [SHOW_ALL, ALL_VOICES, OVERLAPPING] + voices:
             self.voice_filter_var.set(SHOW_ALL)
-        vbox = ttk.Combobox(frame, textvariable=self.voice_filter_var, state="readonly", width=14,
-                            values=[SHOW_ALL] + voices + [ALL_VOICES])
+        # A menu rather than a combobox, so the groups can have separators:
+        # every card | one voice each | all-voices cards | overlapping.
+        vbox = tk.Menubutton(frame, textvariable=self.voice_filter_var, bg=BTN_BG, fg=FG,
+                             activebackground=BTN_HOVER_BG, activeforeground=FG, relief="flat", bd=1,
+                             highlightthickness=0, padx=6, pady=0, width=12, anchor="w", indicatoron=True,
+                             cursor="hand2", takefocus=0)
+        vmenu = tk.Menu(vbox, tearoff=False, bg=MENU_BG, fg=MENU_FG, activebackground=MENU_ACTIVE_BG,
+                        activeforeground=MENU_FG)
+        vbox.configure(menu=vmenu)
+        vmenu.configure(postcommand=lambda m=vmenu: self._fill_filter_menu(m))
         vbox.pack(side="left", padx=(2, 10))
-        vbox.bind("<<ComboboxSelected>>", self._on_voice_filter)
+        _Tip(vbox, "Which cards to show: all, one voice's, the ones for all voices, or overlapping ones")
         self._voice_filter_box = vbox
+        self._voice_filter_menu = vmenu
         hint = tk.Label(frame, text="Click the waveform to place the @cursor (Split \u25be can split there)",
                         fg=FG_DIM, bg=HEADER_BG)
         hint.pack(side="left")
@@ -939,8 +982,9 @@ class TimingPanel:
         for seq in ("<Enter>", "<Motion>"):
             play.bind(seq, lambda ev, b=play: b.configure(cursor="exchange" if ev.state & SHIFT_MASK
                                                            else "hand2"), add="+")
-        _Tip(play, "Play / pause this mark\nWhile paused: Play starts it again from its start;\n"
-                   "Ctrl+click resumes from the paused spot\nShift+click: loop it until paused")
+        _Tip(play, "Play / pause this mark   (Ctrl+Space in its fields)\nWhile paused: Play starts it again "
+                   "from its start;\nCtrl+click resumes from the paused spot\nShift+click: loop it until paused "
+                   "(Ctrl+Shift+Space)")
         register_modifier_button(play, ("shift", "control"))
 
         w["tbtns"] = []          # the Start/End buttons: they take the card's background
@@ -1022,7 +1066,10 @@ class TimingPanel:
                                           "Set End to the end of its stem region\n(again: the region after)")
                 edge_btn("end", 1)
             w[f"{which}_at"] = time_btn("@", lambda mid=mark["id"], wh=which: self._to_cursor(mid, wh),
-                                        f"Set {which.capitalize()} to the @cursor")
+                                        f"Set {which.capitalize()} to the @cursor\n"
+                                        f"Ctrl+click: put the @cursor at this card's {which.capitalize()}")
+            w[f"{which}_at"].bind("<Control-Button-1>",
+                                  lambda ev, mid=mark["id"], wh=which: self._cursor_to(mid, wh))
             if which == "start":
                 join = small_btn(JOIN_TEXT[self.join_mode], self._cycle_join)
                 join.configure(width=JOIN_BTN_WIDTH, anchor="w")
@@ -1067,12 +1114,15 @@ class TimingPanel:
         split_menu.configure(postcommand=lambda mid=mark["id"], m=split_menu: self._fill_split_menu(mid, m))
         split.grid(row=0, column=col, padx=2); col += 1
         w["split"], w["split_menu"] = split, split_menu
+        _Tip(split, "Split this card\nCtrl+Enter in the text: split at the text cursor")
         merge = _style_button(tk.Button(f, text="Merge \u2193", command=lambda mid=mark["id"]: self._merge_next(mid),
                                         padx=4, pady=0))
         merge.grid(row=0, column=col, padx=2); col += 1
         if is_last:
             merge.configure(state="disabled")
         w["merge"] = merge
+        _Tip(merge, "Merge with the next card shown\nIn the text: Delete at the very end merges with the next card,\n"
+                    "Backspace at the very start with the previous one")
         delete = _style_button(tk.Button(f, text="\u2715", command=lambda mid=mark["id"]: self._delete(mid),
                                          padx=4, pady=0))
         delete.configure(fg=DELETE_FG, activeforeground=DELETE_FG)
@@ -1084,8 +1134,8 @@ class TimingPanel:
         t.estimate_px = self._card_width()
         t.max_lines = getattr(self, "_field_cap", None) or self.max_field_lines()
         t.grid(row=1, column=0, columnspan=ncols, sticky="ew", pady=(3, 0))
-        t.bind("<Return>", lambda ev, mid=mark["id"]: (self._commit_text(mid), "break")[1])
-        t.bind("<KP_Enter>", lambda ev, mid=mark["id"]: (self._commit_text(mid), "break")[1])
+        t.bind("<Return>", lambda ev, mid=mark["id"]: self._enter_next(mid))
+        t.bind("<KP_Enter>", lambda ev, mid=mark["id"]: self._enter_next(mid))
         t.bind("<Shift-Return>", lambda ev: None)     # Shift+Enter: a line break in the text
         t.bind("<FocusOut>", lambda ev, mid=mark["id"]: self._commit_text(mid))
         t.bind("<Escape>", lambda ev, mid=mark["id"]: self._revert(mid))
@@ -1106,6 +1156,8 @@ class TimingPanel:
         for seq, syl, sec in (("<Alt-Up>", 1, 0), ("<Alt-Down>", -1, 0), ("<Alt-Right>", 0, 1), ("<Alt-Left>", 0, -1)):
             t.bind(seq, lambda ev, mid=mark["id"], a=syl, b=sec: self._adjust_at_cursor(mid, a, b))
 
+        self._bind_card_keys(w, mark["id"])
+
         # Ctrl+Z / Ctrl+Y in any card field: apply what's typed, then
         # undo/redo the marks (Entry widgets have no undo of their own).
         for entry in (w["start"], w["end"], t):
@@ -1119,6 +1171,12 @@ class TimingPanel:
             if not isinstance(widget, tk.Entry):
                 widget.bind("<Button-1>", lambda ev, mid=mark["id"]: self.ctl.select_mark(mid, from_panel=True),
                             add="+")
+            # the card's background and labels (not its buttons/fields):
+            # Ctrl/Shift+click select several cards, right-click = their menu
+            if isinstance(widget, (tk.Frame, tk.Label)) and widget not in (t, getattr(t, "widget", None)):
+                widget.bind("<Control-Button-1>", lambda ev, mid=mark["id"]: self._extend(mid, toggle=True))
+                widget.bind("<Shift-Button-1>", lambda ev, mid=mark["id"]: self._extend(mid, toggle=False))
+                widget.bind("<Button-3>", lambda ev, mid=mark["id"]: self._card_menu(mid, ev))
         self._forward_wheel(f)
         return w
 
@@ -1235,12 +1293,6 @@ class TimingPanel:
         if self._header_label is not None and track:
             try:
                 self._header_label.configure(text=self._header_text(track, marks))
-            except tk.TclError:
-                pass
-        box = getattr(self, "_voice_filter_box", None)
-        if box is not None:
-            try:
-                box.configure(values=[SHOW_ALL] + list(getattr(self.ctl, "voices", [])) + [ALL_VOICES])
             except tk.TclError:
                 pass
         selected = self.ctl.selected_mark_id()
@@ -1540,20 +1592,147 @@ class TimingPanel:
                 if which in fields and card is not None and card[which] is not focused:
                     self._commit_time(mid, which)
 
-    def focus_adjacent_field(self, mid, key, direction):
+    # ------------------------------------------------------------------ card keyboard shortcuts
+    # Chosen to behave like a word processor / media player, so they can
+    # be guessed: Enter = next line (card), Ctrl+Enter = break here (split),
+    # Backspace at the start / Delete at the end = join (merge), Ctrl+Space
+    # = play/pause, Ctrl+[ / Ctrl+] = this card's [start / end] to the
+    # @cursor, Tab = same field of the next card. Shown in tooltips and the
+    # Split menu.
+    KEY_HELP = ("Enter=next card  Ctrl+Enter=split at text cursor  Backspace at start / Delete at end=merge  "
+                "Ctrl+Space=play/pause (Ctrl+Shift: loop)  Ctrl+[ / Ctrl+]=Start/End to @cursor  "
+                "Tab / Shift+Tab=same field, next / previous card (wraps)  Ctrl+Home / Ctrl+End=first / last card")
+
+    def _bind_card_keys(self, w, mid):
+        t = w["text"]
+        t.bind("<Control-Return>", lambda ev: self._key_split(mid))
+        t.bind("<Control-KP_Enter>", lambda ev: self._key_split(mid))
+        t.bind("<BackSpace>", lambda ev: self._key_merge(mid, -1), add="+")
+        t.bind("<Delete>", lambda ev: self._key_merge(mid, 1), add="+")
+        for key in ("start", "end", "text"):
+            field = w.get(key)
+            if field is None:
+                continue
+            field.bind("<Control-space>", lambda ev: self._key_play(mid, loop=False))
+            field.bind("<Control-Shift-space>", lambda ev: self._key_play(mid, loop=True))
+            field.bind("<Control-bracketleft>", lambda ev: (self._to_cursor(mid, "start"), "break")[1])
+            field.bind("<Control-bracketright>", lambda ev: (self._to_cursor(mid, "end"), "break")[1])
+            field.bind("<Control-Home>", lambda ev, k=key: self.focus_adjacent_field(mid, k, 0, absolute=0))
+            field.bind("<Control-End>", lambda ev, k=key: self.focus_adjacent_field(mid, k, 0, absolute=-1))
+
+    def _enter_next(self, mid):
+        """Enter in a card's text: keep it and go on to the next card's text."""
+        self._commit_text(mid)
+        self.focus_adjacent_field(mid, "text", 1)
+        return "break"
+
+    def _key_play(self, mid, loop):
+        self._commit_all(mid)
+        self.ctl.toggle_mark_play(mid, loop=loop, resume=True)
+        return "break"
+
+    def _focus_text_later(self, mid, index, tries=10):
+        """Put the cursor in a card's text once the list is rebuilt."""
+        def go(n=tries):
+            card = self.cards.get(mid)
+            if card is None:
+                if n > 0:
+                    self.text.after(30, lambda: go(n - 1))
+                return
+            try:
+                self._see(mid)
+                card["text"].focus_set()
+                card["text"].select_range(0, 0)
+                card["text"].icursor(index)
+            except (tk.TclError, AttributeError):
+                pass
+        try:
+            self.text.after_idle(go)
+        except (tk.TclError, AttributeError):
+            go()
+
+    def _key_split(self, mid):
+        """Ctrl+Enter: split at the text cursor; the cursor moves to the new card."""
+        card = self.cards.get(mid)
+        if not card:
+            return "break"
+        try:
+            ins = int(card["text"].index("insert"))
+        except (tk.TclError, TypeError, ValueError):
+            return "break"
+        label = card["text"].get()
+        if not (0 < ins < len(label) and label[:ins].strip() and label[ins:].strip()):
+            self._flash_bad(mid)
+            return "break"
+        mark = self.ctl.mark_by_id(mid)
+        track_id = mark.get("track_id") if mark else None
+        self._split(mid, how="text")
+        after = [m for m in self.ctl.track_marks(track_id) if m["start"] >= self.ctl.mark_by_id(mid)["start"]
+                 and m["id"] != mid] if self.ctl.mark_by_id(mid) else []
+        if after:
+            nxt = min(after, key=lambda m: m["start"])
+            self._focus_text_later(nxt["id"], 0)
+        return "break"
+
+    def _key_merge(self, mid, direction):
+        """Backspace at the very start (direction -1) / Delete at the very
+        end (+1) of a card's text, nothing selected: merge with the
+        previous / next card shown. Otherwise the key edits the text."""
+        card = self.cards.get(mid)
+        if not card:
+            return None
+        field = card["text"]
+        try:
+            if field.selected_span():
+                return None
+            ins = int(field.index("insert"))
+        except (tk.TclError, TypeError, ValueError, AttributeError):
+            return None
+        label = field.get()
+        if (direction < 0 and ins != 0) or (direction > 0 and ins != len(label)):
+            return None
+        self._commit_all(mid)
+        mark = self.ctl.mark_by_id(mid)
+        if mark is None:
+            return "break"
+        pool = self.visible_marks(mark.get("track_id"))
+        other = th.neighbor_mark(pool, mark, direction)
+        if other is None:
+            return "break"
+        join_at = len((other.get("label") or "").rstrip()) if direction < 0 else len(label.rstrip())
+        if self.ctl.merge_mark_by_id(mid, direction=direction, pool=pool):
+            self._focus_text_later(mid, join_at + (1 if direction < 0 and join_at else 0))
+        else:
+            self._flash_bad(mid)
+        return "break"
+
+    def _see_ahead(self, i, direction):
+        """Scroll card i into view together with one more card beyond it
+        (in the direction of travel), so you can see what comes next."""
+        n = len(self.order)
+        if not n:
+            return
+        ahead = self.order[(i + (1 if direction >= 0 else -1)) % n]
+        if ahead != self.order[i] and ahead in self.cards:
+            self._see(ahead)
+        self._see(self.order[i])
+
+    def focus_adjacent_field(self, mid, key, direction, absolute=None):
         """Tab / Shift+Tab in a card field: the same field (text, Start or
-        End) of the next / previous card. Leaving the field commits it, as
-        usual."""
-        if mid not in self.order:
+        End) of the next / previous card, wrapping around within the
+        track. absolute: go to that index instead (Ctrl+Home / Ctrl+End).
+        Leaving the field commits it, as usual."""
+        if mid not in self.order or not self.order:
             return "break"
-        i = self.order.index(mid) + direction
-        if not 0 <= i < len(self.order):
-            return "break"
+        if absolute is not None:
+            i = absolute % len(self.order)
+        else:
+            i = (self.order.index(mid) + direction) % len(self.order)
         target = self.cards.get(self.order[i])
         if target is None:
             return "break"
         field = target.get(key)
-        self._see(self.order[i])
+        self._see_ahead(i, direction if absolute is None else (1 if absolute == 0 else -1))
         try:
             field.focus_set()
         except (tk.TclError, AttributeError):
@@ -1574,7 +1753,16 @@ class TimingPanel:
         else:
             i = 0 if direction > 0 else len(self.order) - 1
         self.ctl.select_mark(self.order[i], from_panel=True)
-        self._scroll_to_selected()
+        self._see_ahead(i, direction)
+        return "break"
+
+    def select_end_card(self, last):
+        """Home / End in the card list: the first / last card."""
+        if self.mode != "track" or not self.order:
+            return None
+        i = len(self.order) - 1 if last else 0
+        self.ctl.select_mark(self.order[i], from_panel=True)
+        self._see(self.order[i])
         return "break"
 
     def set_rest_mode(self, mode):
@@ -1745,6 +1933,32 @@ class TimingPanel:
         if not ok:
             self._flash_bad(mid)
 
+    def _cursor_to(self, mid, which):
+        """Ctrl+click on a card's @: the @cursor goes to its Start / End."""
+        mark = self.ctl.mark_by_id(mid)
+        if mark is None:
+            return "break"
+        t = mark["start"] if which == "start" or mark.get("end") is None else mark["end"]
+        self.ctl._set_cursor(t)
+        return "break"
+
+    def _extend(self, mid, toggle):
+        """Ctrl+click (toggle) / Shift+click (run) on cards: several selected."""
+        mark = self.ctl.mark_by_id(mid)
+        if mark is not None and hasattr(self.ctl, "extend_selection"):
+            self.ctl.extend_selection(mark, toggle=toggle)
+        return "break"
+
+    def _card_menu(self, mid, event):
+        """Right-click on a card (outside its text): the menu for the
+        selected cards -- this one alone if it isn't among them."""
+        if mid not in self.ctl.selected_mark_ids():
+            self.ctl._multi = []
+            self.ctl.select_mark(mid, from_panel=True)
+        self._commit_all(mid)
+        self.ctl.show_selection_menu(event)
+        return "break"
+
     def _undo_redo(self, mid, which):
         self._commit_all(mid)
         self._focus_list()  # the card may be rebuilt; don't leave focus in it
@@ -1779,9 +1993,14 @@ class TimingPanel:
         except (TypeError, ValueError):
             ins = -1
         text_ok = 0 < ins < len(label) and label[:ins].strip() and label[ins:].strip()
-        menu.add_command(label="Split at text cursor" + (f" (before \u201c{label[ins:].split()[0][:15]}\u201d)"
+        menu.add_command(accelerator="Ctrl+Enter", label="Split at text cursor" + (f" (before \u201c{label[ins:].split()[0][:15]}\u201d)"
                                                           if text_ok else " (click in the text first)"),
                          state="normal" if text_ok else "disabled", command=lambda: self._split(mid, how="text"))
+        n_pieces = len(mark.get("pieces") or [])
+        if n_pieces >= 2:
+            menu.add_command(label=f"Unmerge into the {n_pieces} merged cards",
+                             command=lambda: (self._commit_all(mid), self.ctl.unmerge_mark_by_id(mid)))
+            menu.add_separator()
         menu.add_command(label="Split in half", state="normal" if (is_range or n_words >= 2) else "disabled",
                          command=lambda: self._split(mid, how="half"))
         menu.add_command(label="Split selected phrase", state="normal" if sel else "disabled",
@@ -1973,6 +2192,9 @@ class TimingPanel:
         menu = self.build_word_menu(mid, offset)
         if menu is None:
             return "break"
+        menu.add_separator()
+        menu.add_command(label="This card / selected cards: shift, copy, move...",
+                         command=lambda: self._card_menu(mid, event))
         try:
             menu.tk_popup(getattr(event, "x_root", 0), getattr(event, "y_root", 0))
         finally:

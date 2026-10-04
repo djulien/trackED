@@ -861,6 +861,107 @@ def merged_fields(a: Dict[str, Any], b: Dict[str, Any]) -> Tuple[float, float, s
 
 
 # ---------------------------------------------------------------------------
+# Reversible merges: a merged card remembers the cards it was made of
+# (mark["pieces"]: their start/end/label/voices), so "Unmerge" can bring
+# them back later -- not an undo: other edits may have happened since.
+# ---------------------------------------------------------------------------
+
+def _piece_of(m: Dict[str, Any]) -> Dict[str, Any]:
+    p = {"start": m["start"], "end": m.get("end") if m.get("type") == "range" else None,
+         "label": (m.get("label") or "").strip()}
+    if m.get("voices"):
+        p["voices"] = list(m["voices"])
+    return p
+
+
+def pieces_of(m: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The original cards a mark stands for: its remembered pieces, or itself."""
+    return [dict(p) for p in (m.get("pieces") or [])] or [_piece_of(m)]
+
+
+def merged_pieces(a: Dict[str, Any], b: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Pieces of the card made by merging a and b (merges of merges keep
+    all the original cards), in time order."""
+    out = pieces_of(a) + pieces_of(b)
+    out.sort(key=lambda p: (p["start"], p["end"] if p["end"] is not None else p["start"]))
+    return out
+
+
+def _piece_end(p):
+    return p["end"] if p.get("end") is not None else p["start"]
+
+
+def pieces_for_span(pieces: List[Dict[str, Any]], start: float, end: float) -> Optional[List[Dict[str, Any]]]:
+    """After a merged card is split by hand: the pieces that belong to one
+    part (start..end) -- a piece across the cut goes with the part holding
+    its middle, trimmed to it. None when
+    fewer than two are left (then there's nothing to unmerge)."""
+    out = []
+    for p in pieces:
+        mid = (p["start"] + _piece_end(p)) / 2.0      # a piece across the cut goes with its larger part
+        if start - 1e-6 <= mid < end + 1e-6 or (abs(mid - end) < 1e-6 and end == start):
+            a, b = max(p["start"], start), min(_piece_end(p), end)
+            q = dict(p)
+            q["start"] = a
+            if q.get("end") is not None:
+                q["end"] = b
+            out.append(q)
+    return out if len(out) >= 2 else None
+
+
+def unmerge_plan(mark: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
+    """The cards to restore from a merged card, and how exact that is:
+      "exact"    -- nothing changed since the merge: the original cards
+      "moved"    -- the card was moved/resized: the original boundaries,
+                    scaled into its new span
+      "text"     -- its text was edited: the new words are shared out in
+                    the same numbers of words per card (or in proportion
+                    when the count changed)
+    Returns ([], "") when the mark isn't a merged card."""
+    pieces = [dict(p) for p in (mark.get("pieces") or [])]
+    if len(pieces) < 2:
+        return [], ""
+    how = []
+    o0, o1 = pieces[0]["start"], max(_piece_end(p) for p in pieces)
+    n0 = mark["start"]
+    n1 = mark["end"] if mark.get("end") is not None else n0
+    if abs(o0 - n0) > 1e-6 or abs(o1 - n1) > 1e-6:
+        how.append("moved")
+        # Stretch the original boundaries into the card's span -- unless the
+        # card has (almost) no length any more (e.g. its End was cleared or
+        # set onto its Start): then everything would land on one instant, so
+        # keep the original lengths and only move them to the card's start.
+        if o1 - o0 > 1e-9 and n1 - n0 >= MIN_RANGE * len(pieces):
+            scale = (n1 - n0) / (o1 - o0)
+        else:
+            scale = 1.0
+
+        def remap(t):
+            return round(n0 + (t - o0) * scale, 6)
+        for p in pieces:
+            p["start"] = remap(p["start"])
+            if p.get("end") is not None:
+                p["end"] = remap(p["end"])
+    current = (mark.get("label") or "").split()
+    original = [(p.get("label") or "").split() for p in pieces]
+    if current != [w for ws in original for w in ws]:
+        how.append("text")
+        counts = [len(ws) for ws in original]
+        if sum(counts) != len(current):          # share out in proportion
+            total = max(1, sum(counts))
+            bounds, acc = [], 0
+            for c in counts:
+                acc += c
+                bounds.append(round(acc * len(current) / total))
+            counts = [b - a for a, b in zip([0] + bounds[:-1], bounds)]
+        i = 0
+        for p, c in zip(pieces, counts):
+            p["label"] = " ".join(current[i:i + c])
+            i += c
+    return pieces, ("exact" if not how else "+".join(how))
+
+
+# ---------------------------------------------------------------------------
 # Importing timed text: LRC, Audacity labels, SRT -- or plain lyrics
 # ---------------------------------------------------------------------------
 
@@ -1366,6 +1467,38 @@ _MTIME_KEYS = ("genre_mood",)                     # dropped only when the media'
 _cache_lock = threading.RLock()
 
 
+def backup_name(path: str, stamp: str) -> str:
+    """"song-tracked.json" -> "song-tracked-20261003-141500.json"."""
+    root, ext = os.path.splitext(path)
+    return f"{root}-{stamp}{ext}"
+
+
+def backup_sidecar(path: str, stamp: Optional[str] = None) -> Optional[str]:
+    """Copy a sidecar file to "<name>-<YYYYmmdd-HHMMSS><ext>" next to it
+    (song-tracked-20261003-141500.json) and delete its older backups --
+    only one is kept. Returns the backup's path, or None when there's
+    nothing to back up / it failed."""
+    import glob
+    import time as _time
+    if not path or not os.path.isfile(path):
+        return None
+    stamp = stamp or _time.strftime("%Y%m%d-%H%M%S")
+    dest = backup_name(path, stamp)
+    try:
+        shutil.copy2(path, dest)
+    except OSError:
+        return None
+    root, ext = os.path.splitext(path)
+    pattern = glob.escape(root) + "-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]" + glob.escape(ext)
+    for old in glob.glob(pattern):
+        if os.path.abspath(old) != os.path.abspath(dest):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    return dest
+
+
 def cache_path(media_path: str) -> str:
     return _sidecar_path(media_path, CACHE_SUFFIX)
 
@@ -1600,6 +1733,26 @@ def overlap_count(marks: List[Dict[str, Any]]) -> int:
     return n
 
 
+def overlapping_ids(marks: List[Dict[str, Any]]) -> set:
+    """Ids of marks whose time overlaps another mark's (ranges sharing
+    time; a point inside a range; two points at the same time)."""
+    spans = []
+    for m in marks:
+        end = m["end"] if m.get("type") == "range" and m.get("end") is not None else m["start"]
+        spans.append((m["start"], end, m["id"]))
+    spans.sort()
+    out = set()
+    reach_end, reach_id = None, None
+    for start, end, mid in spans:
+        if reach_end is not None and (start < reach_end - 1e-6 or
+                                      (start == end and abs(start - reach_end) < 1e-6 and start <= reach_end)):
+            out.add(mid)
+            out.add(reach_id)
+        if reach_end is None or end > reach_end:
+            reach_end, reach_id = end, mid
+    return out
+
+
 def copy_marks(marks: List[Dict[str, Any]], track_id: Optional[str], new_id: Callable[[], str],
                offset: float = 0.0) -> List[Dict[str, Any]]:
     """Copies of marks (new ids) for track_id, shifted by offset seconds."""
@@ -1611,8 +1764,161 @@ def copy_marks(marks: List[Dict[str, Any]], track_id: Optional[str], new_id: Cal
         c["start"] = m["start"] + offset
         if c.get("end") is not None:
             c["end"] = m["end"] + offset
+        for p in c.get("pieces") or []:         # a merged card's originals move with it
+            p["start"] = p["start"] + offset
+            if p.get("end") is not None:
+                p["end"] = p["end"] + offset
         out.append(c)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Bars / beats (Beats \u25be menu). Beat times come from
+# audio_analysis.detect_beats; everything here is pure.
+# ---------------------------------------------------------------------------
+
+def downbeat_phase(strength: List[float], bass: List[float], beats_per_bar: int) -> int:
+    """Which beat (index mod beats_per_bar) most likely starts a bar: the
+    phase whose beats carry the most bass + onset strength. A guess --
+    the Bars/Beats tracks can be renumbered afterwards."""
+    if beats_per_bar <= 1 or not strength:
+        return 0
+
+    def norm(v):
+        top = max(v) if v and max(v) > 0 else 1.0
+        return [x / top for x in v]
+    s_n, b_n = norm(list(strength)), norm(list(bass or [0.0] * len(strength)))
+    scores = []
+    for p in range(beats_per_bar):
+        idx = range(p, len(s_n), beats_per_bar)
+        vals = [s_n[i] + 1.5 * (b_n[i] if i < len(b_n) else 0.0) for i in idx]
+        scores.append(sum(vals) / len(vals) if vals else 0.0)
+    return max(range(beats_per_bar), key=lambda p: scores[p])
+
+
+def _beat_len(beats: List[float]) -> float:
+    gaps = sorted(b - a for a, b in zip(beats, beats[1:]) if b > a)
+    return gaps[len(gaps) // 2] if gaps else 0.5
+
+
+def beat_marks(beats: List[float], start: float, end: float, beats_per_bar: int = 4, phase: int = 0,
+               mode: str = "beats", which: int = 1) -> List[Dict[str, Any]]:
+    """Timing marks (start, end, label) from beat times, for beats in
+    [start, end):
+      "beats" -- every beat, labeled with its number in the bar (1..N),
+                 lasting until the next beat
+      "beat"  -- only beat number `which` of each bar, one beat long
+      "bars"  -- one mark per bar (from each beat 1), numbered 1, 2, 3...
+                 from the first bar in the range, lasting the whole bar
+    phase: index of a beat that is beat 1 (see downbeat_phase)."""
+    beats = sorted(beats)
+    if not beats:
+        return []
+    bpb = max(1, int(beats_per_bar))
+    blen = _beat_len(beats)
+    out: List[Dict[str, Any]] = []
+
+    def number(i):
+        return (i - phase) % bpb + 1
+
+    def next_time(i, step=1):
+        j = i + step
+        if j < len(beats):
+            return beats[j]
+        return beats[i] + step * blen
+    bar_no = 0
+    for i, t in enumerate(beats):
+        if t < start - 1e-9 or t >= end:
+            continue
+        n = number(i)
+        if mode == "beats":
+            out.append({"start": t, "end": min(next_time(i), end), "label": str(n)})
+        elif mode == "beat":
+            if n == which:
+                out.append({"start": t, "end": min(next_time(i), end), "label": str(n)})
+        elif mode == "bars":
+            if n == 1:
+                bar_no += 1
+                out.append({"start": t, "end": min(next_time(i, bpb), end), "label": str(bar_no)})
+    return [m for m in out if m["end"] - m["start"] > 1e-6]
+
+
+def parse_interval(text: str) -> Optional[float]:
+    """Metronome interval from what the user typed: "0.5", "0.5 s",
+    "500 ms", "120 bpm" (a bare number above 10 counts as BPM).
+    Seconds, or None if it can't be read / is out of range."""
+    s = (text or "").strip().lower().replace(",", ".")
+    m = re.fullmatch(r"([0-9]*\.?[0-9]+)\s*(bpm|ms|s|sec|seconds?)?", s)
+    if not m:
+        return None
+    value, unit = float(m.group(1)), m.group(2)
+    if unit == "bpm" or (unit is None and value > 10):
+        seconds = 60.0 / value if value > 0 else 0.0
+    elif unit == "ms":
+        seconds = value / 1000.0
+    else:
+        seconds = value
+    return seconds if 0.02 <= seconds <= 60.0 else None
+
+
+def metronome_marks(start: float, end: float, interval: float,
+                    beats_per_bar: int = 4) -> List[Dict[str, Any]]:
+    """Evenly spaced ticks from start, labeled 1..beats_per_bar like
+    beats, each lasting until the next tick."""
+    out: List[Dict[str, Any]] = []
+    if interval <= 0 or end <= start:
+        return out
+    n = 0
+    while True:
+        t = start + n * interval
+        if t >= end - 1e-9:
+            break
+        out.append({"start": round(t, 6), "end": round(min(t + interval, end), 6),
+                    "label": str(n % max(1, beats_per_bar) + 1)})
+        n += 1
+        if n > 200000:
+            break
+    return out
+
+
+def numbering_cycle(labels: List[str]) -> Optional[int]:
+    """How a track's numbers run: N when they count 1..N and start over
+    (a Beats track), 0 when they just count up (Bars), None when the
+    labels aren't all numbers."""
+    try:
+        nums = [int(x) for x in labels]
+    except (TypeError, ValueError):
+        return None
+    if not nums:
+        return None
+    top = max(nums)
+    cyclic = len(nums) > top and all(b == a % top + 1 for a, b in zip(nums, nums[1:]))
+    if cyclic and top <= 16:
+        return top
+    return 0
+
+
+def renumber_from(labels: List[str], index: int, first: int, cycle: int = 0) -> List[str]:
+    """New labels: from position index on, count up from `first` (cycle >
+    0: wrap after cycle, as beat numbers do). Earlier labels are kept."""
+    out = list(labels)
+    n = first
+    for i in range(index, len(out)):
+        out[i] = str(n)
+        n += 1
+        if cycle and n > cycle:
+            n = 1
+    return out
+
+
+def unique_track_name(name: str, existing: List[str]) -> str:
+    """name, or "name 2", "name 3"... if a track already has it."""
+    if name not in existing:
+        return name
+    k = 2
+    while f"{name} {k}" in existing:
+        k += 1
+    return f"{name} {k}"
 
 
 def find_span(text: str, piece: str, start: int = 0) -> Optional[Tuple[int, int]]:

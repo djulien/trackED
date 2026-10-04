@@ -440,14 +440,15 @@ class FakeMenu(FakeWidget):
             entry["variable"].set(not entry["variable"].get())
         return entry["command"]()
 
-    def add_separator(self): pass
+    def add_separator(self):
+        self.entries.append({"kind": "separator", "label": ""})
     def tk_popup(self, *a): pass
 
     def labels(self):
-        return [e["label"] for e in self.entries]
+        return [e["label"] for e in self.entries if e.get("kind") != "separator"]
 
     def entry(self, label):
-        return next(e for e in self.entries if e["label"] == label)
+        return next(e for e in self.entries if e.get("label") == label)
 
 
 class FakeTreeview(FakeWidget):
@@ -546,6 +547,7 @@ def install_fake_tk():
     simpledialog = types.ModuleType("tkinter.simpledialog")
     simpledialog.askstring = lambda *a, **k: None
     simpledialog.askfloat = lambda *a, **k: None
+    simpledialog.askinteger = lambda *a, **k: None
     colorchooser = types.ModuleType("tkinter.colorchooser")
     colorchooser.askcolor = lambda *a, **k: (None, None)
     filedialog = types.ModuleType("tkinter.filedialog")
@@ -4085,6 +4087,9 @@ def test_busy_report():
     guard = tracked.InterruptGuard.__new__(tracked.InterruptGuard)
     guard._busy = 0.0
     t0 = time.monotonic()
+    guard._busy_watch(t0)                          # off by default: does nothing
+    check(getattr(guard, "_busy_window_start", None) is None, "busy reports are off by default")
+    tracked.BUSY_REPORTS_CLI["on"] = True          # as with -busy
     guard._busy_watch(t0)                          # starts a window
     utils._crumbs.clear()
     for i in range(30):
@@ -4107,6 +4112,7 @@ def test_busy_report():
     finally:
         sys.stderr = real
     check(out.getvalue() == "", "...and nothing when it's idle")
+    tracked.BUSY_REPORTS_CLI["on"] = None
 
 
 def test_fast_destroy():
@@ -4217,10 +4223,10 @@ def test_round14(th, aa, wt, media):
         restarts = []
         canvas.restart = lambda: restarts.append(1)
         ctl._install_finished(["librosa"], [])
-        check(restarts == [1], "after an install, trackED offers to restart (Yes restarts)")
-        check(ctl.install_btn.cget("text") == "\u27f3 Restart", "...and the button becomes Restart")
+        check(restarts == [] and ctl.install_btn.cget("text") == "\u27f3 Restart",
+              "after an install the toolbar button becomes Restart (no message box that could hide)")
         ctl._on_install_clicked()
-        check(restarts == [1, 1], "clicking Restart restarts")
+        check(restarts == [1], "clicking Restart restarts")
     finally:
         deps.missing = real_missing
     deps.missing = lambda include_broken=False: [deps.BY_KEY["librosa"]]
@@ -4426,6 +4432,905 @@ def test_round14(th, aa, wt, media):
     check(names == ["Lyrics - Lead", "Lyrics - voice 2"], "...one xLights timing track per voice")
 
 
+def test_round15(th, aa, wt, media):
+    print("\n-- round 15: card keys, beats, copy track, renumber, singing faces, pixel editor --")
+    import timing_panel as tp
+
+    # card keyboard shortcuts
+    ctl, c, _t, tab = bare_controller(wt, fresh_copy(media, "r15_keys"), 100.0)
+    tr = ctl._new_track("Lyrics")
+    a = ctl._add_mark("range", 1.0, 5.0, label="hello there world", track_id=tr["id"])
+    b = ctl._add_mark("range", 5.0, 7.0, label="again", track_id=tr["id"])
+    ctl.selected = ("track", tr["id"]); ctl.render_waveform(); run_afters()
+    panel = ctl.panel
+    card = panel.cards[a["id"]]
+    for seq in ("<Control-Return>", "<Control-space>", "<Control-bracketleft>", "<Control-bracketright>"):
+        check(seq in card["text"]._binds if hasattr(card["text"], "_binds") else seq in card["text"].widget._binds,
+              f"card text has {seq}")
+    card["text"].icursor(len("hello "))
+    panel._key_split(a["id"]); run_afters()
+    marks = ctl.track_marks(tr["id"])
+    check(len(marks) == 3 and marks[0]["label"] == "hello" and marks[1]["label"] == "there world",
+          "Ctrl+Enter splits the card at the text cursor")
+    second = marks[1]["id"]
+    panel.cards[second]["text"].icursor(0)
+    check(panel._key_merge(second, -1) == "break" and len(ctl.track_marks(tr["id"])) == 2
+          and ctl.mark_by_id(second)["label"] == "hello there world",
+          "Backspace at the start of a card merges it with the previous one")
+    run_afters()
+    f = panel.cards[second]["text"]
+    f.icursor(3)
+    check(panel._key_merge(second, -1) is None, "...elsewhere Backspace just edits the text")
+    f.icursor(len(f.get()))
+    panel._key_merge(second, 1); run_afters()
+    check(len(ctl.track_marks(tr["id"])) == 1 and "again" in ctl.mark_by_id(second)["label"],
+          "Delete at the end merges with the next card")
+    ctl.cursor_time = 2.0
+    panel.cards[second]["text"].fire("<Control-bracketleft>", Event())
+    check(ctl.mark_by_id(second)["start"] == 2.0, "Ctrl+[ sets Start to the @cursor")
+    panel._key_play(second, loop=False)
+    check(ctl._play_state == "playing" and ctl._play_mark_id == second, "Ctrl+Space plays the card")
+    panel._key_play(second, loop=False)
+    check(ctl._play_state == "paused", "...and pauses it")
+    ctl.stop_play()
+    check("Ctrl+Enter" in panel.KEY_HELP and "Ctrl+Space" in panel.KEY_HELP, "the keys are listed for the tooltips/help")
+
+    # Beats: pure helpers
+    beats = [round(0.5 * i, 3) for i in range(40)]              # 120 BPM
+    strength = [1.0] * 40
+    bass = [3.0 if i % 4 == 1 else 0.2 for i in range(40)]      # bar starts at beat index 1
+    phase = th.downbeat_phase(strength, bass, 4)
+    check(phase == 1, "the bar start is guessed from the bass at each beat")
+    all_b = th.beat_marks(beats, 2.0, 6.0, 4, phase, "beats")
+    check([m["label"] for m in all_b] == ["4", "1", "2", "3", "4", "1", "2", "3"] and all_b[0]["end"] == 2.5,
+          "All beats: beat numbers in the bar, each lasting until the next beat")
+    down = th.beat_marks(beats, 0.0, 20.0, 4, phase, "beat", 1)
+    check(all(m["label"] == "1" for m in down) and abs(down[0]["end"] - down[0]["start"] - 0.5) < 1e-9
+          and down[0]["start"] == 0.5, "Downbeats: only beat 1, one beat long")
+    bars = th.beat_marks(beats, 0.0, 20.0, 4, phase, "bars")
+    check([m["label"] for m in bars[:3]] == ["1", "2", "3"] and abs(bars[0]["end"] - bars[0]["start"] - 2.0) < 1e-9,
+          "Bars: numbered from 1, each a whole bar")
+    check(th.parse_interval("120 bpm") == 0.5 and th.parse_interval("0.25") == 0.25
+          and th.parse_interval("500 ms") == 0.5 and th.parse_interval("90") == 60 / 90
+          and th.parse_interval("x") is None, "metronome intervals: seconds, ms or BPM")
+    met = th.metronome_marks(1.0, 3.0, 0.5, 4)
+    check([m["start"] for m in met] == [1.0, 1.5, 2.0, 2.5] and [m["label"] for m in met] == ["1", "2", "3", "4"],
+          "metronome ticks from the start, labeled like beats")
+    check(th.numbering_cycle(["3", "4", "1", "2", "3"]) == 4 and th.numbering_cycle(["1", "2", "3"]) == 0
+          and th.numbering_cycle(["a"]) is None, "Beats tracks count 1..N and wrap; Bars just count up")
+    check(th.renumber_from(["1", "2", "3", "4"], 1, 7) == ["1", "7", "8", "9"]
+          and th.renumber_from(["1", "2", "3", "4"], 0, 3, cycle=4) == ["3", "4", "1", "2"], "renumbering")
+    check(th.unique_track_name("Beats", ["Beats", "Beats 2"]) == "Beats 3", "new track names don't collide")
+
+    # Beats: UI flow with a stand-in detector
+    ctl2, c2, _t2, _tab2 = bare_controller(wt, fresh_copy(media, "r15_beats"), 20.0)
+    real_avail, real_detect = aa.beats_available, aa.detect_beats
+    aa.beats_available = lambda: True
+    calls = {"n": 0}
+
+    def fake_detect(path, progress=None):
+        calls["n"] += 1
+        return {"tempo": 120.0, "beats": beats, "strength": strength, "bass": bass}
+    aa.detect_beats = fake_detect
+    try:
+        ctl2.cursor_time = 4.0
+        ctl2.run_beats("bars"); run_afters()
+        names = [t["name"] for t in ctl2.tracks]
+        bars_tr = ctl2.tracks[-1]
+        check(names == ["Bars"] and ctl2.track_marks(bars_tr["id"])[0]["start"] >= 4.0,
+              "Beats \u25be > Bars makes a \u201cBars\u201d track from the @cursor on")
+        ctl2.run_beats("beats"); run_afters()
+        check(calls["n"] == 1 and ctl2.tracks[-1]["name"] == "Beats", "...beat detection runs once per file")
+        rng = ctl2._add_mark("range", 2.0, 4.0)
+        ctl2.selected = ("mark", rng["id"])
+        ctl2.run_beats("beat", 3); run_afters()
+        m3 = ctl2.track_marks(ctl2.tracks[-1]["id"])
+        check(ctl2.tracks[-1]["name"] == "Beat 3" and m3 and all(2.0 <= m["start"] < 4.0 for m in m3),
+              "Beat N uses the selected range; the track is named for the choice")
+        ctl2.selected = None
+        ctl2.cursor_time = 10.0
+        met_tr = ctl2.run_metronome("120 bpm")
+        check(met_tr["name"] == "Metronome 120 BPM" and ctl2.track_marks(met_tr["id"])[0]["start"] == 10.0,
+              "Metronome makes \u201cMetronome 120 BPM\u201d from the @cursor")
+        ctl2.beats_menu.entries.clear(); ctl2._fill_beats_menu()
+        labels = ctl2.beats_menu.labels()
+        check(any(l.startswith("All beats") for l in labels) and any(l.startswith("Bars") for l in labels)
+              and "Metronome..." in labels and any(l.startswith("Beats per bar") for l in labels),
+              "the Beats \u25be menu lists all beats, downbeats, beat N, bars, metronome, beats per bar")
+        bm = ctl2.track_marks(bars_tr["id"])
+        ctl2.renumber_from_mark(bm[1]["id"], first=10)
+        check([m["label"] for m in sorted(ctl2.track_marks(bars_tr["id"]), key=lambda m: m["start"])][:3]
+              == ["1", "10", "11"], "Renumber from Here counts up from the chosen number")
+        aa.beats_available = lambda: False
+        ctl2.beats_menu.entries.clear(); ctl2._fill_beats_menu()
+        check(any("Install" in l for l in ctl2.beats_menu.labels()), "without librosa the menu points to Install")
+    finally:
+        aa.beats_available, aa.detect_beats = real_avail, real_detect
+
+    # Copy Track
+    n_before = len(ctl2.marks)
+    copy_tr = ctl2.copy_track(bars_tr)
+    check(copy_tr["name"] == "Bars copy" and len(ctl2.track_marks(copy_tr["id"])) == len(ctl2.track_marks(bars_tr["id"]))
+          and len(ctl2.marks) == n_before + len(ctl2.track_marks(bars_tr["id"])), "Copy Track duplicates a track")
+    ctl2.undo_marks()
+    check(ctl2.track_by_id(copy_tr["id"]) is None, "...in one undo step")
+
+    # singing faces
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        print("  (Pillow not installed: face tests skipped)")
+        return
+    import faces
+    img = Image.new("RGB", (100, 100), (230, 190, 160))
+    d = ImageDraw.Draw(img)
+    for x in (20, 60):
+        d.ellipse((x, 30, x + 20, 42), fill="white"); d.ellipse((x + 6, 31, x + 14, 41), fill=(30, 20, 10))
+    d.ellipse((35, 65, 65, 77), fill=(180, 60, 70))
+    out = faces.generate(img, (15, 25, 85, 47), (30, 60, 70, 82))
+    check(len(out) == 20 and set(out) == set(faces.variant_names()), "20 images: 10 mouth shapes x eyes open/closed")
+    import numpy as np
+    arr = lambda im: np.asarray(im.convert("RGB"), dtype=float)
+    mouth = (slice(60, 82), slice(30, 70))
+    diffs = {ph: np.abs(arr(out[ph + "_EyesOpen"])[mouth] - arr(img)[mouth]).mean() for ph in faces.PHONEMES}
+    check(len({round(v, 1) for v in diffs.values()}) >= 8, "each mouth shape looks different")
+    check(np.abs(arr(out["AI_EyesOpen"])[:55] - arr(img)[:55]).mean() < 1.0, "eyes-open images keep the eyes")
+    eye = (slice(28, 44), slice(20, 40))
+    check(arr(out["AI_EyesClosed"])[eye].min() > 0 and
+          (arr(out["AI_EyesClosed"])[eye] > 235).sum() < (arr(img)[eye] > 235).sum() * 0.2,
+          "eyes-closed images paint the eye whites over with skin")
+    corner = arr(out["rest_EyesOpen"])[90:, 90:]
+    check(np.abs(corner - arr(img)[90:, 90:]).max() < 1, "the rest of the picture is untouched")
+    path = os.path.join(TMP, "face.png")
+    img.save(path)
+    folder = faces.save_set(path, out, (15, 25, 85, 47), (30, 60, 70, 82))
+    check(len(list(folder.glob("face_*_Eyes*.png"))) == 20 and (folder / "README.txt").exists(),
+          "they're saved as face_<shape>_Eyes<Open|Closed>.png with a README")
+    check(faces.load_boxes(path) == ((15, 25, 85, 47), (30, 60, 70, 82)) and len(faces.load_set(path)) == 20,
+          "the boxes and images load back")
+    check(faces.clamp_box((90, 90, 300, 95), (100, 100)) == (90, 90, 100, 95)
+          and faces.clamp_box((1, 1, 2, 2), (100, 100)) is None, "boxes are kept inside the image")
+
+    # image tab: viewer + flip + pixel editor (fake Tk)
+    import image_tab
+    image_tab.messagebox = types.SimpleNamespace(askyesno=lambda *a, **k: True, showinfo=lambda *a, **k: None,
+                                                 showerror=lambda *a, **k: None)
+    for f_ in folder.glob("*"):
+        f_.unlink()
+    folder.rmdir()
+    canvas = FakeCanvas(FakeWidget())
+    viewer = image_tab.ImageViewer(canvas, path)
+    check(viewer.kind == "pil" and viewer.variants == {} and viewer.variant_var.get() == "(no faces yet)",
+          "a plain image has no faces yet")
+    viewer.set_tool("mouth")
+    viewer.scale, viewer.cx, viewer.cy, viewer.fit = 1.0, 50.0, 50.0, False
+    cw, ch = viewer.canvas_size()
+    to_c = lambda x, y: (int(cw / 2 + x - 50), int(ch / 2 + y - 50))
+    x0, y0 = to_c(30, 60); x1, y1 = to_c(70, 82)
+    viewer._on_press(Event(x=x0, y=y0)); viewer._on_drag(Event(x=x1, y=y1)); viewer._on_release(Event(x=x1, y=y1))
+    check(viewer.mouth_box == (30, 60, 70, 82) and viewer.tool is None, "dragging with Mouth \u25ad sets the mouth box")
+    viewer.eyes_box = (15, 25, 85, 47)
+    check(viewer.make_faces() and len(viewer.variants) == 20 and viewer.view_name == "AI_EyesOpen",
+          "Make faces generates, saves and shows the first image")
+    viewer.step_variant(1)
+    check(viewer.view_name == "AI_EyesClosed" and "eyes closed" in viewer.variant_var.get(), "\u25b6 steps to the next image")
+    viewer.step_variant(-1); viewer.step_variant(-1)
+    check(viewer.view_name is None and viewer.source is viewer.base, "...and back to the original")
+    viewer.toggle_flip()
+    for _ in range(3):
+        fn = AFTERS.pop() if AFTERS else None
+        if fn:
+            fn()
+    check(viewer.view_name.endswith("_EyesOpen") and "Stop" in viewer.flip_btn._cfg.get("text"),
+          "Flip steps through the mouth shapes")
+    viewer.toggle_flip()
+    check(viewer._flip_id is None, "...until clicked again")
+    AFTERS.clear()
+    viewer.show_variant("O_EyesOpen")
+    viewer.set_tool("pencil")
+    viewer.set_color((0, 255, 0))
+    viewer.paint_at(5, 5)
+    check(viewer.source.getpixel((5, 5))[:3] == (0, 255, 0) and "O_EyesOpen" in viewer._edited,
+          "the pixel editor paints the shown image")
+    viewer._on_right(Event(x=to_c(50, 50)[0], y=to_c(50, 50)[1]))
+    check(viewer.pen_color == tuple(img.getpixel((50, 50))[:3]), "right-click picks a color")
+    viewer.undo_pixels()
+    check(viewer.variants["O_EyesOpen"].getpixel((5, 5))[:3] == tuple(img.getpixel((5, 5))[:3]),
+          "Ctrl+Z undoes the stroke")
+    viewer.set_color((0, 255, 0))
+    viewer._last_px = None
+    viewer.paint_at(6, 6)
+    viewer._last_px = None
+    saved = viewer.save_edits()
+    reread = Image.open(faces.variant_path(path, "O_EyesOpen")).convert("RGB")
+    check(saved == ["O_EyesOpen"] and reread.getpixel((6, 6)) == (0, 255, 0),
+          f"Save writes the edited image ({saved}, {reread.getpixel((6, 6))})")
+    viewer2 = image_tab.ImageViewer(FakeCanvas(FakeWidget()), path)
+    check(len(viewer2.variants) == 20 and viewer2.mouth_box == (30, 60, 70, 82),
+          "reopening the image finds its faces and boxes")
+
+
+def test_round16(th, aa, wt, media):
+    print("\n-- round 16: shortcuts sheet, overlap filter, tab wrap, Home/End, status bar, shift track --")
+    import tracked
+    import timing_panel as tp
+    src = open(os.path.join(HERE, "tracked.py")).read()
+    check('label="Keyboard Shortcuts"' in src and '"<F1>"' in src, "Help > Keyboard Shortcuts (F1)")
+    keys = " ".join(k + " " + w for _sec, rows in tracked.SHORTCUTS for k, w in rows)
+    for k in ("Ctrl+Enter", "Ctrl+Space", "Home / End", "Ctrl+Play", "Ctrl+Home", "Ctrl+V"):
+        check(k in keys, f"the cheat sheet lists {k}")
+    app = types.SimpleNamespace(_shortcuts_win=None)
+    app.tk = None
+    tracked.EditorApp.show_shortcuts(types.SimpleNamespace(**{"_shortcuts_win": None}))
+    check(True, "the cheat sheet window builds")
+    check("before=self.notebook" in src, "the status bar is packed before the notebook (stays visible when resized)")
+
+    # overlap filter
+    marks = [{"id": "a", "type": "range", "start": 0.0, "end": 2.0},
+             {"id": "b", "type": "range", "start": 1.5, "end": 3.0},
+             {"id": "c", "type": "range", "start": 3.0, "end": 4.0},
+             {"id": "d", "type": "point", "start": 3.5},
+             {"id": "e", "type": "range", "start": 5.0, "end": 6.0}]
+    check(th.overlapping_ids(marks) == {"a", "b", "c", "d"}, "overlapping cards are found (touching ones aren't)")
+    ctl, c, _t, _tab = bare_controller(wt, fresh_copy(media, "r16"), 100.0)
+    tr = ctl._new_track("Lyrics")
+    ms = [ctl._add_mark("range", s_, e_, label=f"w{i}", track_id=tr["id"])
+          for i, (s_, e_) in enumerate(((1, 2), (2, 3), (2.5, 3.5), (5, 6), (7, 8)))]
+    ctl.selected = ("track", tr["id"]); ctl.render_waveform(); run_afters()
+    panel = ctl.panel
+    panel.voice_filter_var.set(tp.OVERLAPPING); panel._on_voice_filter(); run_afters()
+    check(sorted(panel.cards) == sorted([ms[1]["id"], ms[2]["id"]]), "Show: Overlapping shows only overlapping cards")
+    panel.voice_filter_var.set(tp.SHOW_ALL); panel._on_voice_filter(); run_afters()
+
+    # Tab wraps within the track, with the next card scrolled into view too
+    seen = []
+    real_see = panel._see
+    panel._see = lambda mid: seen.append(mid)
+    order = list(panel.order)
+    panel.focus_adjacent_field(order[-1], "text", 1)
+    check(FOCUS["w"] is panel.cards[order[0]]["text"].widget or FOCUS["w"] is panel.cards[order[0]]["text"],
+          "Tab on the last card wraps to the first card of the same track")
+    check(seen[-1] == order[0] and order[1] in seen, "...and scrolls it and the card after it into view")
+    panel.focus_adjacent_field(order[0], "start", -1)
+    check(FOCUS["w"] is panel.cards[order[-1]]["start"], "Shift+Tab on the first card wraps to the last")
+    seen.clear()
+    panel.focus_adjacent_field(order[1], "text", 1)
+    check(seen == [order[3], order[2]], "tabbing ahead keeps the target and the next card in view")
+    panel.focus_adjacent_field(order[2], "end", 0, absolute=-1)
+    check(FOCUS["w"] is panel.cards[order[-1]]["end"], "Ctrl+End goes to the same field of the last card")
+    panel._see = real_see
+    panel.select_end_card(last=True)
+    check(ctl.selected == ("mark", order[-1]), "End in the card list selects the last card")
+    panel.select_end_card(last=False)
+    check(ctl.selected == ("mark", order[0]), "Home selects the first")
+
+    # Home / End on the waveform
+    ctl.selected = ("mark", ms[2]["id"])
+    ctl.select_end_mark(last=True)
+    check(ctl.selected == ("mark", ms[4]["id"]), "End on the waveform: last mark of the track")
+    ctl.select_end_mark(last=False)
+    check(ctl.selected == ("mark", ms[0]["id"]), "Home: first mark of the track")
+    check("<Home>" in c._binds and "<End>" in c._binds, "Home/End are bound on the waveform")
+
+    # Shift track
+    done = ctl.shift_track(tr, 0.5)
+    check(done == 0.5 and ctl.mark_by_id(ms[0]["id"])["start"] == 1.5 and ctl.mark_by_id(ms[4]["id"])["end"] == 8.5,
+          "Shift Track moves every mark of the track")
+    done = ctl.shift_track(tr, -5.0)
+    check(abs(done + 1.5) < 1e-9 and ctl.mark_by_id(ms[0]["id"])["start"] == 0.0,
+          "...but not before 0:00 (limited, lengths kept)")
+    ctl.undo_marks()
+    check(ctl.mark_by_id(ms[0]["id"])["start"] == 1.5, "...one undo step each")
+    wt.simpledialog.askstring = lambda *a, **k: "-0.25"
+    try:
+        ctl.ask_shift_track(tr)
+    finally:
+        wt.simpledialog.askstring = lambda *a, **k: None
+    check(ctl.mark_by_id(ms[0]["id"])["start"] == 1.25, "Shift Track... asks for the seconds")
+
+
+def test_round17(th, aa, wt, media):
+    print("\n-- round 17: filter menu/note, current tab, sidecar backups, updates, image panel, launch logs --")
+    import tracked
+    import timing_panel as tp
+    import updater
+    import io, zipfile
+
+    # Show: menu groups + empty note
+    ctl, c, _t, _tab = bare_controller(wt, fresh_copy(media, "r17"), 100.0)
+    tr = ctl._new_track("Lyrics")
+    a = ctl._add_mark("range", 1.0, 2.0, label="a", track_id=tr["id"])
+    ctl.set_mark_voices(a["id"], ["Lead"])
+    ctl.selected = ("track", tr["id"]); ctl.render_waveform(); run_afters()
+    panel = ctl.panel
+    menu = FakeMenu()
+    panel._fill_filter_menu(menu)
+    kinds = [e.get("kind") for e in menu.entries]
+    check(kinds.count("separator") == 3 and [e["label"] for e in menu.entries if e.get("label")]
+          == ["All cards", "Lead", "All voices", "Overlapping"],
+          "Show: lists All cards | voices | All voices | Overlapping, with separators between the groups")
+    panel.voice_filter_var.set(tp.OVERLAPPING); panel._on_voice_filter(); run_afters()
+    check("overlap another card" in panel.empty_note() and "no marks in this track yet" not in panel.empty_note(),
+          "with a filter on, an empty list says which filter hides the cards")
+    panel.voice_filter_var.set("Lead")
+    check("are for Lead" in panel.empty_note(), "...naming the voice")
+    panel.voice_filter_var.set(tp.SHOW_ALL)
+    tr2 = ctl._new_track("Empty")
+    ctl.selected = ("track", tr2["id"]); ctl.render_waveform(); run_afters()
+    check("no marks in this track yet" in panel.empty_note(), "an empty track still says it has no marks")
+
+    # current tab survives the quit questions
+    class ET:
+        def __init__(self, n):
+            self.filepath = f"/x/{n}"
+
+        def save_current_sash(self):
+            pass
+
+        def save_cursor_state(self):
+            pass
+    tabs = [ET(n) for n in "abc"]
+    fake = types.SimpleNamespace(tabs=tabs, current_tab=lambda: tabs[2])
+    real_load, real_et, real_recent = tracked.load_session_data, tracked.EditorTab, tracked.load_recent
+    tracked.load_session_data, tracked.EditorTab, tracked.load_recent = (lambda: {}), ET, (lambda: [])
+    try:
+        data = tracked.EditorApp._collect_session(fake, active=tabs[1])
+    finally:
+        tracked.load_session_data, tracked.EditorTab, tracked.load_recent = real_load, real_et, real_recent
+    check(data["active_index"] == 1, "the session remembers the tab that was current before quitting")
+    src = open(os.path.join(HERE, "tracked.py")).read()
+    check("active = self.current_tab()" in src and "_collect_session(active=active)" in src,
+          "on_quit takes the current tab before its questions select other tabs")
+
+    # sidecar backups
+    side = os.path.join(TMP, "bak-tracked.json")
+    open(side, "w").write("{}")
+    first = th.backup_sidecar(side, stamp="20260101-000000")
+    second = th.backup_sidecar(side, stamp="20260102-000000")
+    import glob as _g
+    baks = _g.glob(os.path.join(TMP, "bak-tracked-*.json"))
+    check(first.endswith("bak-tracked-20260101-000000.json") and baks == [second],
+          "a timestamped backup (song-tracked-<date>-<time>.json); only the newest is kept")
+    check(th.backup_sidecar(os.path.join(TMP, "none.json")) is None, "no sidecar, no backup")
+    song = fresh_copy(media, "r17_bak")
+    open(th.cache_path(song), "w").write("{}")
+    wt.set_preference("backup_sidecars", True)
+    try:
+        wt._BACKED_UP.clear()
+        made = wt.backup_sidecar_once(song)
+        again = wt.backup_sidecar_once(song)
+    finally:
+        wt.set_preference("backup_sidecars", False)
+    check(made and again is None, "with the preference on, each sidecar is backed up once per run (at startup)")
+    wt._BACKED_UP.clear()
+    check(wt.backup_sidecar_once(song) is None, "...and not at all when it's off")
+
+    # updates
+    check(updater.is_newer("1.10.0", "1.9.3") and not updater.is_newer("1.2.0", "1.2")
+          and updater.is_newer("2", "1.99.99"), "version comparison is numeric")
+    check(updater.valid_repo("someone/trackED") and not updater.valid_repo("not a repo"), "repo names are checked")
+    check(updater.remote_version("o/r", fetch=lambda url: b'x = 1\nVERSION = "1.4.2"\n') == "1.4.2",
+          "the repository's version is read from its tracked.py")
+    app_dir = os.path.join(TMP, "upd_app"); os.makedirs(app_dir, exist_ok=True)
+    open(os.path.join(app_dir, "a.py"), "w").write("old")
+    open(os.path.join(app_dir, "same.txt"), "w").write("same")
+    open(os.path.join(app_dir, "mine.txt"), "w").write("keep")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("trackED-main/a.py", "new")
+        zf.writestr("trackED-main/same.txt", "same")
+        zf.writestr("trackED-main/sub/b.md", "doc")
+        zf.writestr("trackED-main/.git/config", "x")
+        zf.writestr("trackED-main/../evil.py", "x")
+    changed, backup = updater.apply_zip(buf.getvalue(), app_dir, backup_root=os.path.join(TMP, "upd_bak"))
+    check(sorted(changed) == ["a.py", "sub/b.md"] and open(os.path.join(app_dir, "a.py")).read() == "new"
+          and open(os.path.join(app_dir, "mine.txt")).read() == "keep",
+          "updating writes changed files only and leaves the user's other files")
+    check(backup and open(os.path.join(backup, "a.py")).read() == "old", "...after backing up what it replaces")
+    check(not os.path.exists(os.path.join(TMP, "evil.py")), "...and never writes outside the app folder")
+    check(updater.needs_restart(changed) and not updater.needs_restart(["sub/b.md"]), "a restart is offered for .py changes")
+
+    # image panel grows when zooming in (up to 75% of the window)
+    try:
+        from PIL import Image
+    except ImportError:
+        Image = None
+    import image_tab
+    if Image is not None:
+        path = os.path.join(TMP, "tall.png")
+        Image.new("RGB", (100, 400), (10, 20, 30)).save(path)
+        sash = {"pos": 200}
+        paned = types.SimpleNamespace(sashpos=lambda i, v=None: sash.update(pos=v) if v is not None else sash["pos"],
+                                      winfo_height=lambda: 900)
+        tab = types.SimpleNamespace(paned=paned)
+        canvas = FakeCanvas(FakeWidget())
+        canvas.winfo_toplevel = lambda: types.SimpleNamespace(winfo_height=lambda: 1000)
+        viewer = image_tab.ImageViewer(canvas, path, tab=tab)
+        viewer.set_scale(1.0)
+        grew_to = sash["pos"]
+        viewer.set_scale(4.0)
+        check(grew_to > 200 and sash["pos"] == 750, "zooming in grows the image panel, up to 75% of the window")
+        sash["pos"] = 800
+        viewer.set_scale(0.5)
+        check(sash["pos"] == 800, "...and never shrinks it")
+    real = image_tab._pillow_installed
+    image_tab._pillow_installed = lambda: False
+    try:
+        jpg = os.path.join(TMP, "x.jpg")
+        open(jpg, "wb").write(b"not really")
+        v = image_tab.ImageViewer.__new__(image_tab.ImageViewer)
+        v.canvas, v.kind, v.source, v.image_size = FakeCanvas(FakeWidget()), None, None, (0, 0)
+        v.canvas._plugin_toolbars = []
+        v._build_toolbar()
+        check(getattr(v, "install_btn", None) is not None and "Install" in v.install_btn._cfg.get("text", ""),
+              "the image tab shows an \u26a0 Install button when Pillow is missing")
+    finally:
+        image_tab._pillow_installed = real
+
+    # launch diagnostics
+    real_out, real_err = sys.stdout, sys.stderr
+    home = os.environ.get("HOME")
+    os.environ["HOME"] = TMP
+    try:
+        sys.stderr = None
+        log = tracked.capture_output_if_windowless()
+        sys.stderr.write("boom\n")
+        sys.stderr.flush()
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
+        if home is not None:
+            os.environ["HOME"] = home
+    check(log and "boom" in open(log).read(), "without a console (pythonw), errors go to ~/.tracked/console.log")
+    cmd = open(os.path.join(HERE, "trackED.cmd"), newline="").read()
+    check("--check" in cmd and "--console" in cmd and "\r\n" in cmd, "trackED.cmd has --check / --console (CRLF kept)")
+
+
+def test_round18(th, aa, wt, media):
+    print("\n-- round 18: install progress, image backdrop/overlay, Faces menu, flip order --")
+    import deps
+    # deps.install: one package at a time, with start/ok/failed steps
+    steps = []
+    real_run = deps._run
+    deps._run = lambda cmd, log, timeout=3600: (0 if "librosa" in cmd else 1, "error")
+    try:
+        ok, failed = deps.install(["librosa", "demucs"], on_step=lambda k, st: steps.append((k, st)))
+    finally:
+        deps._run = real_run
+    check(steps == [("librosa", "start"), ("librosa", "ok"), ("demucs", "start"), ("demucs", "failed")]
+          and ok == ["librosa"] and [k for k, _ in failed] == ["demucs"],
+          "packages install one at a time, reporting start / ok / failed for each")
+
+    # the dialog: highlight while installing, then the result + Restart in the window
+    canvas = FakeCanvas(FakeWidget())
+    real_missing = deps.missing
+    deps.missing = lambda include_broken=False: [deps.BY_KEY["librosa"], deps.BY_KEY["demucs"]]
+    restarts = []
+    try:
+        dlg = wt.InstallDialog(canvas, restart=lambda: restarts.append(1))
+    finally:
+        deps.missing = real_missing
+    dlg._row_state("librosa", "start")
+    check(all(w._cfg.get("bg") == wt.DLG_BUSY_BG for w in dlg.rows["librosa"])
+          and dlg.rows["librosa"][3]._cfg.get("text") == "installing...",
+          "the package being installed is highlighted")
+    dlg._row_state("librosa", "ok")
+    check(dlg.rows["librosa"][0]._cfg.get("bg") == wt.DLG_BG and "\u2713" in dlg.rows["librosa"][3]._cfg["text"]
+          and dlg.vars["librosa"].get() is False and dlg.rows["librosa"][0]._cfg.get("state") == "disabled",
+          "...then marked \u2713 installed (unchecked, no longer selectable)")
+    dlg._row_state("demucs", "failed")
+    check("\u2717" in dlg.rows["demucs"][3]._cfg["text"], "a failed one is marked \u2717")
+    dlg._finished(["librosa"], [("demucs", "x")])
+    check("Installed: librosa" in dlg.header._cfg["text"] and "Restart" in dlg.header._cfg["text"]
+          and dlg.restart_btn.packed, "the window itself says what was installed and offers Restart")
+    dlg.restart_btn._cfg["command"]()
+    check(restarts == [1], "...which restarts trackED")
+
+    try:
+        from PIL import Image
+    except ImportError:
+        return
+    import image_tab, faces
+    path = os.path.join(TMP, "r18.png")
+    img = Image.new("RGBA", (20, 20), (200, 150, 120, 255))
+    img.putpixel((3, 4), (10, 20, 30, 128))
+    img.save(path)
+    canvas = FakeCanvas(FakeWidget())
+    v = image_tab.ImageViewer(canvas, path)
+    v.fit, v.scale, v.cx, v.cy = False, 10.0, 10.0, 10.0
+    v.redraw()
+    tags = [it.get("tags") for it in canvas.items] if hasattr(canvas, "items") else []
+    bg_lines = canvas.find_withtag("plugin_bg") if hasattr(canvas, "find_withtag") else []
+    check(v.BACKDROP and callable(v._draw_backdrop), "a light gray grid is drawn behind the image")
+    xs, ys = v._grid_lines(1, 0, 0, 400, 300)
+    check(len(xs) > 10 and abs((xs[1] - xs[0]) - 10.0) < 1e-6, "...its lines fall on the image's pixel boundaries")
+    v.scale = 0.5
+    step = 1
+    while step * v.scale < 8:
+        step *= 2
+    check(step == 16, "...every few pixels when zoomed out (lines at least 8 px apart)")
+    v.scale = 10.0
+    cw, ch = v.canvas_size()
+    x, y = v.to_canvas(3.5, 4.5)
+    v._on_motion(Event(x=x, y=y))
+    check(v.coords_text().startswith("x 3  y 4  #0a141e") and "a128" in v.coords_text(),
+          "the pointer's pixel coordinates (and color) show along the bottom")
+    v._on_leave()
+    check(v.coords_text() == "", "...and clear when the pointer leaves")
+    v.set_tool("pencil")
+    check("Pixel editor on" in v.status_msg, "messages show along the bottom of the image area (not cut off)")
+    labels = v.faces_menu.labels() if hasattr(v.faces_menu, "labels") else [e.get("label") for e in v.faces_menu.entries]
+    check(any(l.startswith("Mark eyes") for l in labels) and any(l.startswith("Mark mouth") for l in labels)
+          and "Make faces" in labels, "Faces \u25be holds Mark eyes, Mark mouth and Make faces")
+    image_tab.messagebox = types.SimpleNamespace(askyesno=lambda *a, **k: True, showinfo=lambda *a, **k: None,
+                                                 showerror=lambda *a, **k: None)
+    v.set_tool(None)
+    v.mouth_box, v.eyes_box = (5, 12, 15, 18), (3, 3, 17, 9)
+    v.make_faces(confirm=False)
+    check(v.view_name is not None, "after Make faces a face image is shown")
+    v.mark("eyes")
+    check(v.view_name is None and v.tool == "eyes", "Mark eyes again goes back to the original, where the boxes show")
+    v.toggle_flip()
+    seen = []
+    for _ in range(len(v.variants)):
+        fn = AFTERS.pop() if AFTERS else None
+        seen.append(v.view_name)
+        if fn:
+            fn()
+    v.toggle_flip(); AFTERS.clear()
+    n_open = len([n for n in v.variants if n.endswith("_EyesOpen")])
+    check(all(n.endswith("_EyesOpen") for n in seen[:n_open]) and all(n.endswith("_EyesClosed") for n in seen[n_open:]),
+          "Flip shows the eyes-open images first, then the eyes-closed ones")
+    import shutil as _sh
+    _sh.rmtree(faces.faces_dir(path), ignore_errors=True)
+
+
+def test_round19(th, aa, wt, media):
+    print("\n-- round 19: reversible merges (Unmerge), default update repo, Auto-browse --")
+    ctl, c, _t, _tab = bare_controller(wt, fresh_copy(media, "r19"), 100.0)
+    tr = ctl._new_track("Lyrics")
+    specs = [(1.0, 2.0, "one"), (2.2, 3.0, "two"), (3.0, 4.5, "three four")]
+    ms = [ctl._add_mark("range", a, b, label=t, track_id=tr["id"]) for a, b, t in specs]
+    ctl.set_mark_voices(ms[1]["id"], ["Lead"])
+    ctl.merge_mark_by_id(ms[0]["id"], 1)
+    ctl.merge_mark_by_id(ms[0]["id"], 1)
+    merged = ctl.mark_by_id(ms[0]["id"])
+    check(len(ctl.track_marks(tr["id"])) == 1 and len(merged["pieces"]) == 3,
+          "a merged card remembers the cards it was made of (merges of merges too)")
+    ctl._add_mark("point", 50.0, None)                      # other work in between: not an undo
+    n, how = ctl.unmerge_mark_by_id(ms[0]["id"])
+    back = sorted(ctl.track_marks(tr["id"]), key=lambda m: m["start"])
+    check(n == 3 and how == "exact" and [(m["start"], m["end"], m["label"]) for m in back] == specs,
+          "Unmerge brings back the original cards with their own start/end times and text")
+    check(back[1].get("voices") == ["Lead"] and "pieces" not in back[0], "...and their voices")
+    check(len(ctl.marks) == 4, "...without undoing the other edits made since")
+    # merge, then move + edit text, then unmerge
+    ctl.merge_mark_by_id(back[0]["id"], 1)
+    m = ctl.mark_by_id(back[0]["id"])
+    m["start"], m["end"] = 11.0, 13.0                      # was 1.0 .. 3.0, now 2 s long from 11 s
+    m["label"] = "uno dos"
+    n, how = ctl.unmerge_mark_by_id(m["id"])
+    parts = sorted((x for x in ctl.track_marks(tr["id"]) if x["start"] >= 11.0), key=lambda x: x["start"])
+    check(how == "moved+text" and [(p["start"], p["end"]) for p in parts] == [(11.0, 12.0), (12.2, 13.0)]
+          and [p["label"] for p in parts] == ["uno", "dos"],
+          "after the card was moved/resized, the original boundaries are fitted into its new span")
+    plan, how = th.unmerge_plan({"start": 0.0, "end": 2.0, "label": "a b c",
+                                 "pieces": [{"start": 0.0, "end": 1.0, "label": "x"},
+                                            {"start": 1.0, "end": 2.0, "label": "y"}]})
+    check(how == "text" and [p["label"] for p in plan] == ["a", "b c"] or [p["label"] for p in plan] == ["a b", "c"],
+          "edited text with a different word count is shared out in proportion")
+    check(th.unmerge_plan({"start": 0, "end": 1, "label": "x"}) == ([], ""), "a card that wasn't merged has no plan")
+    # a merged card split by hand keeps the pieces on each side
+    a2 = ctl._add_mark("range", 20.0, 21.0, label="aa", track_id=tr["id"])
+    b2 = ctl._add_mark("range", 21.0, 22.0, label="bb", track_id=tr["id"])
+    c2 = ctl._add_mark("range", 22.0, 23.0, label="cc", track_id=tr["id"])
+    d2 = ctl._add_mark("range", 23.0, 24.0, label="dd", track_id=tr["id"])
+    for _ in range(3):
+        ctl.merge_mark_by_id(a2["id"], 1)
+    ctl.split_mark_by_id(a2["id"], at_time=22.0)
+    left = ctl.mark_by_id(a2["id"])
+    right = next(m for m in ctl.track_marks(tr["id"]) if m["start"] == 22.0)
+    check(len(left["pieces"]) == 2 and len(right["pieces"]) == 2, "splitting a merged card shares its pieces out")
+    ctl.unmerge_mark_by_id(right["id"])
+    check(sorted(m["label"] for m in ctl.track_marks(tr["id"]) if m["start"] >= 22.0) == ["cc", "dd"],
+          "...so each part can still be unmerged")
+    # the menus offer it
+    ctl.selected = ("track", tr["id"]); ctl.render_waveform(); run_afters()
+    menu = FakeMenu()
+    ctl.panel._split_ctx = None
+    if hasattr(ctl.panel, "_fill_split_menu"):
+        ctl.panel._fill_split_menu(left["id"], menu)
+        check(any(l.startswith("Unmerge into the 2") for l in menu.labels()), "Split \u25be offers Unmerge")
+    ctl.mark_by_id(a2["id"])["pieces"] and ctl.unmerge_mark_by_id(a2["id"])
+    ctl.undo_marks()
+    check(len(ctl.mark_by_id(a2["id"]).get("pieces") or []) == 2, "Unmerge is one undo step")
+    th.save_marks(ctl.filepath, ctl.marks, ctl.tracks, ctl.voices)
+    saved = th.load_cache(ctl.filepath)["marks"]
+    check(any(len(m.get("pieces") or []) == 2 for m in saved), "the remembered pieces are saved with the marks")
+
+    # default update repo
+    import updater
+    app = os.path.join(TMP, "gitclone"); os.makedirs(os.path.join(app, ".git"), exist_ok=True)
+    open(os.path.join(app, ".git", "config"), "w").write(
+        '[core]\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:someone/trackED.git\n')
+    check(updater.repo_from_git(app) == "someone/trackED", "a git clone finds its GitHub repository by itself")
+    check(updater.default_repo("me/fork", app) == "me/fork", "the Preferences setting wins")
+    real = updater.UPDATE_REPO
+    updater.UPDATE_REPO = "official/trackED"
+    try:
+        check(updater.default_repo("", os.path.join(TMP, "nogit")) == "official/trackED",
+              "otherwise the UPDATE_REPO constant")
+    finally:
+        updater.UPDATE_REPO = real
+    src = open(os.path.join(HERE, "image_tab.py")).read()
+    check("Auto-browse" in src and '"Flip"' not in src, "the image tab's Flip button is now \u25b6 Auto-browse")
+
+
+def test_round20(th, aa, wt, media):
+    print("\n-- round 20: unmerge after copy/clear, shift to @cursor, selection menu, group restore, @ Ctrl+click --")
+    ctl, c, _t, tab = bare_controller(wt, fresh_copy(media, "r20"), 100.0)
+    tr = ctl._new_track("Lyrics")
+    specs = [(1.0, 2.0, "one"), (2.0, 3.0, "two"), (3.0, 4.0, "three")]
+    ms = [ctl._add_mark("range", a, b, label=t, track_id=tr["id"]) for a, b, t in specs]
+    ctl.merge_mark_by_id(ms[0]["id"], 1); ctl.merge_mark_by_id(ms[0]["id"], 1)
+    merged = ctl.mark_by_id(ms[0]["id"])
+    # Copy to a new track, then unmerge there
+    ctl.selected = ("mark", merged["id"]); ctl._multi = []
+    copies = ctl.move_selection_to_track(ctl._new_track("Copy", record_history=False)["id"], [merged["id"]], keep=True)
+    n, how = ctl.unmerge_mark_by_id(copies[0]["id"])
+    got = sorted((m["start"], m["end"], m["label"]) for m in ctl.marks if m.get("track_id") == copies[0]["track_id"])
+    check(n == 3 and how == "exact" and got == specs, "a copied merged card unmerges into the original times")
+    # pasted at the @cursor: the originals move with it
+    ctl.copy_selection([merged["id"]])
+    ctl.cursor_time = 50.0
+    pasted = ctl.paste_marks(tr["id"], at_cursor=True)
+    n, how = ctl.unmerge_mark_by_id(pasted[0]["id"])
+    got = sorted((m["start"], m["end"]) for m in ctl.marks if m["start"] >= 50.0)
+    check(how == "exact" and got == [(50.0, 51.0), (51.0, 52.0), (52.0, 53.0)], "...also when pasted elsewhere")
+    # End cleared / set onto Start: originals keep their lengths (not all on one instant)
+    merged["end"] = None; merged["type"] = "point"
+    plan, how = th.unmerge_plan(merged)
+    check([(p["start"], p["end"]) for p in plan] == [(1.0, 2.0), (2.0, 3.0), (3.0, 4.0)],
+          "a merged card whose End was cleared doesn't collapse its cards onto one time")
+    merged["end"] = 1.0; merged["type"] = "range"
+    plan, _ = th.unmerge_plan(merged)
+    check(len({p["start"] for p in plan}) == 3, "...nor one whose End was set onto its Start")
+    merged["end"] = 4.0
+
+    # shift the selection so the first selected mark starts at the @cursor
+    ctl2, c2, _t2, _tab2 = bare_controller(wt, fresh_copy(media, "r20b"), 100.0)
+    t2 = ctl2._new_track("T")
+    xs = [ctl2._add_mark("range", float(s_), s_ + 0.5, label=str(s_), track_id=t2["id"]) for s_ in (2, 4, 6, 8)]
+    ctl2.selected = ("mark", xs[2]["id"]); ctl2._multi = [xs[1]["id"], xs[2]["id"]]
+    ctl2.cursor_time = 10.0
+    ctl2.shift_selection_to_cursor()
+    check(ctl2.mark_by_id(xs[1]["id"])["start"] == 10.0 and ctl2.mark_by_id(xs[2]["id"])["start"] == 12.0
+          and ctl2.mark_by_id(xs[0]["id"])["start"] == 2.0, "Shift to @cursor: the first selected starts there, the rest follow")
+    ctl2.undo_marks()
+    ctl2.cursor_time = 3.0
+    ctl2.shift_track_to_cursor(t2)
+    check([ctl2.mark_by_id(x["id"])["start"] for x in xs] == [1.0, 3.0, 5.0, 7.0],
+          "Shift Track to @cursor: the whole track moves so its first selected mark starts there")
+    check(ctl2.shift_marks([xs[0]["id"]], -50.0) == -1.0 and ctl2.mark_by_id(xs[0]["id"])["start"] == 0.0,
+          "shifts stop at 0:00")
+    captured = []
+    orig = wt.tk.Menu
+
+    class Capture(orig):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            captured.append(self)
+    wt.tk.Menu = Capture
+    try:
+        ctl2.selected = ("mark", xs[2]["id"]); ctl2._multi = [xs[1]["id"], xs[2]["id"]]
+        ctl2.show_selection_menu(Event(x_root=0, y_root=0))
+        labels = captured[0].labels()
+        captured.clear()
+        ctl2._show_track_menu(t2, Event(x_root=0, y_root=0))
+        tlabels = captured[0].labels()
+    finally:
+        wt.tk.Menu = orig
+    check(any(l.startswith("Shift 2 Marks to @cursor") for l in labels) and "Shift 2 Marks..." in labels
+          and "Move 2 Marks to Track" in labels and "Delete 2 Marks" in labels,
+          "right-clicking selected cards offers shift / cut / copy / move / delete for all of them")
+    check(any(l.startswith("Shift Track to @cursor") for l in tlabels) and any(l.startswith("Shift 2 Marks") for l in tlabels),
+          "the track menu offers Shift Track to @cursor and shifting the selected marks")
+
+    # the card editor: Ctrl+click selects more cards, right-click shows that menu
+    ctl2.selected = ("track", t2["id"]); ctl2._multi = []; ctl2.render_waveform(); run_afters()
+    panel = ctl2.panel
+    ctl2.select_mark(xs[0]["id"], from_panel=True)
+    panel._extend(xs[3]["id"], toggle=True)
+    check(set(ctl2.selected_mark_ids()) == {xs[0]["id"], xs[3]["id"]}, "Ctrl+click on cards selects several")
+    shown = []
+    real = ctl2.show_selection_menu
+    ctl2.show_selection_menu = lambda ev, ids=None: shown.append(list(ctl2.selected_mark_ids()))
+    panel._card_menu(xs[3]["id"], Event(x_root=0, y_root=0))
+    panel._card_menu(xs[1]["id"], Event(x_root=0, y_root=0))
+    ctl2.show_selection_menu = real
+    check(len(shown[0]) == 2 and shown[1] == [xs[1]["id"]],
+          "right-click on a selected card: menu for the group; on another card: for it alone")
+
+    # several selected cards are remembered for the next start
+    ctl2.select_mark(xs[0]["id"], from_panel=True)
+    panel._extend(xs[2]["id"], toggle=False)
+    group = list(ctl2.selected_mark_ids())
+    ctl2.save_marks_now()
+    ctl2.remember_selection()
+    ctl3, _c3, _t3, _tab3 = bare_controller(wt, ctl2.filepath, 100.0)
+    ctl3._restore_selection(reveal=False)
+    check(len(group) == 3 and ctl3.selected_mark_ids() == group, "all the selected cards are selected again after a restart")
+
+    # Ctrl+click on a card's @: the @cursor goes to its Start / End
+    card = panel.cards[xs[1]["id"]]
+    check("<Control-Button-1>" in card["end_at"]._binds, "Ctrl+click on @ is bound")
+    panel._cursor_to(xs[1]["id"], "end")
+    check(abs(ctl2.cursor_time - ctl2.mark_by_id(xs[1]["id"])["end"]) < 1e-9, "Ctrl+click on End's @ puts the @cursor there")
+    panel._cursor_to(xs[1]["id"], "start")
+    check(abs(ctl2.cursor_time - ctl2.mark_by_id(xs[1]["id"])["start"]) < 1e-9, "...and on Start's @ at the start")
+
+    # a new track gets room
+    sash = {"pos": 200}
+    ctl2.tab = types.SimpleNamespace(paned=types.SimpleNamespace(
+        sashpos=lambda i, v=None: sash.update(pos=v) if v is not None else sash["pos"]), mark_dirty=lambda: None)
+    c2.winfo_height = lambda: 120
+    c2.winfo_toplevel = lambda: types.SimpleNamespace(winfo_height=lambda: 1000)
+    for k in range(4):
+        ctl2._new_track(f"extra {k}", record_history=False)
+    ctl2._ensure_tracks_fit()
+    need = 60 + ctl2.STATUS_ROW_HEIGHT + len(ctl2.tracks) * ctl2.TRACK_HEIGHT + 4
+    check(sash["pos"] == 200 + need - 120, "a new track grows the waveform panel so every band is visible")
+
+
+def test_round21(th, aa, wt, media):
+    print("\n-- round 21: user action log, backup names, debug.log last, Beats messages --")
+    import tracked
+    # backup names
+    check(th.backup_name("/m/song-tracked.json", "20261003-141500") == "/m/song-tracked-20261003-141500.json",
+          "backups are named song-tracked-20261003-141500.json")
+    other = os.path.join(TMP, "keep-tracked.json"); open(other, "w").write("{}")
+    th.backup_sidecar(os.path.join(TMP, "bak-tracked.json"), stamp="20260103-000000")
+    check(os.path.exists(other), "...and cleaning up old backups touches nothing else")
+
+    # user action log
+    logged = []
+    real_debug = tracked.debug
+    tracked.debug = lambda level, msg, **k: logged.append((level, msg))
+    tracked.LOG_ACTIONS_CLI["on"] = True
+    try:
+        root = FakeWidget()
+        root.after = lambda ms, fn: AFTERS.append(fn) or len(AFTERS)
+        root.after_cancel = lambda i: None
+        root.bind_class = lambda *a, **k: None
+        log = tracked.UserActionLog(root)
+
+        class W:
+            def __init__(self, cls, text="", path=".tab.card.start"):
+                self._cls, self._text, self._path = cls, text, path
+
+            def winfo_class(self):
+                return self._cls
+
+            def cget(self, k):
+                return self._text
+
+            def __str__(self):
+                return self._path
+        entry, btn, canvas = W("Entry"), W("Button", "Save"), W("Canvas", path=".tab.waveform")
+        for ch in "hi":
+            log.on_key(types.SimpleNamespace(char=ch, keysym=ch, state=0, widget=entry))
+        log.on_key(types.SimpleNamespace(char="\x13", keysym="s", state=0x0004, widget=entry))
+        log.on_button(types.SimpleNamespace(num=1, state=0, widget=btn, x=1, y=2))
+        log.on_button(types.SimpleNamespace(num=3, state=0x0004, widget=canvas, x=10, y=20))
+        log.on_key(types.SimpleNamespace(char="", keysym="Shift_L", state=0, widget=entry))
+        log._menu_label = "Copy Track"
+        log.on_menu_pick(types.SimpleNamespace(widget=None))
+        lines = [m for lv, m in logged]
+        check(all(lv == tracked.USER_ACTION_LEVEL for lv, _ in logged) and all(m.startswith("ACTION ") for m in lines),
+              "user actions go to the debug log as ACTION lines at their own level")
+        check(lines[0] == "ACTION typed 'hi' in Entry (card.start)", "typing is gathered into one line per field")
+        check(lines[1] == "ACTION key Ctrl+s in Entry (card.start)", "keys with modifiers are named")
+        check(lines[2] == "ACTION click on Button 'Save'", "clicks name the button")
+        check(lines[3] == "ACTION Ctrl+right-click on Canvas (tab.waveform) at 10,20", "...and where on a canvas")
+        check(lines[4] == "ACTION menu pick 'Copy Track'" and len(lines) == 5,
+              "menu picks are logged; lone modifier keys aren't")
+        tracked.LOG_ACTIONS_CLI["on"] = False
+        logged.clear()
+        log.on_button(types.SimpleNamespace(num=1, state=0, widget=btn, x=0, y=0))
+        check(logged == [], "nothing is logged while the setting is off")
+    finally:
+        tracked.debug = real_debug
+        tracked.LOG_ACTIONS_CLI["on"] = None
+    check(tracked.parse_args(["t.py", "-actions"]) is not None and tracked.LOG_ACTIONS_CLI["on"] is True,
+          "-actions turns it on for one run")
+    tracked.LOG_ACTIONS_CLI["on"] = None
+
+    # debug.log opened as a file is kept right-most
+    log_path = str(tracked.debug_log_path())
+    a, b = types.SimpleNamespace(filepath="/x/a.txt", frame="f_a"), types.SimpleNamespace(filepath=log_path, frame="f_log")
+    c_ = types.SimpleNamespace(filepath="/x/c.txt", frame="f_c")
+    order = ["f_a", "f_log", "f_c"]
+    nb = types.SimpleNamespace(tabs=lambda: list(order),
+                               insert=lambda where, child: (order.remove(child), order.append(child)))
+    app = types.SimpleNamespace(tabs=[a, b, c_], notebook=nb, _debug_tab=None)
+    app._debug_log_tab = lambda: tracked.EditorApp._debug_log_tab(app)
+    tracked.EditorApp._keep_debug_last(app)
+    check(order[-1] == "f_log" and app.tabs[-1] is b, "debug.log opened as a file is moved to the right-most tab")
+
+    # Beats: a range with no beat says why
+    ctl, c, _t, _tab = bare_controller(wt, fresh_copy(media, "r21"), 20.0)
+    infos = []
+    ctl.append_info = lambda t: infos.append(t)
+    rng = ctl._add_mark("range", 5.1, 5.3, label="short card")
+    ctl.selected = ("mark", rng["id"])
+    ctl._beat_range_why = ctl.analysis_range_why()[2]
+    beats = [0.5 * i for i in range(40)]
+    out = ctl._make_beat_track({"beats": beats, "strength": [1.0] * 40, "bass": [1.0] * 40, "tempo": 120.0},
+                               "beat", 1, 5.1, 5.3)
+    check(out is None and "No track made" in infos[-1] and "the selected range" in infos[-1]
+          and "Esc" in infos[-1], "when no track can be made, the panel says which range was used and why")
+
+
+def test_round22(th, aa, wt, media):
+    print("\n-- round 22: export folder/confirm/status, card actions in the mark menus --")
+    from pathlib import Path
+    ctl, c, _t, _tab = bare_controller(wt, fresh_copy(media, "r22"), 100.0)
+    tr = ctl._new_track("Lyrics")
+    ms = [ctl._add_mark("range", float(i), i + 1.0, label=f"w{i} x{i}", track_id=tr["id"]) for i in range(1, 5)]
+    seen = {}
+    out = os.path.join(TMP, "r22-out.xtiming")
+    real = wt.filedialog.asksaveasfilename
+    wt.filedialog.asksaveasfilename = lambda **k: (seen.update(k), out)[1]
+    try:
+        ok = ctl.export_timing_track(tr)
+    finally:
+        wt.filedialog.asksaveasfilename = real
+    check(seen.get("initialdir") == str(Path(ctl.filepath).resolve().parent) and seen.get("confirmoverwrite") is True,
+          "exports open in the audio file's folder and ask before replacing a file")
+    check(ok and os.path.exists(out) and "Exported 1 timing track to r22-out.xtiming" in ctl.play_status_var.get(),
+          "a successful export says so in the status bar")
+    statuses = []
+    c.winfo_toplevel = lambda: types.SimpleNamespace(set_status=lambda m: statuses.append(m))
+    ctl.announce("hello")
+    check(statuses == ["hello"], "...the app's status bar, too")
+
+    captured = []
+    orig = wt.tk.Menu
+
+    class Capture(orig):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            captured.append(self)
+    wt.tk.Menu = Capture
+    try:
+        ctl.selected = ("mark", ms[1]["id"]); ctl._multi = [ms[1]["id"], ms[2]["id"]]
+        ctl.show_selection_menu(Event(x_root=0, y_root=0))
+        many = captured[0].labels(); captured.clear()
+        ctl._multi = []
+        ctl.cursor_time = 2.5
+        ctl.show_selection_menu(Event(x_root=0, y_root=0), [ms[1]["id"]])
+        one = captured[0].labels()
+    finally:
+        wt.tk.Menu = orig
+    check("Merge 2 into One Card" in many and "Split Each in Half" in many and "Split Each into Words" in many
+          and "Delete 2 Marks" in many, "selected marks' menu: merge / split / delete")
+    check({"Split at @cursor", "Split in half", "Split into words (2)", "Merge with Previous", "Merge with Next"} <= set(one),
+          "one card's menu: split at @cursor / in half / into words, merge with previous / next")
+    h = ctl._mark_history_index
+    ctl.merge_selection([ms[1]["id"], ms[2]["id"]])
+    merged = ctl.mark_by_id(ms[1]["id"])
+    check(merged["start"] == 2.0 and merged["end"] == 4.0 and merged["label"] == "w2 x2 w3 x3"
+          and len(merged["pieces"]) == 2 and ctl._mark_history_index == h + 1,
+          "Merge into One Card merges them (remembered for Unmerge), one undo step")
+    n = ctl.split_selection("words", [ms[0]["id"], ms[3]["id"]])
+    labels = sorted(m["label"] for m in ctl.track_marks(tr["id"]))
+    check(n == 2 and "w1" in labels and "x1" in labels and "w4" in labels and ctl._mark_history_index == h + 2,
+          "Split Each into Words splits every selected card in one undo step")
+    ctl.undo_marks()
+    check(len(ctl.track_marks(tr["id"])) == 3, "...and one undo puts them back")
+    ctl.unmerge_selection([ms[1]["id"]])
+    check(len(ctl.track_marks(tr["id"])) == 4, "Unmerge from the menu")
+
+
 # ---------------------------------------------------------------------------
 
 def main():
@@ -4496,6 +5401,14 @@ def main():
         test_round9(th, aa, wt, media)
         test_stems_and_transcription(th, aa, wt, media)
         test_round14(th, aa, wt, media)
+        test_round15(th, aa, wt, media)
+        test_round16(th, aa, wt, media)
+        test_round17(th, aa, wt, media)
+        test_round18(th, aa, wt, media)
+        test_round19(th, aa, wt, media)
+        test_round20(th, aa, wt, media)
+        test_round21(th, aa, wt, media)
+        test_round22(th, aa, wt, media)
 
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n{'=' * 50}")
