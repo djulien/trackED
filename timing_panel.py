@@ -53,7 +53,7 @@ import re
 import time
 import tkinter as tk
 from tkinter import ttk
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from utils import insert_styled_text, register_modifier_button, crumb, fast_destroy
 
@@ -160,11 +160,26 @@ class _Tip:
         widget.bind("<ButtonPress>", self._hide, add="+")
 
     def _schedule(self, _e=None):
+        self._cancel()                 # a second Enter mustn't leave an uncancellable timer
         self._after = self.widget.after(self.delay_ms, self._show)
 
+    def _cancel(self):
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
     def _show(self):
+        self._after = None
         if self._tip is not None:
             return
+        try:
+            if self.widget.grab_current():
+                return                 # a menu is open: the tip would cover it
+        except Exception:
+            pass
         try:
             x = self.widget.winfo_rootx() + 10
             y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
@@ -177,12 +192,7 @@ class _Tip:
             self._tip = None
 
     def _hide(self, _e=None):
-        if self._after is not None:
-            try:
-                self.widget.after_cancel(self._after)
-            except Exception:
-                pass
-            self._after = None
+        self._cancel()
         if self._tip is not None:
             try:
                 self._tip.destroy()
@@ -236,6 +246,40 @@ def _field_font():
         import tkinter.font as tkfont
         _FIELD_FONT = tkfont.Font(family="TkDefaultFont", size=10)
     return _FIELD_FONT
+
+
+_LOCK_IMAGES: Dict[bool, Any] = {}
+
+
+def lock_image(locked: bool, color: str = "#e0e0e0"):
+    """A small padlock (closed / open) drawn from pixels -- an emoji lock
+    isn't in every system's UI font. Made once per state."""
+    if locked in _LOCK_IMAGES:
+        return _LOCK_IMAGES[locked]
+    try:
+        img = tk.PhotoImage(width=12, height=13)
+        for x in range(2, 10):                      # body
+            for y in range(6, 12):
+                img.put(color, (x, y))
+        for xy in ((5, 8), (6, 8), (5, 9), (6, 9)):  # keyhole
+            img.put("#3a3a3a", xy)
+        for x in range(3, 9):                       # shackle top
+            img.put(color, (x, 1))
+        for y in range(1, 6):                       # right side: always down into the body
+            img.put(color, (8, y))
+        for y in range(1, 6 if locked else 3):      # left side: open = lifted out of the body
+            img.put(color, (3, y))
+    except (tk.TclError, TypeError, AttributeError):
+        img = None
+    _LOCK_IMAGES[locked] = img
+    return img
+
+
+def duration_text(mark) -> str:
+    """The card's Length readout: "1.234 s", or "mark" (no duration)."""
+    if mark.get("type") == "range" and mark.get("end") is not None:
+        return f"{mark['end'] - mark['start']:.3f} s"
+    return "mark"
 
 
 class WrapField:
@@ -527,6 +571,7 @@ class TimingPanel:
         self._show_list(False)
         self.mode = "info"
         self.track_id = None
+        self._progress_shown = False            # the rebuilt text ends with the progress line as it is now
         self._with_text(lambda: (self.text.delete("1.0", "end"), insert_styled_text(self.text, self.ctl.info_text)))
 
     def append_info(self, styled: str) -> None:
@@ -534,9 +579,30 @@ class TimingPanel:
         shown immediately if the info view is current."""
         if self.mode != "info":
             return
+        self._progress_shown = False            # a progress line above stays as it is
+
         def put():
             insert_styled_text(self.text, styled)
             self.text.see("end")
+        self._with_text(put)
+
+    def replace_progress(self, styled: str) -> None:
+        """Show a progress line ("... (45%)") in place of the previous one,
+        so a long job's percentages don't push the other messages away."""
+        if self.mode != "info":
+            return
+
+        def put():
+            if getattr(self, "_progress_shown", False):
+                try:
+                    self.text.delete("progress_line", "end-1c")
+                except tk.TclError:
+                    pass
+            self.text.mark_set("progress_line", "end-1c")
+            self.text.mark_gravity("progress_line", "left")
+            insert_styled_text(self.text, styled)
+            self.text.see("end")
+            self._progress_shown = True
         self._with_text(put)
 
     # ------------------------------------------------------------------ building
@@ -1091,6 +1157,26 @@ class TimingPanel:
                            "  all \u2014 every later card in this track\n"
                            "Click to switch. Shared by all cards.")
                 w["rest"] = rest
+                dur = tk.Label(f, text=duration_text(mark), bg=normal_bg, fg=contrast_fg(normal_bg),
+                               width=8, anchor="e")
+                dur.grid(row=0, column=col, padx=(6, 0)); col += 1
+                w["labels"].append(dur)
+                w["dur"] = dur
+                _Tip(dur, "Length (End \u2212 Start). A card is at least "
+                          f"{th.MIN_RANGE * 1000:.0f} ms long;\nEnd = Start (or an empty End) makes it "
+                          "a mark with no length.")
+                locked = self.is_locked(mark["id"])
+                lock = tk.Button(f, image=lock_image(locked), text="L" if lock_image(locked) is None else "",
+                                 command=lambda mid=mark["id"]: self.toggle_lock(mid), padx=1, pady=0,
+                                 bg=normal_bg, activebackground=normal_bg, relief="flat", overrelief="raised",
+                                 bd=1, highlightthickness=0, cursor="hand2", takefocus=0)
+                lock._rest_bg, lock._mod_normal_fg = normal_bg, contrast_fg(normal_bg)
+                lock.grid(row=0, column=col, padx=(1, 0)); col += 1
+                w["tbtns"].append(lock)
+                w["lock"] = lock
+                _Tip(lock, "Lock the length: changing Start or End (typed, \u2212/+, @, snaps)\n"
+                           "then moves the whole card, keeping its length.\n"
+                           "(Join and the End's shift-rest setting don't apply while locked.)")
 
         filler_col = col
         f.grid_columnconfigure(filler_col, weight=1)
@@ -1313,8 +1399,9 @@ class TimingPanel:
                     card["merge"].configure(state="disabled" if i == n - 1 else "normal")
                 is_range = m["type"] == "range" and m.get("end") is not None
                 state = self.ctl.mark_play_state(m["id"])
-                content = (m["start"], m["end"] if is_range else None, m.get("label"),
-                           tuple(m.get("voices") or ()), m["id"] == selected, m["id"] == self.playing_mid,
+                content = (m["start"], m["end"] if is_range else None, m.get("label"), self.is_locked(m["id"]),
+                           tuple(m.get("voices") or ()), m["id"] == selected or m["id"] in sel_ids,
+                           m["id"] == self.playing_mid,
                            state, has_regions)
                 if not force and card.get("content") == content:
                     continue
@@ -1323,6 +1410,11 @@ class TimingPanel:
                          self._set_entry(card["text"], m.get("label") or "")]
                 # a field left alone while being typed in is filled in on a later pass
                 card["content"] = content if all(x is not False for x in shown) else None
+                dtext = duration_text(m)
+                if card.get("dur") is not None and card["dur"].cget("text") != dtext:
+                    card["dur"].configure(text=dtext)
+                if card.get("lock") is not None:
+                    self._show_lock(card, m)
                 vtext = voice_button_text(m.get("voices"), m.get("label"))
                 if card["voice"].cget("text") != vtext:
                     card["voice"].configure(text=vtext)
@@ -1387,11 +1479,12 @@ class TimingPanel:
             return
         old, self.playing_mid = self.playing_mid, mid
         selected = self.ctl.selected_mark_id()
+        group = set(self.ctl.selected_mark_ids()) if hasattr(self.ctl, "selected_mark_ids") else set()
         for m in (old, mid):
             card = self.cards.get(m) if m else None
             if card is not None:
                 try:
-                    self._paint(card, self._card_bg(selected=(m == selected), playing=(m == mid)))
+                    self._paint(card, self._card_bg(selected=(m == selected or m in group), playing=(m == mid)))
                 except tk.TclError:
                     pass
         card = self.cards.get(mid) if mid else None
@@ -1481,6 +1574,22 @@ class TimingPanel:
         current = mark["start"] if which == "start" else (mark["end"] if is_range else None)
         if current is not None and abs(value - current) < 0.0005:
             return
+        locked = self._locked_range(mid) is not None
+        if which == "end" and not locked and abs(value - mark["start"]) < 0.0005:
+            # End = Start: the card becomes a mark with no length
+            if is_range and self.ctl.set_mark_times(mid, mark["start"], None):
+                self._announce("End = Start: the card is now a mark with no length")
+            return
+        if not locked and is_range and (
+                (which == "end" and value - mark["start"] < th.MIN_RANGE - 1e-9)
+                or (which == "start" and mark["end"] - value < th.MIN_RANGE - 1e-9)):
+            self._flash_bad(mid)
+            self._min_length_hint(mid, which)
+            return
+        if which == "end" and not is_range and value - mark["start"] < th.MIN_RANGE - 1e-9:
+            self._flash_bad(mid)
+            self._min_length_hint(mid, which)
+            return
         if which == "start":
             ok = self._set_start(mid, value)
         else:
@@ -1488,12 +1597,141 @@ class TimingPanel:
         if not ok:
             self._flash_bad(mid)
 
+    # ------------------------------------------------------------------ length lock / hints
+    def _locked_ids(self) -> set:
+        """Cards whose length is locked (kept by the tab's controller, so
+        it lasts while the file is open, across tracks)."""
+        ids = getattr(self.ctl, "_dur_locked", None)
+        if ids is None:
+            ids = set()
+            try:
+                self.ctl._dur_locked = ids
+            except AttributeError:
+                pass
+        return ids
+
+    def is_locked(self, mid) -> bool:
+        return mid in self._locked_ids()
+
+    def toggle_lock(self, mid, locked=None):
+        ids = self._locked_ids()
+        if locked is None:
+            locked = mid not in ids
+        if locked:
+            ids.add(mid)
+        else:
+            ids.discard(mid)
+        card = self.cards.get(mid)
+        mark = self.ctl.mark_by_id(mid)
+        if card is not None and mark is not None:
+            self._show_lock(card, mark)
+        self._announce("Length locked: Start/End now move the whole card" if locked else "Length unlocked")
+        return locked
+
+    def _show_lock(self, card, mark):
+        is_range = mark.get("type") == "range" and mark.get("end") is not None
+        locked = self.is_locked(mark["id"]) and is_range
+        try:
+            img = lock_image(locked)
+            if img is not None:
+                card["lock"].configure(image=img)
+            card["lock"]._locked = locked
+            want = "normal" if is_range else "disabled"
+            if card["lock"].cget("state") != want:
+                card["lock"].configure(state=want)
+        except (tk.TclError, KeyError):
+            pass
+
+    def _locked_range(self, mid):
+        """The mark if its length is locked (and it has one), else None."""
+        mark = self.ctl.mark_by_id(mid)
+        if mark is None or not self.is_locked(mid):
+            return None
+        if mark["type"] != "range" or mark.get("end") is None:
+            return None
+        return mark
+
+    def _move_locked(self, mid, start=None, end=None):
+        """Locked length: move the whole card so it starts at `start` (or
+        ends at `end`), kept inside 0 .. the limit. One undo step."""
+        mark = self._locked_range(mid)
+        if mark is None:
+            return False
+        length = mark["end"] - mark["start"]
+        new_start = start if start is not None else end - length
+        new_start = max(0.0, min(self._time_limit() - length, new_start))
+        if abs(new_start - mark["start"]) < 1e-9:
+            return True
+        return self.ctl.set_mark_times(mid, new_start, new_start + length)
+
+    def _announce(self, message):
+        announce = getattr(self.ctl, "announce", None)
+        if callable(announce):
+            try:
+                announce(message)
+            except (tk.TclError, AttributeError):
+                pass
+
+    HINT_MS = 5000
+
+    def show_hint(self, widget, message):
+        """A note under a field that doesn't take focus or block typing: it
+        goes away by itself (or with the next key/click there), and the
+        status bar says the same."""
+        self.hide_hint()
+        self.last_hint = message
+        self._announce(message.replace("\n", " "))
+        try:
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height() + 2
+            tip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(tip, text=message, background=TIP_BG, foreground=TIP_FG, relief="solid", borderwidth=1,
+                     justify="left", font=("TkDefaultFont", 9), padx=5, pady=3).pack()
+            self._hint = tip
+            widget.after(self.HINT_MS, lambda t=tip: self.hide_hint(t))
+            if not getattr(widget, "_hint_bound", False):
+                widget._hint_bound = True
+                for seq in ("<KeyPress>", "<ButtonPress>"):
+                    widget.bind(seq, lambda e: self.hide_hint(), add="+")
+        except (tk.TclError, TypeError, AttributeError):
+            self._hint = None
+
+    def hide_hint(self, only=None):
+        tip = getattr(self, "_hint", None)
+        if tip is None or (only is not None and tip is not only):
+            return
+        self._hint = None
+        try:
+            tip.destroy()
+        except Exception:
+            pass
+
+    def _min_length_hint(self, mid, which):
+        card = self.cards.get(mid)
+        widget = card.get(which) if card else None
+        ms = th.MIN_RANGE * 1000
+        if which == "end":
+            first = f"End must be at least {ms:.0f} ms after Start (the shortest card)."
+        else:
+            first = f"Start must be at least {ms:.0f} ms before End (the shortest card)."
+        msg = (first + "\nFor a mark with no length: set End = Start, or clear End."
+               "\nTo move the whole card instead, lock its length (padlock).")
+        if widget is not None:
+            self.show_hint(widget, msg)
+        else:
+            self.last_hint = msg
+            self._announce(msg.replace("\n", " "))
+
     def _set_start(self, mid, value):
         """Change a card's Start -- with "join" on, the previous card in
         the track then ends right there."""
         mark = self.ctl.mark_by_id(mid)
         if mark is None:
             return False
+        if self._locked_range(mid) is not None:
+            return self._move_locked(mid, start=value)
         if self.join_mode != "off":
             return self.ctl.set_mark_start_joined(mid, value, mode=self.join_mode)
         is_range = mark["type"] == "range" and mark.get("end") is not None
@@ -1519,6 +1757,8 @@ class TimingPanel:
         mark = self.ctl.mark_by_id(mid)
         if mark is None:
             return False
+        if self._locked_range(mid) is not None:
+            return self._move_locked(mid, end=value)
         if allow_shift and self.rest_mode != "off":
             return self.ctl.set_mark_end_shifting(mid, value, mode=self.rest_mode)
         return self.ctl.set_mark_times(mid, mark["start"], value)
@@ -1792,11 +2032,14 @@ class TimingPanel:
         is_range = mark["type"] == "range" and mark.get("end") is not None
         if which == "start":
             t = self.ctl.rise_time(mark["start"], use_vocals=use_vocals, direction=direction)
-            ok = t is not None and (not is_range or t <= mark["end"] - th.MIN_RANGE) and self._set_start(mid, t)
+            free = self._locked_range(mid) is not None         # locked: the card moves, no length check
+            ok = t is not None and (free or not is_range or t <= mark["end"] - th.MIN_RANGE) \
+                and self._set_start(mid, t)
         else:
             base = mark["end"] if is_range else mark["start"]
             t = self.ctl.edge_time(base, "fall", use_vocals=use_vocals, direction=direction)
-            ok = t is not None and t >= mark["start"] + th.MIN_RANGE and self._set_end(mid, t)
+            free = self._locked_range(mid) is not None
+            ok = t is not None and (free or t >= mark["start"] + th.MIN_RANGE) and self._set_end(mid, t)
         if not ok:
             self._flash_bad(mid)
 
@@ -1827,16 +2070,29 @@ class TimingPanel:
         step = self._step() * direction
         duration = self._time_limit()
         is_range = mark["type"] == "range" and mark.get("end") is not None
+        if self._locked_range(mid) is not None:
+            # locked length: -/+ on either edge moves the whole card
+            length = mark["end"] - mark["start"]
+            new = max(0.0, min(duration - length, mark["start"] + step))
+            if abs(new - mark["start"]) < 1e-9:
+                return  # at 0 / the end
+            if not self._move_locked(mid, start=new):
+                self._flash_bad(mid)
+            return
         if which == "start":
             hi = (mark["end"] - th.MIN_RANGE) if is_range else duration
             new = min(max(0.0, mark["start"] + step), hi)
             if abs(new - mark["start"]) < 1e-9:
+                if is_range and direction > 0:
+                    self._min_length_hint(mid, "start")      # would make it shorter than allowed
                 return  # at the limit
             ok = self._set_start(mid, new)
         else:
             base = mark["end"] if is_range else mark["start"]
             new = min(max(mark["start"] + th.MIN_RANGE, base + step), duration)
             if is_range and abs(new - mark["end"]) < 1e-9:
+                if direction < 0:
+                    self._min_length_hint(mid, "end")
                 return  # at the limit
             if not is_range and direction < 0:
                 return  # a point has no end to shrink
@@ -1854,6 +2110,8 @@ class TimingPanel:
         is_range = mark["type"] == "range" and mark.get("end") is not None
         if which == "start":
             ok = self._set_start(mid, t)
+        elif self._locked_range(mid) is not None:
+            ok = self._move_locked(mid, end=t)
         else:
             ok = self.ctl.set_mark_times(mid, mark["start"], t)
         if not ok:

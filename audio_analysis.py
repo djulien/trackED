@@ -728,6 +728,214 @@ def detect_beats(filepath: str, progress_cb: ProgressCb = None) -> Dict[str, Any
             "bass": [float(low[min(f, len(low) - 1)]) for f in frames]}
 
 
+# ---------------------------------------------------------------------------
+# Song structure (Structure \u25be): sections from repetition in the audio
+# ---------------------------------------------------------------------------
+
+def structure_available() -> bool:
+    return beats_available()
+
+
+def structure_features(filepath: str, progress_cb: ProgressCb = None) -> Dict[str, Any]:
+    """Beats plus one feature vector per beat for find_sections(): chroma
+    (harmony), MFCC (timbre) and loudness, each the median over the beat.
+    Returns detect_beats()'s dict plus "features" (list of lists, one per
+    beat) and "rms" (per beat). Slow-ish: a worker thread. Needs librosa."""
+    if not structure_available():
+        raise RuntimeError("librosa not installed")
+    import librosa
+
+    def report(msg):
+        if progress_cb:
+            progress_cb(msg)
+    report("Decoding audio... (5%)")
+    duration = None
+    try:
+        duration = librosa.get_duration(path=filepath)
+    except Exception:
+        pass
+    y = _decode_16k_mono(filepath, 0.0, duration or 36000.0, sr=GENRE_SR)
+    if len(y) == 0:
+        raise RuntimeError("no audio decoded")
+    sr, hop = GENRE_SR, 512
+    report("Finding beats... (20%)")
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    tempo, frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop, units="frames")
+    frames = np.asarray(frames, dtype=int)
+    frames = frames[frames < len(onset_env)]
+    if len(frames) < 8:
+        raise RuntimeError("too few beats found for a structure analysis")
+    report("Measuring harmony... (40%)")
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+    report("Measuring timbre and loudness... (65%)")
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, hop_length=hop, n_mfcc=13)[1:]
+    rms = librosa.feature.rms(y=y, hop_length=hop)
+    spec = np.abs(librosa.stft(y, hop_length=hop))
+    low = spec[librosa.fft_frequencies(sr=sr) < 150.0].sum(axis=0)
+    n = min(chroma.shape[1], mfcc.shape[1], rms.shape[1])
+    report("Summarizing per beat... (85%)")
+    bounds = [int(f) for f in frames if f < n]
+    sync = lambda m: librosa.util.sync(m[:, :n], bounds, aggregate=np.median)
+    c_b, m_b, r_b = sync(chroma), sync(mfcc), sync(rms)
+    # sync adds a segment before the first beat; drop it so row i = beat i
+    k = len(bounds)
+    c_b, m_b, r_b = c_b[:, -k:], m_b[:, -k:], r_b[:, -k:]
+    feats = np.vstack([c_b, m_b / 20.0, r_b * 10.0]).T
+    times = librosa.frames_to_time(np.asarray(bounds), sr=sr, hop_length=hop)
+    return {"tempo": float(np.atleast_1d(tempo)[0]), "beats": [float(t) for t in times],
+            "strength": [float(onset_env[f]) for f in bounds],
+            "bass": [float(low[min(f, len(low) - 1)]) for f in bounds],
+            "features": feats.tolist(), "rms": [float(v) for v in r_b[0]]}
+
+
+def _novelty(sim, half):
+    """Checkerboard-kernel novelty along the self-similarity diagonal
+    (Foote): high where the music before and after a beat differ."""
+    n = sim.shape[0]
+    if half < 1 or n < 4:
+        return np.zeros(n)
+    idx = np.arange(-half, half)
+    sign = np.where(idx < 0, -1.0, 1.0)
+    taper = np.exp(-0.5 * ((idx + 0.5) / (half * 0.6)) ** 2)
+    kernel = np.outer(sign, sign) * np.outer(taper, taper)
+    padded = np.pad(sim, half, mode="edge")
+    out = np.zeros(n)
+    for i in range(n):
+        block = padded[i:i + 2 * half, i:i + 2 * half]
+        out[i] = float((block * kernel).sum())
+    out[out < 0] = 0.0
+    top = out.max()
+    return out / top if top > 0 else out
+
+
+REPEAT_RATIO = 0.6     # find_sections: how close a repeat must be (0..1, vs. self-similarity)
+
+
+def find_sections(features, downbeats: List[int], min_beats: int = 16, max_sections: int = 24) -> Dict[str, Any]:
+    """Section boundaries and repeat letters from per-beat features.
+
+    features: one vector per beat. downbeats: beat indices where bars
+    start (boundaries are only placed there). min_beats: shortest section.
+    Returns {"bounds": [beat index, ...] (starts, first is 0, plus n at the
+    end), "letters": ["A", "B", "A", ...] one per section,
+    "novelty": [...]}. Pure numpy (no librosa)."""
+    X = np.asarray(features, dtype=float)
+    n = X.shape[0]
+    if n < 4:
+        return {"bounds": [0, n], "letters": ["A"], "novelty": [0.0] * n}
+    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-9)
+    X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
+    sim = X @ X.T
+    half = int(max(2, min(16, min_beats // 2, n // 4)))
+    nov = _novelty(sim, half)
+    cands = sorted({d for d in downbeats if min_beats <= d <= n - min_beats})
+    if not cands:
+        cands = list(range(min_beats, n - min_beats + 1, max(1, min_beats // 2)))
+    win = 1                       # a bar start takes the novelty right at it (+-1 beat)
+    score = {d: float(nov[max(0, d - win):d + win + 1].max()) for d in cands}
+    vals = np.array(list(score.values())) if score else np.zeros(1)
+    thr = float(vals.mean() + 0.25 * vals.std()) if len(vals) > 2 else 0.0
+    chosen: List[int] = []
+    for d in sorted(cands, key=lambda c: -score[c]):
+        if score[d] < thr or len(chosen) >= max_sections - 1:
+            break
+        if all(abs(d - c) >= min_beats for c in chosen):
+            chosen.append(d)
+    bounds = [0] + sorted(chosen) + [n]
+    k = len(bounds) - 1
+    # mean similarity between sections (block averages) -> repeat letters
+    B = np.zeros((k, k))
+    for a in range(k):
+        for b in range(k):
+            B[a, b] = sim[bounds[a]:bounds[a + 1], bounds[b]:bounds[b + 1]].mean()
+    letters: List[str] = []
+    if k == 1:
+        letters = ["A"]
+    else:
+        # A repeat sounds about as much like the other section as each
+        # section sounds like itself (its diagonal block); a chance
+        # resemblance is far weaker than that.
+        diag = np.diag(B)
+        groups: List[List[int]] = []
+        for i in range(k):
+            best, best_g, ratio = None, None, 0.0
+            for gi, members in enumerate(groups):
+                v = float(np.mean([B[i, j] for j in members]))
+                own = float(np.mean([diag[i]] + [diag[j] for j in members]))
+                r = v / own if own > 1e-9 else 0.0
+                if best is None or r > ratio:
+                    best, best_g, ratio = v, gi, r
+            if best is not None and ratio >= REPEAT_RATIO:
+                groups[best_g].append(i)
+                letters.append(chr(ord("A") + best_g) if best_g < 26 else f"S{best_g + 1}")
+            else:
+                groups.append([i])
+                gi = len(groups) - 1
+                letters.append(chr(ord("A") + gi) if gi < 26 else f"S{gi + 1}")
+    return {"bounds": bounds, "letters": letters, "novelty": [float(v) for v in nov]}
+
+
+def name_sections(letters: List[str], energy: List[float], vocal: Optional[List[Optional[float]]] = None
+                  ) -> List[str]:
+    """Guess section names from the repeat pattern (rule-based):
+    the loudest repeated part -> Chorus; the most-repeated other part ->
+    Verse; a part always right before a Chorus -> Pre-Chorus; a first /
+    last part that doesn't come back -> Intro / Outro; other one-off parts
+    -> Bridge, or Instrumental when (stems known) it has almost no vocals.
+    Repeated names are numbered: Verse 1, Verse 2, ..."""
+    k = len(letters)
+    if k == 0:
+        return []
+    vocal = list(vocal) if vocal else [None] * k
+    count = {L: letters.count(L) for L in letters}
+    mean_e = {L: float(np.mean([energy[i] for i in range(k) if letters[i] == L])) for L in count}
+    ends = letters[0] if (k >= 3 and letters[0] == letters[-1] and count[letters[0]] == 2) else None
+    repeated = [L for L in count if count[L] >= 2 and L != ends]
+    role: Dict[str, str] = {}
+    if repeated:
+        chorus = max(repeated, key=lambda L: (mean_e[L], count[L]))
+        role[chorus] = "Chorus"
+        rest = [L for L in repeated if L != chorus]
+        if rest:
+            verse = max(rest, key=lambda L: (count[L], -letters.index(L)))
+            role[verse] = "Verse"
+        for L in rest:
+            if L in role:
+                continue
+            pos = [i for i in range(k) if letters[i] == L]
+            if all(i + 1 < k and letters[i + 1] == chorus for i in pos):
+                role[L] = "Pre-Chorus"
+    # a part heard only at the very start and the very end: Intro / Outro
+    bookend = ends
+    names: List[str] = []
+    for i, L in enumerate(letters):
+        if L == bookend:
+            names.append("Intro" if i == 0 else "Outro")
+            continue
+        if L in role:
+            names.append(role[L])
+            continue
+        v = vocal[i]
+        if i == 0 and count[L] == 1:
+            names.append("Intro")
+        elif i == k - 1 and count[L] == 1:
+            names.append("Outro")
+        elif count[L] == 1:
+            names.append("Instrumental" if v is not None and v < 0.1 else "Bridge")
+        else:
+            names.append(f"Section {L}")
+    totals = {nm: names.count(nm) for nm in names}
+    seen: Dict[str, int] = {}
+    out = []
+    for nm in names:
+        if totals[nm] > 1:
+            seen[nm] = seen.get(nm, 0) + 1
+            out.append(f"{nm} {seen[nm]}")
+        else:
+            out.append(nm)
+    return out
+
+
 def estimate_genre_mood(filepath: str, lyrics: str = "", progress_cb: ProgressCb = None) -> Dict[str, Any]:
     """Decode the whole file (mono, 22.05 kHz), measure the features with
     librosa, and score them. Slow-ish (seconds to a minute): run it in a

@@ -914,3 +914,51 @@ def fast_destroy(widget) -> None:
     except (AttributeError, KeyError):
         pass
 
+
+
+# ---------------------------------------------------------------------------
+# Paste replaces the selection (all Entry / ttk.Entry / Text widgets)
+# ---------------------------------------------------------------------------
+# Tk follows the old X11 convention on Linux: <<Paste>> inserts at the
+# cursor and leaves selected text in place (Windows/macOS replace it). With
+# a field's whole text selected, Ctrl+V then appended instead of replacing.
+
+def paste_replacing_selection(widget) -> bool:
+    """Paste the clipboard into widget, replacing its selection. True if
+    something was pasted."""
+    try:
+        text = widget.clipboard_get()
+    except (tk.TclError, AttributeError):
+        return False
+    try:
+        if str(widget.cget("state")) in ("disabled", "readonly"):
+            return False
+    except (tk.TclError, AttributeError):
+        pass
+    try:
+        if isinstance(widget, tk.Text):
+            try:
+                widget.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass                                  # nothing selected
+            widget.insert("insert", text)
+            widget.see("insert")
+        else:
+            try:
+                if widget.selection_present():
+                    widget.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass
+            widget.insert("insert", text)
+    except (tk.TclError, AttributeError):
+        return False
+    return True
+
+
+def install_paste_replaces_selection(root) -> None:
+    """Make <<Paste>> (Ctrl+V, Edit > Paste) replace the selection in every
+    Entry, ttk.Entry and Text. These class bindings deliberately take over
+    Tk's own <<Paste>> for those classes (same event name, so exactly
+    Tk's binding is replaced -- nothing else)."""
+    for cls in ("Entry", "TEntry", "Text"):
+        root.bind_class(cls, "<<Paste>>", lambda e: "break" if paste_replacing_selection(e.widget) else None)

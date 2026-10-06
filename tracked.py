@@ -564,6 +564,9 @@ class EditorApp(TkinterDnD.Tk if HAS_DND else tk.Tk):  # type: ignore
 
     def _bind_shortcuts(self) -> None:
         self.bind_all("<F1>", lambda e: self.show_shortcuts())
+        # Ctrl+V replaces selected text in fields (Tk on Linux appends otherwise)
+        from utils import install_paste_replaces_selection
+        install_paste_replaces_selection(self)
         self.bind_all("<Control-n>", lambda e: self.new_file())
         self.bind_all("<Control-o>", lambda e: self.open_file())
         self.bind_all("<Control-s>", lambda e: self.save_file())
@@ -1712,8 +1715,14 @@ class UserActionLog:
         root.bind_all("<KeyPress>", self.on_key, add="+")
         root.bind_all("<ButtonPress>", self.on_button, add="+")
         root.bind_all("<MouseWheel>", self.on_wheel, add="+")
+        # Careful with class bindings: Tk runs only the MOST SPECIFIC
+        # binding per tag, and its own menu code binds <ButtonRelease> (any
+        # button) on the Menu class. Binding "<ButtonRelease-1>" there would
+        # replace Tk's for button 1 -- menu items then neither run nor close
+        # the menu (that bug happened). So use exactly Tk's sequences, added
+        # with "+" after its scripts.
         root.bind_class("Menu", "<<MenuSelect>>", self.on_menu_select, add="+")
-        root.bind_class("Menu", "<ButtonRelease-1>", self.on_menu_pick, add="+")
+        root.bind_class("Menu", "<ButtonRelease>", self.on_menu_pick, add="+")
         root.bind_class("Menu", "<KeyPress-Return>", self.on_menu_pick, add="+")
         self._menu_label = ""
 

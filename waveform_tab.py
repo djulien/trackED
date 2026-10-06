@@ -243,13 +243,43 @@ class _Tooltip:
         widget.bind("<Enter>", self._schedule, add="+")
         widget.bind("<Leave>", self._hide, add="+")
         widget.bind("<ButtonPress>", self._hide, add="+")
+        widget.bind("<ButtonRelease>", self._hide, add="+")
 
     def _schedule(self, event=None):
+        # Cancel a pending show first: two Enters in a row (X11 sends one
+        # when a menubutton's menu takes the grab) used to leave an
+        # uncancellable timer that showed the tip over the open menu.
+        self._cancel()
+        if self._grabbed():
+            return
         self._after_id = self.widget.after(self.delay_ms, self._show)
 
+    def _cancel(self):
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _grabbed(self):
+        """True while a menu is posted (or a drag holds the mouse): the tip
+        would cover the menu and swallow clicks on its first entries."""
+        try:
+            return bool(self.widget.grab_current())
+        except Exception:
+            return False
+
     def _show(self):
-        if self._tip is not None:
+        self._after_id = None
+        if self._tip is not None or self._grabbed():
             return
+        try:
+            under = self.widget.winfo_containing(*self.widget.winfo_pointerxy())
+        except Exception:
+            under = None
+        if under is not None and under is not self.widget:
+            return                      # the pointer has moved on (e.g. into the menu)
         x = self.widget.winfo_rootx() + 10
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
         self._tip = tk.Toplevel(self.widget)
@@ -264,12 +294,7 @@ class _Tooltip:
         ).pack()
 
     def _hide(self, event=None):
-        if self._after_id is not None:
-            try:
-                self.widget.after_cancel(self._after_id)
-            except Exception:
-                pass
-            self._after_id = None
+        self._cancel()
         if self._tip is not None:
             try:
                 self._tip.destroy()
@@ -358,7 +383,8 @@ def _tb_menubutton(parent, text):
                        highlightthickness=0, padx=7, pady=3, cursor="hand2", font=TB_FONT, takefocus=0)
     _tb_hover(mb)
     menu = tk.Menu(mb, tearoff=False, bg="#2d2d30", fg=TB_FG, activebackground=TB_HOVER,
-                   activeforeground="#ffffff", selectcolor=TB_ACCENT, bd=1)
+                   activeforeground="#ffffff", selectcolor=TB_ACCENT, bd=1,
+                   disabledforeground=TB_DISABLED)      # Tk's default gray barely differs from TB_FG here
     mb.configure(menu=menu)
     return mb, menu
 
@@ -799,6 +825,7 @@ class WaveformController:
         self._preview_range = None
         self._mark_history = [self._mark_snapshot()]
         self._mark_history_index = 0
+        self._history_views = [None]      # the zoom/scroll each step was made in (undo/redo returns there)
 
         # -- stem regions / analysis state --
         self.region_colors = stem_colors()
@@ -986,7 +1013,16 @@ class WaveformController:
         self.beats_btn.pack(side="left", padx=(0, 6))
         self.beats_menu.configure(postcommand=self._fill_beats_menu)
         _Tooltip(self.beats_btn, "Bars / beats as a new timing track (beat detection needs librosa).\n"
-                                 "Uses the selected range, or from the @cursor to the end.")
+                                 "Where (in the menu): the selected range, else the whole song;\n"
+                                 "or from the @cursor to the end; or always the whole song.")
+        # Structure \u25be: intro / verse / chorus ... sections as a timing track.
+        self.structure_btn, self.structure_menu = _tb_menubutton(right, "Structure \u25be")
+        self.structure_btn.pack(side="left", padx=(0, 6))
+        self.structure_menu.configure(postcommand=self._fill_structure_menu)
+        _Tooltip(self.structure_btn, "Find the song's sections (intro, verse, chorus, bridge, ...) from how\n"
+                                     "the music repeats, as a new \u201cStructure\u201d timing track.\n"
+                                     "Names are a rule-based guess; repeated parts share a letter (A, B, ...).\n"
+                                     "Needs librosa. Run Stems first to help tell instrumental parts.")
         self.transcribe_btn = _tb_button(right, "Transcribe", self.transcribe_selected)
         self.transcribe_btn.pack(side="left", padx=(0, 1))
         _Tooltip(self.transcribe_btn, "Transcribe with Whisper:\n"
@@ -1434,12 +1470,24 @@ class WaveformController:
         return (copy.deepcopy(self.marks), copy.deepcopy(self.tracks), list(self.voices))
 
     def _one_step(self, fn):
-        """Run fn (several mark edits) as one undo step."""
+        """Run fn (several mark edits) as one undo step, drawing the
+        waveform and the card editor once at the end instead of after each
+        edit (with dozens of cards, redrawing after every split made the
+        window stop responding)."""
         self._batch_depth = getattr(self, "_batch_depth", 0) + 1
+        try:
+            self.canvas.configure(cursor="watch")
+            self.canvas.update_idletasks()
+        except (tk.TclError, AttributeError):
+            pass
         try:
             result = fn()
         finally:
             self._batch_depth -= 1
+            try:
+                self.canvas.configure(cursor="")
+            except (tk.TclError, AttributeError):
+                pass
         if self._batch_depth == 0:
             self._mark_changed()
             self.render_waveform()
@@ -1556,12 +1604,40 @@ class WaveformController:
                 self.cursor_time = start
 
     def _push_mark_history(self):
+        views = self.__dict__.setdefault("_history_views", [None] * len(self._mark_history))
         del self._mark_history[self._mark_history_index + 1:]
+        del views[self._mark_history_index + 1:]
+        views.extend([None] * (len(self._mark_history) - len(views)))
         self._mark_history.append(self._mark_snapshot())
+        views.append(self._current_view())
         max_len = self.UNDO_LIMIT + 1
         if len(self._mark_history) > max_len:
-            del self._mark_history[: len(self._mark_history) - max_len]
+            cut = len(self._mark_history) - max_len
+            del self._mark_history[:cut]
+            del views[:cut]
         self._mark_history_index = len(self._mark_history) - 1
+
+    def _current_view(self):
+        if self.audio_duration is None or self.view_end <= self.view_start:
+            return None
+        return (self.view_start, self.view_end)
+
+    def _restore_history_view(self, step):
+        """Undo/redo: show the zoom and scroll position the step was made
+        in, so the change being undone/redone is in view."""
+        views = getattr(self, "_history_views", None) or []
+        view = views[step] if 0 <= step < len(views) else None
+        if view is None or self.audio_duration is None:
+            return False
+        start, end = view
+        limit = self.audio_duration * self.OVERSHOOT_FACTOR
+        if not (0.0 <= start < end <= limit + 1e-6):
+            return False
+        if (start, end) == (self.view_start, self.view_end):
+            return False
+        self.view_start, self.view_end = start, end
+        self._refresh_view_from_cache(render=False)
+        return True
 
     def can_undo_marks(self):
         return self._mark_history_index > 0
@@ -1572,8 +1648,10 @@ class WaveformController:
     def undo_marks(self):
         if not self.can_undo_marks():
             return
+        undone = self._mark_history_index
         self._mark_history_index -= 1
         self.marks, self.tracks, self.voices = copy.deepcopy(self._mark_history[self._mark_history_index])
+        self._restore_history_view(undone)          # where the undone change was made
         self._keep_selection_if_present()
         self._hover = None
         self._mark_changed(record_history=False)
@@ -1598,6 +1676,7 @@ class WaveformController:
             return
         self._mark_history_index += 1
         self.marks, self.tracks, self.voices = copy.deepcopy(self._mark_history[self._mark_history_index])
+        self._restore_history_view(self._mark_history_index)
         self._keep_selection_if_present()
         self._hover = None
         self._mark_changed(record_history=False)
@@ -1836,10 +1915,15 @@ class WaveformController:
             self.render_waveform()
 
     def _prompt_new_track_for_mark(self, mark):
+        self._prompt_new_track_for_marks([mark])
+
+    def _prompt_new_track_for_marks(self, marks):
+        """Dropped below the tracks: ask for a name; the marks go into the new track."""
         name = simpledialog.askstring("New Timing Track", "Track name:")
         if name and name.strip():
             track = self._new_track(name.strip())
-            mark["track_id"] = track["id"]
+            for mark in marks:
+                mark["track_id"] = track["id"]
             self._mark_changed()
             self.render_waveform()
 
@@ -2448,9 +2532,21 @@ class WaveformController:
     def append_info(self, styled):
         """Add a line to the tab's info text (shown whenever no timing
         track is selected)."""
+        self._progress_len = 0                  # a progress line above stays
         self.info_text += styled
         if self.panel is not None:
             self.panel.append_info(styled)
+
+    def progress_info(self, styled):
+        """A progress line that replaces the previous progress line (the
+        same job's percentages update in place)."""
+        n = getattr(self, "_progress_len", 0)
+        if n:
+            self.info_text = self.info_text[:-n]
+        self.info_text += styled
+        self._progress_len = len(styled)
+        if self.panel is not None and hasattr(self.panel, "replace_progress"):
+            self.panel.replace_progress(styled)
 
     # ------------------------------------------------------------------ Ctrl+click cursor
     def _on_ctrl_press(self, event):
@@ -2529,16 +2625,44 @@ class WaveformController:
         self.append_info(msg)
 
     def _set_analysis_busy(self, what):
+        """A long job starts (what) / ends (None). While it runs, the text
+        panel is shown (the card editor would hide its progress): a selected
+        track or card is deselected and selected again afterwards."""
+        if what and not self._analysis_busy:
+            self._progress_len = 0
+            if self.selected and (self.selected[0] == "track" or self.panel_track_id()):
+                self._sel_before_busy = (self.selected, list(getattr(self, "_multi", [])))
+                self.selected = None
+                self.render_waveform()
+        elif not what and self._analysis_busy:
+            saved = getattr(self, "_sel_before_busy", None)
+            self._sel_before_busy = None
+            if saved and self.selected is None:
+                (kind, ident), multi = saved
+                if (kind == "track" and self.track_by_id(ident)) or (kind == "mark" and self.mark_by_id(ident)):
+                    self.selected = (kind, ident)
+                    self._multi = [i for i in multi if self.mark_by_id(i)]
+                    self.render_waveform()
         self._analysis_busy = what
         state = "disabled" if what else "normal"
         for btn in (self.stems_btn, self.transcribe_btn, self.model_btn, self.mood_btn,
-                    getattr(self, "beats_btn", None)):
+                    getattr(self, "beats_btn", None), getattr(self, "structure_btn", None)):
             if btn is None:
                 continue
             try:
                 btn.configure(state=state)
             except tk.TclError:
                 pass
+
+    def _show_text_panel(self):
+        """Make sure the text panel (not the card editor) is showing, so a
+        message just added there is seen: deselects a selected track/card.
+        Used for errors and "nothing made" results -- before this, a job's
+        end re-selected the card and its message stayed hidden."""
+        if self.selected and (self.selected[0] == "track" or self.panel_track_id()):
+            self.selected = None
+            self._multi = []
+            self.render_waveform()
 
     def _run_in_thread(self, work, done, progress_prefix=""):
         """Run work(progress) in a thread; call done(result, error, elapsed)
@@ -2566,7 +2690,7 @@ class WaveformController:
                 shown["msg"] = msg
                 self.analysis_status_var.set(f"{progress_prefix}{msg}"[:70])
                 if "%" in msg:
-                    self.append_info(f"{{cyan}}  {msg}\n")
+                    self.progress_info(f"{{cyan}}  {progress_prefix}{msg}\n")
             if thread.is_alive():
                 self.canvas.after(150, poll)
                 return
@@ -2605,6 +2729,7 @@ class WaveformController:
                 self.analysis_status_var.set("Stems failed")
                 self.append_info(f"\n{{red}}Stem analysis error: " + _explained(error, "Stem separation") + "\n")
                 debug(1, f"{{red}}waveform_tab stems failed: {error}")
+                self._show_text_panel()
             else:
                 regions, reused = value
                 self._set_regions(regions)
@@ -2709,7 +2834,8 @@ class WaveformController:
                 menu.add_command(label=f"   {name} ({n} ranges)", state="normal" if n else "disabled",
                                  command=lambda nm=name, cb=combo: self.create_combined_stem_track(nm, cb))
             menu.add_checkbutton(label="   Merge touching regions of different stems",
-                                 variable=self._merge_var, command=self._on_merge_toggled)
+                                 variable=self._merge_var,
+                                 command=self._menu_option(self.stems_menu_btn, menu, self._on_merge_toggled))
             menu.add_separator()
             menu.add_command(label=f"All non-empty stems ({len(kinds)} tracks)",
                              command=lambda: self.create_stem_tracks(kinds))
@@ -2810,6 +2936,7 @@ class WaveformController:
             if error is not None:
                 self.analysis_status_var.set("Genre/mood failed")
                 self.append_info(f"{{red}}Genre/mood error: " + _explained(error, "The genre/mood estimate") + "\n")
+                self._show_text_panel()
                 return
             th.save_genre_mood(self.filepath, value)
             self._report_genre_mood(value, elapsed)
@@ -2955,12 +3082,14 @@ class WaveformController:
                 self.analysis_status_var.set("Transcription failed")
                 self.append_info(f"{{red}}Transcription error: " + _explained(error, "Transcription") + "\n")
                 debug(1, f"{{red}}waveform_tab transcribe failed: {error}")
+                self._show_text_panel()
                 return
             target = self.mark_by_id(mark_id)
             text = value.get("text", "")
             if not text:
                 self.analysis_status_var.set("No vocals found in range")
                 self.append_info("{yellow}No vocals/words found in that range.\n")
+                self._show_text_panel()
                 return
             detail = (f"{value.get('backend')} {value.get('model')}, {value.get('source')}, "
                       f"{value.get('seconds_voiced', 0):.1f}s voiced, {elapsed:.1f}s")
@@ -3708,17 +3837,10 @@ class WaveformController:
             if hit_mark is not None and event.state & SHIFT_MASK:
                 self.extend_selection(hit_mark, toggle=False)      # Shift+click: a run of marks
                 return
-            self._multi = []
             if hit_mark is not None:
-                self.selected = ("mark", hit_mark["id"])
-                self._move_drag = {
-                    "mark": hit_mark, "edge": edge,
-                    "start_orig": hit_mark["start"], "end_orig": hit_mark.get("end"),
-                    "press_time": self._time_at_x(event.x), "orig_track_id": hit_mark.get("track_id"),
-                }
-                self.canvas.configure(cursor=self._cursor_for_edge(edge))
-                self.render_waveform()
+                self._start_move_drag(hit_mark, edge, event)
                 return
+            self._multi = []
             self._deselect()
             return
 
@@ -3731,19 +3853,51 @@ class WaveformController:
         if event.y >= self.LABEL_ZONE_HEIGHT:
             hit_mark, edge = self._mark_and_edge_at_x(event.x)
             if hit_mark is not None:
-                self.selected = ("mark", hit_mark["id"])
-                self._move_drag = {
-                    "mark": hit_mark, "edge": edge,
-                    "start_orig": hit_mark["start"], "end_orig": hit_mark.get("end"),
-                    "press_time": self._time_at_x(event.x), "orig_track_id": hit_mark.get("track_id"),
-                }
-                self.canvas.configure(cursor=self._cursor_for_edge(edge))
-                self.render_waveform()
+                self._start_move_drag(hit_mark, edge, event)
                 return
         self._press_info = {
             "x": event.x, "time": self._time_at_x(event.x),
             "shift": bool(event.state & 0x0001), "dragging": False,
         }
+
+    def _start_move_drag(self, hit_mark, edge, event):
+        """Press on a mark: select it and get ready to drag it. When it's
+        one of several selected marks and the press is on its body (not an
+        edge), the whole selection moves together -- in time, and onto
+        another track / the waveform. An edge resizes just that mark."""
+        group_ids = self.selected_mark_ids()
+        in_group = len(group_ids) > 1 and hit_mark["id"] in group_ids
+        if not in_group:
+            self._multi = []
+        self.selected = ("mark", hit_mark["id"])
+        group = []
+        if in_group and edge is None:
+            group = [(m, m["start"], m.get("end")) for m in self._selected_marks(group_ids)]
+        self._move_drag = {
+            "mark": hit_mark, "edge": edge,
+            "start_orig": hit_mark["start"], "end_orig": hit_mark.get("end"),
+            "press_time": self._time_at_x(event.x), "orig_track_id": hit_mark.get("track_id"),
+            "group": group,
+        }
+        self.canvas.configure(cursor=self._cursor_for_edge(edge))
+        self.render_waveform()
+
+    def _drag_group(self, event, crossing_rows):
+        """Move every selected mark by the same (snapped) time, keeping the
+        whole block inside 0 .. the end; crossing rows puts them back at
+        their own times (the drop decides the track)."""
+        group = self._move_drag["group"]
+        if crossing_rows:
+            delta = 0.0
+        else:
+            delta = self._snap_delta(self._time_at_x(event.x) - self._move_drag["press_time"], event)
+            first = min(s0 for _m, s0, _e0 in group)
+            last = max((e0 if e0 is not None else s0) for _m, s0, e0 in group)
+            delta = max(-first, min(self.max_mark_time() - last, delta))
+        for m, s0, e0 in group:
+            m["start"] = s0 + delta
+            if e0 is not None:
+                m["end"] = e0 + delta
 
     def _on_waveform_drag(self, event):
         if self._track_drag:
@@ -3806,7 +3960,10 @@ class WaveformController:
         current_zone = self._track_zone_at_y(event.y)
         crossing_rows = edge is None and current_zone != orig_zone
 
-        if crossing_rows:
+        if self._move_drag.get("group"):
+            self._drag_group(event, crossing_rows)
+            self.canvas.configure(cursor="hand2" if crossing_rows else self._cursor_for_edge(edge))
+        elif crossing_rows:
             mark["start"] = self._move_drag["start_orig"]
             if mark["type"] == "range":
                 mark["end"] = self._move_drag["end_orig"]
@@ -3834,6 +3991,7 @@ class WaveformController:
             self.canvas.configure(cursor=self._cursor_for_edge(edge))
         if edge is None:
             self._move_drag["preview_zone"] = current_zone
+        self._move_drag["moved"] = True
         self._move_drag["last_xy"] = (event.x, event.y)
         self.render_waveform()
 
@@ -3846,14 +4004,19 @@ class WaveformController:
         if self._move_drag:
             mark = self._move_drag["mark"]
             edge = self._move_drag.get("edge")
+            moving = [m for m, _s, _e in self._move_drag.get("group") or []] or [mark]
+            if self._move_drag.get("group") and not self._move_drag.get("moved"):
+                self._multi = []         # a plain click on one of several selected marks selects just it
             if edge is None:
                 zone, target = self._track_zone_at_y(event.y)
                 if zone == "work":
-                    mark["track_id"] = None
+                    for m in moving:
+                        m["track_id"] = None
                 elif zone == "track":
-                    mark["track_id"] = target
+                    for m in moving:
+                        m["track_id"] = target
                 else:
-                    self._prompt_new_track_for_mark(mark)
+                    self._prompt_new_track_for_marks(moving)
             self._move_drag = None
             self._mark_changed()
             self.render_waveform()
@@ -4488,6 +4651,13 @@ class WaveformController:
                          command=lambda: self.paste_marks(track_id, at_cursor=True))
 
     # ------------------------------------------------------------------ card actions on selections
+    def _after_menu(self, fn):
+        """Run a menu's bigger action once the menu has closed."""
+        try:
+            self.canvas.after_idle(fn)
+        except (tk.TclError, AttributeError):
+            fn()
+
     def merge_selection(self, ids=None):
         """Merge the selected marks (one track) into one card, in time
         order -- remembering the originals for Unmerge. One undo step."""
@@ -4564,16 +4734,16 @@ class WaveformController:
             menu.add_command(label="Merge with Next", state="normal" if next_m else "disabled",
                              command=lambda: self.merge_mark_by_id(m["id"], 1))
         else:
-            menu.add_command(label=f"Merge {n} into One Card", command=lambda: self.merge_selection(ids))
+            menu.add_command(label=f"Merge {n} into One Card", command=lambda: self._after_menu(lambda: self.merge_selection(ids)))
             menu.add_command(label=f"Split Each at @cursor  (where it's inside)", state="normal" if pos is not None
-                             else "disabled", command=lambda: self.split_selection("cursor", ids))
-            menu.add_command(label="Split Each in Half", command=lambda: self.split_selection("half", ids))
-            menu.add_command(label="Split Each into Words", command=lambda: self.split_selection("words", ids))
+                             else "disabled", command=lambda: self._after_menu(lambda: self.split_selection("cursor", ids)))
+            menu.add_command(label="Split Each in Half", command=lambda: self._after_menu(lambda: self.split_selection("half", ids)))
+            menu.add_command(label="Split Each into Words", command=lambda: self._after_menu(lambda: self.split_selection("words", ids)))
         merged = sum(1 for m in marks if len(m.get("pieces") or []) >= 2)
         if merged:
             label = (f"Unmerge into {len(marks[0]['pieces'])} Cards" if n == 1
                      else f"Unmerge {merged} Merged Card{'s' if merged != 1 else ''}")
-            menu.add_command(label=label, command=lambda: self.unmerge_selection(ids))
+            menu.add_command(label=label, command=lambda: self._after_menu(lambda: self.unmerge_selection(ids)))
 
     def _show_group_menu(self, ids, event):
         menu = tk.Menu(self.canvas, tearoff=False)
@@ -4785,11 +4955,70 @@ class WaveformController:
     # ------------------------------------------------------------------ bars / beats
     BEAT_TRACK_NAMES = {"beats": "Beats", "bars": "Bars"}
 
+    BEAT_LENGTH_CHOICES = (("fill", "Up to the next mark (touching)"),
+                           ("beat", "One beat"),
+                           ("lines", "No length (lines)"))
+
+    def beat_length(self):
+        value = get_preference("beats_length", "fill")
+        return value if value in dict(self.BEAT_LENGTH_CHOICES) else "fill"
+
+    def beat_labels(self):
+        return bool(get_preference("beats_labels", True))
+
+    def _styled_specs(self, specs, beats=None, end=None):
+        return th.style_beat_marks(specs, self.beat_length(), self.beat_labels(), beats=beats, end=end)
+
     def beats_per_bar(self):
         try:
             return max(1, min(16, int(get_preference("beats_per_bar", 4))))
         except (TypeError, ValueError):
             return 4
+
+    def _beats_submenu(self, key):
+        """The Beats menu's cascades, made once and refilled on each open
+        (a new tk.Menu per open piled up hidden menus)."""
+        subs = self.__dict__.setdefault("_beats_subs", {})
+        sub = subs.get(key)
+        if sub is None:
+            sub = tk.Menu(self.beats_menu, tearoff=False, bg="#ffffff", fg="#1e1e1e",
+                          activebackground="#cce4ff", activeforeground="#1e1e1e",
+                          disabledforeground="#9a9a9a", selectcolor="#1e1e1e")
+            subs[key] = sub
+        try:
+            sub.delete(0, "end")
+        except tk.TclError:
+            pass
+        return sub
+
+    def _reopen_menu(self, button, menu):
+        """Show a toolbar menu again right below its button. Tk closes a
+        menu on every click; an option (checkbox / radio choice) calls this
+        so the menu stays up until an action is picked or the user clicks
+        elsewhere (tk_popup takes the grab, so an outside click closes it)."""
+        def go():
+            try:
+                x = button.winfo_rootx()
+                y = button.winfo_rooty() + button.winfo_height()
+                menu.tk_popup(x, y)
+            except (tk.TclError, AttributeError):
+                pass
+        self._after_menu(go)
+
+    def _menu_option(self, button, menu, fn):
+        """A menu command for an option: apply it, keep the menu open."""
+        def run():
+            fn()
+            self._reopen_menu(button, menu)
+        return run
+
+    def _beats_pick(self, label, fn, *args):
+        """A Beats menu command: logged, then run once the menu has closed
+        (its grab released) so dialogs and the busy state behave."""
+        def run():
+            debug(2, f"beats menu: '{label}' picked")
+            fn(*args)
+        return lambda: self._after_menu(run)
 
     def _fill_beats_menu(self):
         menu = self.beats_menu
@@ -4798,39 +5027,85 @@ class WaveformController:
         except tk.TclError:
             pass
         bpb = self.beats_per_bar()
-        need = "" if aa.beats_available() else "  (needs librosa)"
-        state = "normal" if aa.beats_available() else "disabled"
-        menu.add_command(label="All beats" + need, state=state, command=lambda: self.run_beats("beats"))
-        menu.add_command(label="Downbeats (beat 1)" + need, state=state, command=lambda: self.run_beats("beat", 1))
-        sub = tk.Menu(menu, tearoff=False, bg="#ffffff", fg="#1e1e1e")
+        have = aa.beats_available()
+        need = "" if have else "  (needs librosa)"
+        state = "normal" if have else "disabled"
+        menu.add_command(label="All beats" + need, state=state,
+                         command=self._beats_pick("All beats", self.run_beats, "beats"))
+        menu.add_command(label="Downbeats (beat 1)" + need, state=state,
+                         command=self._beats_pick("Downbeats", self.run_beats, "beat", 1))
+        sub = self._beats_submenu("beat_n")
         for n in range(2, bpb + 1):
-            sub.add_command(label=f"Beat {n}", command=lambda k=n: self.run_beats("beat", k))
+            sub.add_command(label=f"Beat {n}", command=self._beats_pick(f"Beat {n}", self.run_beats, "beat", n))
         menu.add_cascade(label="Beat N of each bar" + need, menu=sub, state=state if bpb > 1 else "disabled")
-        menu.add_command(label="Bars (numbered)" + need, state=state, command=lambda: self.run_beats("bars"))
+        menu.add_command(label="Bars (numbered)" + need, state=state,
+                         command=self._beats_pick("Bars", self.run_beats, "bars"))
         menu.add_separator()
-        menu.add_command(label="Metronome...", command=self.run_metronome)
+        menu.add_command(label="Metronome...", command=self._beats_pick("Metronome", self.run_metronome))
         menu.add_separator()
-        per_bar = tk.Menu(menu, tearoff=False, bg="#ffffff", fg="#1e1e1e")
-        self._bpb_var = tk.IntVar(value=bpb)
+        per_bar = self._beats_submenu("per_bar")
+        if getattr(self, "_bpb_var", None) is None:
+            self._bpb_var = tk.IntVar(value=bpb)
+        self._bpb_var.set(bpb)
         for n in (2, 3, 4, 5, 6, 7, 8, 12):
             per_bar.add_radiobutton(label=str(n), variable=self._bpb_var, value=n,
-                                    command=lambda k=n: set_preference("beats_per_bar", k))
+                                    command=self._menu_option(self.beats_btn, menu,
+                                                              lambda k=n: set_preference("beats_per_bar", k)))
         menu.add_cascade(label=f"Beats per bar: {bpb}", menu=per_bar)
-        if not aa.beats_available():
+        where = self._beats_submenu("where")
+        if getattr(self, "_beat_scope_var", None) is None:
+            self._beat_scope_var = tk.StringVar(value=self.beat_scope())
+        self._beat_scope_var.set(self.beat_scope())
+        for key, label in self.BEAT_SCOPES:
+            where.add_radiobutton(label=label, variable=self._beat_scope_var, value=key,
+                                  command=self._menu_option(self.beats_btn, menu,
+                                                            lambda k=key: set_preference("beats_scope", k)))
+        menu.add_cascade(label="Where: " + dict(self.BEAT_SCOPES)[self.beat_scope()], menu=where)
+        length = self._beats_submenu("length")
+        if getattr(self, "_beat_length_var", None) is None:
+            self._beat_length_var = tk.StringVar(value=self.beat_length())
+        self._beat_length_var.set(self.beat_length())
+        for key, label in self.BEAT_LENGTH_CHOICES:
+            length.add_radiobutton(label=label, variable=self._beat_length_var, value=key,
+                                   command=self._menu_option(self.beats_btn, menu,
+                                                             lambda k=key: set_preference("beats_length", k)))
+        menu.add_cascade(label="Length: " + dict(self.BEAT_LENGTH_CHOICES)[self.beat_length()], menu=length)
+        if getattr(self, "_beat_labels_var", None) is None:
+            self._beat_labels_var = tk.BooleanVar(value=self.beat_labels())
+        self._beat_labels_var.set(self.beat_labels())
+        menu.add_checkbutton(label="Label the marks (beat / bar numbers)", variable=self._beat_labels_var,
+                             command=self._menu_option(self.beats_btn, menu, lambda: set_preference(
+                                 "beats_labels", bool(self._beat_labels_var.get()))))
+        if not have:
             menu.add_command(label="Install librosa: \u26a0 Install button (upper right)", state="disabled")
 
     def analysis_range(self):
         """The selected range mark's span, else @cursor .. the end."""
         return self.analysis_range_why()[:2]
 
-    def analysis_range_why(self):
-        """(start, end, where it came from) -- for messages."""
+    BEAT_SCOPES = (("auto", "The selected range, else the whole song"),
+                   ("cursor", "From the @cursor to the end"),
+                   ("all", "The whole song"))
+
+    def beat_scope(self):
+        value = get_preference("beats_scope", "auto")
+        return value if value in dict(self.BEAT_SCOPES) else "auto"
+
+    def analysis_range_why(self, scope="cursor"):
+        """(start, end, where it came from) -- for messages. scope:
+        "cursor" = the selected range, else @cursor .. end (Transcribe);
+        "auto" = the selected range, else the whole song;
+        "all" = the whole song (ignores the selection)."""
+        if scope == "all":
+            return 0.0, self.audio_duration or 0.0, "the whole song"
         mark = self.mark_by_id(self.selected_mark_id())
-        if mark and mark["type"] == "range" and mark.get("end") is not None:
+        if scope != "all" and mark and mark["type"] == "range" and mark.get("end") is not None:
             label = (mark.get("label") or "").strip()
             what = f"the selected {'card' if mark.get('track_id') else 'range'}" + (
                 f" \u201c{label[:30]}\u201d" if label else "")
             return mark["start"], mark["end"], what
+        if scope == "auto":
+            return 0.0, self.audio_duration or 0.0, "the whole song"
         start = self.cursor_position() or 0.0
         return start, self.audio_duration or start, "from the @cursor to the end"
 
@@ -4844,13 +5119,14 @@ class WaveformController:
             base = self.BEAT_TRACK_NAMES[mode]
         return th.unique_track_name(base, [t["name"] for t in self.tracks])
 
-    def _add_marks_track(self, name, specs):
+    def _add_marks_track(self, name, specs, source="beats"):
         """One new track holding these {start, end, label} marks (one undo step)."""
         track = self._new_track(name, record_history=False)
         for sp in specs:
-            self.marks.append({"id": uuid.uuid4().hex[:8], "type": "range", "start": sp["start"],
-                               "end": sp["end"], "label": sp["label"], "track_id": track["id"],
-                               "source": "beats"})
+            end = sp.get("end")
+            self.marks.append({"id": uuid.uuid4().hex[:8], "type": "range" if end is not None else "point",
+                               "start": sp["start"], "end": end, "label": sp["label"], "track_id": track["id"],
+                               "source": source})
         self.selected = ("track", track["id"])
         self._mark_changed()
         self.render_waveform()
@@ -4859,13 +5135,19 @@ class WaveformController:
     def run_beats(self, mode, which=1):
         """Detect beats (once per file; cached while it's open), then make
         a track for the range (selected range, or @cursor to the end)."""
-        if self._analysis_busy or self.audio_duration is None:
+        debug(2, f"beats: run mode={mode} which={which} busy={self._analysis_busy} "
+                 f"duration={self.audio_duration} librosa={aa.beats_available()}")
+        if self._analysis_busy:
+            self.announce(f"Beats: wait until the running job ({self._analysis_busy}) has finished")
+            return
+        if self.audio_duration is None:
+            self.announce("Beats: no audio loaded yet")
             return
         if not aa.beats_available():
             messagebox.showinfo("Beats", "Beat detection needs librosa, which isn't installed.\n\n"
                                          "Use the \u26a0 Install button in the upper right corner.")
             return
-        start, end, self._beat_range_why = self.analysis_range_why()
+        start, end, self._beat_range_why = self.analysis_range_why(self.beat_scope())
         cached = getattr(self, "_beat_cache", None)
         try:
             st = Path(self.filepath).stat()
@@ -4886,6 +5168,8 @@ class WaveformController:
             if error is not None:
                 self.append_info("{red}Beat detection error: " + _explained(error, "Beat detection") + "\n")
                 debug(1, f"{{red}}waveform_tab beats failed: {error}")
+                self.announce("Beats: detection failed -- see the text panel")
+                self._show_text_panel()
                 return
             self._beat_cache = {"stamp": stamp, "result": result}
             self.append_info(f"{{green}}Found {len(result['beats'])} beats, about {result['tempo']:.0f} BPM "
@@ -4897,6 +5181,7 @@ class WaveformController:
         bpb = self.beats_per_bar()
         phase = th.downbeat_phase(result["strength"], result["bass"], bpb)
         specs = th.beat_marks(result["beats"], start, end, bpb, phase, mode, which)
+        specs = self._styled_specs(specs, beats=result["beats"], end=end)
         in_range = sum(1 for t in result["beats"] if start - 1e-9 <= t < end)
         why = getattr(self, "_beat_range_why", "")
         debug(2, f"beats: mode={mode} which={which} range {start:.3f}-{end:.3f} ({why}); "
@@ -4908,13 +5193,187 @@ class WaveformController:
             else:
                 reason = (f"{in_range} beat{'s' if in_range != 1 else ''} in {span} ({why}), but no "
                           f"{'bar start' if mode == 'bars' else f'beat {which}'} among them")
-            self.append_info(f"{{yellow}}No track made: {reason}. Press Esc to clear the selection and use "
-                             "the @cursor (or select a longer range).\n")
+            self.append_info(f"{{yellow}}No track made: {reason}. Select nothing (Esc) and try again, or pick "
+                             "Where \u25b8 The whole song in the Beats menu.\n")
+            self.announce("Beats: no track made -- see the text panel")
+            self._show_text_panel()
             return None
         track = self._add_marks_track(self._beat_track_name(mode, which), specs)
         self.append_info(f"{{blue}}Track \u201c{track['name']}\u201d: {len(specs)} marks "
                          f"({th.format_time_ms(start)}\u2013{th.format_time_ms(end)}, {bpb} beats per bar). "
                          "Which beat starts a bar is a guess: right-click a mark > Renumber from Here.\n")
+        self.announce(f"Beats: new track \u201c{track['name']}\u201d ({len(specs)} marks)")
+        return track
+
+    # ------------------------------------------------------------------ Structure
+    STRUCTURE_NAMES = (("guess", "Guessed (Intro, Verse, Chorus...)"),
+                       ("letters", "Letters only (A, B, C...)"),
+                       ("both", "Both (Verse 1 \u00b7 A)"))
+    STRUCTURE_BARS = (2, 4, 8, 16)
+    STRUCTURE_TRACK_NAME = "Structure"
+
+    def structure_names(self):
+        value = get_preference("structure_names", "guess")
+        return value if value in dict(self.STRUCTURE_NAMES) else "guess"
+
+    def structure_bars(self):
+        try:
+            value = int(get_preference("structure_min_bars", 4))
+        except (TypeError, ValueError):
+            value = 4
+        return value if value in self.STRUCTURE_BARS else 4
+
+    def _structure_submenu(self, key):
+        subs = self.__dict__.setdefault("_structure_subs", {})
+        sub = subs.get(key)
+        if sub is None:
+            sub = tk.Menu(self.structure_menu, tearoff=False, bg="#ffffff", fg="#1e1e1e",
+                          activebackground="#cce4ff", activeforeground="#1e1e1e",
+                          disabledforeground="#9a9a9a", selectcolor="#1e1e1e")
+            subs[key] = sub
+        try:
+            sub.delete(0, "end")
+        except tk.TclError:
+            pass
+        return sub
+
+    def _fill_structure_menu(self):
+        menu = self.structure_menu
+        try:
+            menu.delete(0, "end")
+        except tk.TclError:
+            pass
+        have = aa.structure_available()
+        menu.add_command(label="Find sections \u2192 new \u201cStructure\u201d track" + ("" if have else "  (needs librosa)"),
+                         state="normal" if have else "disabled",
+                         command=self._beats_pick("Structure", self.run_structure))
+        menu.add_separator()
+        names = self._structure_submenu("names")
+        if getattr(self, "_structure_names_var", None) is None:
+            self._structure_names_var = tk.StringVar(value=self.structure_names())
+        self._structure_names_var.set(self.structure_names())
+        for key, label in self.STRUCTURE_NAMES:
+            names.add_radiobutton(label=label, variable=self._structure_names_var, value=key,
+                                  command=self._menu_option(self.structure_btn, menu,
+                                                            lambda k=key: set_preference("structure_names", k)))
+        menu.add_cascade(label="Names: " + dict(self.STRUCTURE_NAMES)[self.structure_names()], menu=names)
+        bars = self._structure_submenu("bars")
+        if getattr(self, "_structure_bars_var", None) is None:
+            self._structure_bars_var = tk.IntVar(value=self.structure_bars())
+        self._structure_bars_var.set(self.structure_bars())
+        for n in self.STRUCTURE_BARS:
+            bars.add_radiobutton(label=f"{n} bars", variable=self._structure_bars_var, value=n,
+                                 command=self._menu_option(self.structure_btn, menu,
+                                                           lambda k=n: set_preference("structure_min_bars", k)))
+        menu.add_cascade(label=f"Shortest section: {self.structure_bars()} bars", menu=bars)
+        menu.add_command(label=f"Beats per bar: {self.beats_per_bar()}  (set in Beats \u25be)", state="disabled")
+        if not have:
+            menu.add_command(label="Install librosa: \u26a0 Install button (upper right)", state="disabled")
+
+    def _file_stamp(self):
+        try:
+            st = Path(self.filepath).stat()
+            return (st.st_mtime, st.st_size)
+        except OSError:
+            return None
+
+    def run_structure(self):
+        """Analyze the whole song (once per file while it's open), then
+        make a "Structure" track of its sections."""
+        debug(2, f"structure: run busy={self._analysis_busy} duration={self.audio_duration}")
+        if self._analysis_busy:
+            self.announce(f"Structure: wait until the running job ({self._analysis_busy}) has finished")
+            return
+        if self.audio_duration is None:
+            self.announce("Structure: no audio loaded yet")
+            return
+        if not aa.structure_available():
+            messagebox.showinfo("Structure", "Finding sections needs librosa, which isn't installed.\n\n"
+                                             "Use the \u26a0 Install button in the upper right corner.")
+            return
+        stamp = self._file_stamp()
+        cached = getattr(self, "_structure_cache", None)
+        if cached and cached.get("stamp") == stamp:
+            return self._make_structure_track(cached["result"])
+        self._set_analysis_busy("structure")
+        self.append_info("\n{yellow}Finding the song's sections in the background...\n")
+
+        def work(progress):
+            return aa.structure_features(self.filepath, progress)
+
+        def done(result, error, elapsed):
+            self._set_analysis_busy(None)
+            self.analysis_status_var.set("")
+            if error is not None:
+                self.append_info("{red}Structure analysis error: " + _explained(error, "Structure analysis") + "\n")
+                debug(1, f"{{red}}waveform_tab structure failed: {error}")
+                self.announce("Structure: analysis failed -- see the text panel")
+                self._show_text_panel()
+                return
+            self._structure_cache = {"stamp": stamp, "result": result}
+            # the beats come for free: Beats \u25be reuses them
+            self._beat_cache = {"stamp": stamp, "result": {k: result[k] for k in ("tempo", "beats", "strength", "bass")}}
+            self.append_info(f"{{green}}Analyzed {len(result['beats'])} beats, about {result['tempo']:.0f} BPM "
+                             f"({elapsed:.1f}s).\n")
+            self._make_structure_track(result)
+        self._run_in_thread(work, done, progress_prefix="Structure: ")
+
+    def _vocal_fraction(self, start, end):
+        """Share of [start, end) with vocals in the stem regions (None if
+        stems haven't been separated)."""
+        if not self.regions or end <= start:
+            return None
+        sung = 0.0
+        for r in self.regions:
+            if r.get("kind") in ("vocal", "mixed"):
+                sung += max(0.0, min(end, r["end"]) - max(start, r["start"]))
+        return sung / (end - start)
+
+    def structure_specs(self, result):
+        """{start, end, label} per section from structure_features()."""
+        beats = result["beats"]
+        n = len(beats)
+        bpb = self.beats_per_bar()
+        phase = th.downbeat_phase(result["strength"], result["bass"], bpb)
+        downbeats = [i for i in range(n) if (i - phase) % bpb == 0]
+        min_beats = max(4, self.structure_bars() * bpb)
+        found = aa.find_sections(result["features"], downbeats, min_beats=min_beats)
+        bounds, letters = found["bounds"], found["letters"]
+        end_time = self.audio_duration or (beats[-1] if beats else 0.0)
+        specs, energy, vocal = [], [], []
+        rms = result.get("rms") or [1.0] * n
+        for i in range(len(letters)):
+            a, b = bounds[i], bounds[i + 1]
+            start = 0.0 if i == 0 else beats[a]
+            stop = end_time if i == len(letters) - 1 else beats[b]
+            if stop - start < th.MIN_RANGE:
+                continue
+            specs.append({"start": start, "end": stop, "letter": letters[i]})
+            energy.append(sum(rms[a:b]) / max(1, b - a))
+            vocal.append(self._vocal_fraction(start, stop))
+        names = aa.name_sections([sp["letter"] for sp in specs], energy, vocal)
+        style = self.structure_names()
+        for sp, name in zip(specs, names):
+            sp["label"] = (sp["letter"] if style == "letters"
+                           else f"{name} \u00b7 {sp['letter']}" if style == "both" else name)
+        return specs
+
+    def _make_structure_track(self, result):
+        specs = self.structure_specs(result)
+        if not specs:
+            self.append_info("{yellow}No sections found (the song may be too short).\n")
+            self.announce("Structure: no sections found -- see the text panel")
+            self._show_text_panel()
+            return None
+        name = th.unique_track_name(self.STRUCTURE_TRACK_NAME, [t["name"] for t in self.tracks])
+        track = self._add_marks_track(name, [{"start": sp["start"], "end": sp["end"], "label": sp["label"]}
+                                             for sp in specs], source="structure")
+        lines = "".join(f"{{cyan}}  {th.format_time_ms(sp['start'])}\u2013{th.format_time_ms(sp['end'])}  "
+                        f"{{blue}}{sp['letter']}  {{cyan}}{sp['label']}\n" for sp in specs)
+        self.append_info(f"{{blue}}Track \u201c{track['name']}\u201d: {len(specs)} sections "
+                         f"(shortest {self.structure_bars()} bars; same letter = the music repeats). "
+                         "The names are a guess -- edit them in the cards.\n" + lines)
+        self.announce(f"Structure: new track \u201c{track['name']}\u201d ({len(specs)} sections)")
         return track
 
     def run_metronome(self, text=None):
@@ -4931,11 +5390,18 @@ class WaveformController:
             messagebox.showinfo("Metronome", f"Couldn't read \u201c{text}\u201d. Try 0.5, 500 ms or 120 bpm.")
             return None
         set_preference("metronome_interval", text.strip())
-        start, end = self.analysis_range()
+        start, end, _why = self.analysis_range_why(self.beat_scope())
         specs = th.metronome_marks(start, end, interval, self.beats_per_bar())
+        specs = self._styled_specs(specs, end=end)
         if not specs:
+            self.append_info(f"{{yellow}}Metronome: no ticks between {th.format_time_ms(start)} and "
+                             f"{th.format_time_ms(end)} ({_why}).\n")
+            self.announce("Metronome: no track made -- see the text panel")
+            self._show_text_panel()
             return None
-        return self._add_marks_track(self._beat_track_name("metronome", interval=interval), specs)
+        track = self._add_marks_track(self._beat_track_name("metronome", interval=interval), specs)
+        self.announce(f"Metronome: new track \u201c{track['name']}\u201d ({len(specs)} marks)")
+        return track
 
     def _show_track_menu(self, track, event):
         menu = tk.Menu(self.canvas, tearoff=False)
@@ -5155,6 +5621,8 @@ class WaveformController:
     def render_waveform(self):
         if getattr(self, "closing", False):
             return
+        if getattr(self, "_batch_depth", 0):
+            return                         # _one_step draws once when the whole batch is done
         crumb("waveform render")
         self._remember_selection_later()
         c = self.canvas

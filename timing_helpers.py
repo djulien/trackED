@@ -35,6 +35,7 @@ audio_tab.py already uses for its own dependencies.
 
 from __future__ import annotations
 
+import bisect
 import array
 import json
 import os
@@ -1807,7 +1808,8 @@ def beat_marks(beats: List[float], start: float, end: float, beats_per_bar: int 
     [start, end):
       "beats" -- every beat, labeled with its number in the bar (1..N),
                  lasting until the next beat
-      "beat"  -- only beat number `which` of each bar, one beat long
+      "beat"  -- only beat number `which` of each bar, one beat long,
+                 labeled with the bar number (beat 1) or "bar.beat"
       "bars"  -- one mark per bar (from each beat 1), numbered 1, 2, 3...
                  from the first bar in the range, lasting the whole bar
     phase: index of a beat that is beat 1 (see downbeat_phase)."""
@@ -1833,14 +1835,65 @@ def beat_marks(beats: List[float], start: float, end: float, beats_per_bar: int 
         n = number(i)
         if mode == "beats":
             out.append({"start": t, "end": min(next_time(i), end), "label": str(n)})
-        elif mode == "beat":
-            if n == which:
-                out.append({"start": t, "end": min(next_time(i), end), "label": str(n)})
-        elif mode == "bars":
+        else:
             if n == 1:
                 bar_no += 1
+            if mode == "beat" and n == which:
+                # downbeats: the bar number; beat N: "bar.N" (bar 0 = before the first bar start)
+                label = str(bar_no) if which == 1 else f"{bar_no}.{n}"
+                out.append({"start": t, "end": min(next_time(i), end), "label": label})
+            elif mode == "bars" and n == 1:
                 out.append({"start": t, "end": min(next_time(i, bpb), end), "label": str(bar_no)})
     return [m for m in out if m["end"] - m["start"] > 1e-6]
+
+
+BEAT_LENGTHS = ("fill", "beat", "lines")     # Beats > Length: up to the next mark / one beat / no length
+
+
+def style_beat_marks(specs: List[Dict[str, Any]], length: str = "fill", labels: bool = True,
+                     beats: Optional[List[float]] = None, end: Optional[float] = None) -> List[Dict[str, Any]]:
+    """The Beats menu's Labels / Length choices, applied to beat_marks()
+    or metronome_marks() output (new dicts; sorted by start):
+      length "fill"  -- each mark lasts until the next one starts (touching);
+                        the last one as long as the usual spacing (to `end`)
+             "beat"  -- one beat long (the next beat time in `beats`, else
+                        the median beat spacing)
+             "lines" -- no length (end None: point marks)
+      labels False   -- empty labels."""
+    out = [dict(m) for m in sorted(specs, key=lambda m: m["start"])]
+    if not out:
+        return out
+    starts = [m["start"] for m in out]
+    if length == "lines":
+        for m in out:
+            m["end"] = None
+    elif length == "beat":
+        bts = sorted(beats or [])
+        blen = _beat_len(bts) if len(bts) >= 2 else None
+        for m in out:
+            j = bisect.bisect_right(bts, m["start"] + 1e-6)
+            if j < len(bts):
+                stop = bts[j]
+            elif blen:
+                stop = m["start"] + blen
+            else:
+                stop = m["end"]
+            if end is not None:
+                stop = min(stop, end)
+            m["end"] = stop if stop is not None and stop - m["start"] > 1e-6 else m["end"]
+    else:  # fill
+        gaps = sorted(b - a for a, b in zip(starts, starts[1:]) if b - a > 1e-6)
+        typical = gaps[len(gaps) // 2] if gaps else None
+        for i, m in enumerate(out):
+            if i + 1 < len(out):
+                m["end"] = out[i + 1]["start"]
+            elif typical is not None:
+                m["end"] = m["start"] + typical if end is None else min(end, m["start"] + typical)
+        out = [m for m in out if m["end"] is None or m["end"] - m["start"] > 1e-6]
+    if not labels:
+        for m in out:
+            m["label"] = ""
+    return out
 
 
 def parse_interval(text: str) -> Optional[float]:

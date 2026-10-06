@@ -163,6 +163,11 @@ class FakeWidget:
         AFTERS.append(fn)
         return f"after#{len(AFTERS)}"
 
+    def after_idle(self, fn, *args):
+        """Like Tk: runs later (run_afters), not never."""
+        AFTERS.append(fn)
+        return f"after#{len(AFTERS)}"
+
     def after_cancel(self, ident):
         pass
 
@@ -3728,8 +3733,9 @@ def test_round11(th, wt, media):
     ctl.selected = ("track", tr["id"]); ctl.render_waveform(); run_afters()
     card = panel.cards[ids[0]]
     order = [b.cget("text") for b in card["tbtns"]]
-    check(order == ["\u2196", "[", "\u21e4", "\u2212", "+", "\u2197", "@", "\u2199", "\u2212", "+", "\u21e5", "]", "\u2198", "@"],
-          "Start/End buttons: the earlier ones left of the box, the later ones and @ right of it")
+    check(order[:-1] == ["\u2196", "[", "\u21e4", "\u2212", "+", "\u2197", "@", "\u2199", "\u2212", "+", "\u21e5", "]", "\u2198", "@"]
+          and card["tbtns"][-1] is card["lock"],
+          "Start/End buttons: the earlier ones left of the box, the later ones and @ right of it (then the lock)")
     check(card["join"].cget("text") == "<Join none" and card["rest"].cget("text") == "Join> none",
           "the buttons are named <Join (Start side) and Join> (End side)")
     check(card["frame"].cget("bg") != "#f4f4f4" and tp.contrast_fg(card["frame"].cget("bg")) == tp.LIGHT_TEXT
@@ -4485,8 +4491,8 @@ def test_round15(th, aa, wt, media):
     check([m["label"] for m in all_b] == ["4", "1", "2", "3", "4", "1", "2", "3"] and all_b[0]["end"] == 2.5,
           "All beats: beat numbers in the bar, each lasting until the next beat")
     down = th.beat_marks(beats, 0.0, 20.0, 4, phase, "beat", 1)
-    check(all(m["label"] == "1" for m in down) and abs(down[0]["end"] - down[0]["start"] - 0.5) < 1e-9
-          and down[0]["start"] == 0.5, "Downbeats: only beat 1, one beat long")
+    check([m["label"] for m in down[:3]] == ["1", "2", "3"] and abs(down[0]["end"] - down[0]["start"] - 0.5) < 1e-9
+          and down[0]["start"] == 0.5, "Downbeats: only beat 1, one beat long, labeled with the bar number")
     bars = th.beat_marks(beats, 0.0, 20.0, 4, phase, "bars")
     check([m["label"] for m in bars[:3]] == ["1", "2", "3"] and abs(bars[0]["end"] - bars[0]["start"] - 2.0) < 1e-9,
           "Bars: numbered from 1, each a whole bar")
@@ -4513,6 +4519,7 @@ def test_round15(th, aa, wt, media):
         return {"tempo": 120.0, "beats": beats, "strength": strength, "bass": bass}
     aa.detect_beats = fake_detect
     try:
+        wt.set_preference("beats_scope", "cursor")      # Where > From the @cursor to the end
         ctl2.cursor_time = 4.0
         ctl2.run_beats("bars"); run_afters()
         names = [t["name"] for t in ctl2.tracks]
@@ -5200,8 +5207,16 @@ def test_round21(th, aa, wt, media):
         root = FakeWidget()
         root.after = lambda ms, fn: AFTERS.append(fn) or len(AFTERS)
         root.after_cancel = lambda i: None
-        root.bind_class = lambda *a, **k: None
+        class_binds = []
+        root.bind_class = lambda cls, seq, fn, add=None: class_binds.append((cls, seq, add))
         log = tracked.UserActionLog(root)
+        # Tk's menu.tcl binds these on the Menu class; a more specific
+        # sequence (e.g. <ButtonRelease-1>) would replace Tk's and menus
+        # would stop working -- so only these exact sequences, appended.
+        tk_menu_class_seqs = {"<ButtonRelease>", "<KeyPress-Return>", "<<MenuSelect>>"}
+        check(all(cls == "Menu" and seq in tk_menu_class_seqs and add == "+" for cls, seq, add in class_binds)
+              and ("Menu", "<ButtonRelease>", "+") in class_binds,
+              "the action log adds to Tk's own Menu bindings instead of replacing them (menu items keep working)")
 
         class W:
             def __init__(self, cls, text="", path=".tab.card.start"):
@@ -5331,7 +5346,787 @@ def test_round22(th, aa, wt, media):
     check(len(ctl.track_marks(tr["id"])) == 4, "Unmerge from the menu")
 
 
+def test_round23(th, aa, wt, media):
+    print("\n-- round 23: Beats 'Where', group highlight in the card editor, batch splits draw once --")
+    ctl, c, _t, _tab = bare_controller(wt, fresh_copy(media, "r23"), 20.0)
+    rng = ctl._add_mark("range", 5.0, 9.0)
+    ctl.cursor_time = 12.0
+    ctl.selected = None
+    check(ctl.analysis_range_why("auto")[:2] == (0.0, 20.0), "Where: nothing selected -> the whole song (default)")
+    ctl.selected = ("mark", rng["id"])
+    check(ctl.analysis_range_why("auto")[:2] == (5.0, 9.0), "...a selected range -> just that range")
+    check(ctl.analysis_range_why("all")[:2] == (0.0, 20.0), "Where: the whole song, even with a selection")
+    ctl.selected = None
+    check(ctl.analysis_range_why("cursor")[:2] == (12.0, 20.0), "Where: from the @cursor to the end")
+    wt.set_preference("beats_scope", "auto")
+    check(ctl.beat_scope() == "auto", "the choice is remembered")
+    real = aa.beats_available
+    aa.beats_available = lambda: True
+    try:
+        ctl.beats_menu.entries.clear(); ctl._fill_beats_menu()
+        labels = ctl.beats_menu.labels()
+    finally:
+        aa.beats_available = real
+    check(any(l.startswith("Where: The selected range, else the whole song") for l in labels), "the Beats menu has Where \u25b8")
+
+    # Shift+click: every card in the run is highlighted in the card editor
+    ctl2, c2, _t2, _tab2 = bare_controller(wt, fresh_copy(media, "r23b"), 100.0)
+    tr = ctl2._new_track("L")
+    ms = [ctl2._add_mark("range", float(i), i + 0.9, label=f"w{i}", track_id=tr["id"]) for i in range(1, 7)]
+    ctl2.selected = ("track", tr["id"]); ctl2.render_waveform(); run_afters()
+    panel = ctl2.panel
+    ctl2.select_mark(ms[0]["id"]); run_afters()
+    ctl2.extend_selection(ms[4], toggle=False); run_afters()
+    sel_bg = panel._card_bg(selected=True)
+    painted = [panel.cards[m["id"]]["frame"].cget("bg") == sel_bg for m in ms]
+    check(painted == [True, True, True, True, True, False], "Shift+click highlights every card of the run, not just the ends")
+
+    # a batch draws once
+    renders = []
+    real_render = ctl2.render_waveform
+    ctl2.render_waveform = lambda: (renders.append(1) if not getattr(ctl2, "_batch_depth", 0) else None,
+                                    real_render())[1]
+    ms2 = [m for m in ctl2.track_marks(tr["id"])]
+    for m in ms2:
+        m["label"] = "a b c"
+    ctl2._multi = [m["id"] for m in ms2]
+    ctl2.selected = ("mark", ms2[0]["id"])
+    ctl2.split_selection("words")
+    ctl2.render_waveform = real_render
+    check(len(renders) == 1 and len(ctl2.track_marks(tr["id"])) == 18,
+          "Split Each into Words redraws once at the end (not after every card)")
+
+
+def test_round24(th, aa, wt, media):
+    print("\n-- round 24: bar numbers on downbeats, text panel during long jobs, progress on one line --")
+    beats = [0.5 * i for i in range(20)]
+    b3 = th.beat_marks(beats, 0.0, 10.0, 4, 0, "beat", 3)
+    check([m["label"] for m in b3[:3]] == ["1.3", "2.3", "3.3"], "Beat N is labeled bar.beat")
+    late = th.beat_marks(beats, 3.0, 10.0, 4, 0, "beat", 1)
+    check(late[0]["label"] == "1" and late[0]["start"] == 4.0, "bar numbers count from the first bar in the range")
+
+    ctl, c, _t, _tab = bare_controller(wt, fresh_copy(media, "r24"), 20.0)
+    tr = ctl._new_track("Lyrics")
+    m = ctl._add_mark("range", 1.0, 2.0, label="x", track_id=tr["id"])
+    ctl.selected = ("mark", m["id"]); ctl.render_waveform(); run_afters()
+    check(ctl.panel.mode == "track", "(a card is showing in the card editor)")
+    ctl._set_analysis_busy("beats"); run_afters()
+    check(ctl.selected is None and ctl.panel.mode == "info", "a long job switches to the text panel so its progress shows")
+    ctl._set_analysis_busy(None); run_afters()
+    check(ctl.selected == ("mark", m["id"]), "...and selects the card again when it's done")
+    ctl._set_analysis_busy("beats")
+    ctl.selected = ("track", tr["id"])                 # the job picks its own selection (e.g. the new track)
+    ctl._set_analysis_busy(None)
+    check(ctl.selected == ("track", tr["id"]), "...unless something else got selected meanwhile")
+    ctl.selected = None; ctl.render_waveform(); run_afters()
+
+    text = ctl.panel.text
+    ctl.append_info("{blue}before\n")
+    for pct in (10, 40, 90):
+        ctl.progress_info(f"{{cyan}}  Beats: working ({pct}%)\n")
+    ctl.append_info("{green}done\n")
+    ctl.progress_info("{cyan}  next job (5%)\n")
+    shown = text.get("1.0", "end")
+    check(shown.count("Beats: working") == 1 and "(90%)" in shown and "(10%)" not in shown
+          and shown.index("before") < shown.index("90%") < shown.index("done") < shown.index("next job"),
+          "progress percentages update one line in place; other messages stay")
+    check(ctl.info_text.count("Beats: working") == 1 and ctl.info_text.endswith("next job (5%)\n"),
+          "...also in the saved info text (shown again after the card editor)")
+
+
+def test_group_drag(th, aa, wt, media):
+    print("\n-- dragging several selected marks together --")
+    ctl, c, _t, _tab = bare_controller(wt, fresh_copy(media, "r25"), 100.0)
+    x_of = lambda t: int((t / 100.0) * 800)
+    tr = ctl._new_track("Lyrics")
+    other = ctl._new_track("Other")
+    ms = [ctl._add_mark("range", float(s_), s_ + 8.0, label=f"m{s_}", track_id=tr["id"]) for s_ in (10, 20, 30, 40)]
+    ctl.render_waveform()
+
+    def band_y(track_id):
+        for y in range(0, 600):
+            z, t_ = ctl._track_zone_at_y(y)
+            if z == "track" and t_ == track_id:
+                return y + 3
+    work_y = 30
+    ctl.selected = ("mark", ms[1]["id"]); ctl._multi = [ms[1]["id"], ms[2]["id"], ms[3]["id"]]
+    y = band_y(tr["id"])
+    h = ctl._mark_history_index
+    # drag the middle of one selected mark up onto the waveform
+    ctl._on_waveform_press(Event(x=x_of(24.0), y=y))
+    ctl._on_waveform_drag(Event(x=x_of(24.0), y=work_y))
+    ctl._on_waveform_release(Event(x=x_of(24.0), y=work_y))
+    moved = [ctl.mark_by_id(m["id"]) for m in ms[1:]]
+    check(all(m.get("track_id") is None for m in moved) and ctl.mark_by_id(ms[0]["id"])["track_id"] == tr["id"],
+          "dragging one of several selected marks onto the waveform takes all of them")
+    check([m["start"] for m in moved] == [20.0, 30.0, 40.0], "...at their own times")
+    check(ctl._mark_history_index == h + 1, "...one undo step")
+    check(ctl.selected_mark_ids() == [m["id"] for m in moved], "...and they stay selected")
+    # drag them along in time (same row): all move by the same amount
+    ctl._on_waveform_press(Event(x=x_of(34.0), y=work_y + 10))
+    ctl._on_waveform_drag(Event(x=x_of(39.0), y=work_y + 10, state=0x0001))
+    ctl._on_waveform_release(Event(x=x_of(39.0), y=work_y + 10, state=0x0001))
+    starts = [ctl.mark_by_id(m["id"])["start"] for m in ms[1:]]
+    check(abs(starts[0] - 25.0) < 0.2 and abs((starts[1] - starts[0]) - 10.0) < 1e-6 and abs((starts[2] - starts[1]) - 10.0) < 1e-6,
+          "dragging sideways moves the whole selection by the same time")
+    # can't push the block past the end
+    ctl._on_waveform_press(Event(x=x_of(44.0), y=work_y + 10))
+    ctl._on_waveform_drag(Event(x=x_of(99.0), y=work_y + 10, state=0x0001))
+    ctl._on_waveform_release(Event(x=x_of(99.0), y=work_y + 10, state=0x0001))
+    last = ctl.mark_by_id(ms[3]["id"])
+    check(last["end"] <= ctl.max_mark_time() + 1e-6 and
+          abs((last["start"] - ctl.mark_by_id(ms[1]["id"])["start"]) - 20.0) < 1e-6,
+          "...the block stops at the end without changing its spacing")
+    # into another track
+    ctl._on_waveform_press(Event(x=x_of(ctl.mark_by_id(ms[1]["id"])["start"] + 4.0), y=work_y + 10))
+    oy = band_y(other["id"])
+    ctl._on_waveform_drag(Event(x=x_of(ctl.mark_by_id(ms[1]["id"])["start"] + 4.0), y=oy))
+    ctl._on_waveform_release(Event(x=x_of(ctl.mark_by_id(ms[1]["id"])["start"] + 4.0), y=oy))
+    check(all(ctl.mark_by_id(m["id"])["track_id"] == other["id"] for m in ms[1:]), "...or into another track")
+    # an edge still resizes just that mark; a plain click selects just one
+    ctl._on_waveform_press(Event(x=x_of(ctl.mark_by_id(ms[2]["id"])["start"] + 4.0), y=band_y(other["id"])))
+    ctl._on_waveform_release(Event(x=x_of(ctl.mark_by_id(ms[2]["id"])["start"] + 4.0), y=band_y(other["id"])))
+    check(ctl.selected_mark_ids() == [ms[2]["id"]], "a click without dragging on one of them selects just that one")
+    ctl.selected = ("mark", ms[0]["id"]); ctl._multi = []
+    ctl._on_waveform_press(Event(x=x_of(14.0), y=band_y(tr["id"])))
+    ctl._on_waveform_drag(Event(x=x_of(18.0), y=band_y(tr["id"]), state=0x0001))
+    ctl._on_waveform_release(Event(x=x_of(18.0), y=band_y(tr["id"]), state=0x0001))
+    check(abs(ctl.mark_by_id(ms[0]["id"])["start"] - 14.0) < 0.2 and ctl.mark_by_id(ms[2]["id"])["track_id"] == other["id"],
+          "a single selected mark still drags on its own")
+
+
 # ---------------------------------------------------------------------------
+
+
+def test_round25(th, aa, wt, media):
+    print("\n-- round 25: Beats menu picks work (tooltip over the menu, deferred picks, visible results) --")
+    # Tooltip: never shown while a menu is posted (grab) or after the pointer moved on;
+    # a second Enter doesn't leave an uncancellable timer behind.
+    class Stub:
+        def __init__(self):
+            self.grab, self.under, self.timers, self.n = None, None, {}, 0
+        def bind(self, *a, **k): pass
+        def after(self, ms, fn):
+            self.n += 1; self.timers[self.n] = fn; return self.n
+        def after_cancel(self, i): self.timers.pop(i, None)
+        def grab_current(self): return self.grab
+        def winfo_pointerxy(self): return (1, 1)
+        def winfo_containing(self, x, y): return self.under
+        def winfo_rootx(self): return 0
+        def winfo_rooty(self): return 0
+        def winfo_height(self): return 20
+    w = Stub()
+    tip = wt._Tooltip(w, "help")
+    tip._schedule(); tip._schedule()
+    check(len(w.timers) == 1, "two Enters in a row leave one pending tooltip, not two")
+    tip._hide()
+    check(not w.timers, "...and leaving cancels it")
+    w.grab = w
+    tip._schedule()
+    check(not w.timers, "no tooltip is scheduled while the button's menu holds the grab")
+    w.grab = None
+    tip._schedule()
+    w.grab = w
+    list(w.timers.values())[0]()
+    check(tip._tip is None, "a tooltip due while the menu is open doesn't cover the menu")
+    w.grab, w.under = None, object()
+    tip._schedule(); list(w.timers.values())[0]()
+    check(tip._tip is None, "...nor once the pointer is over something else")
+    w.under = w
+    tip._schedule(); list(w.timers.values())[0]()
+    check(tip._tip is not None, "it still shows when resting on the button")
+    tip._hide()
+
+    ctl, c, _t, _tab = bare_controller(wt, fresh_copy(media, "r25"), 20.0)
+    check(ctl.beats_menu.cget("disabledforeground") == wt.TB_DISABLED,
+          "greyed-out toolbar menu entries are visibly gray on the dark menu")
+    beats = [round(0.5 * i, 3) for i in range(40)]
+    real_avail, real_detect = aa.beats_available, aa.detect_beats
+    aa.beats_available = lambda: True
+    result = {"tempo": 120.0, "beats": beats, "strength": [1.0] * 40,
+              "bass": [3.0 if i % 4 == 1 else 0.2 for i in range(40)]}
+    aa.detect_beats = lambda path, progress=None: result
+    try:
+        wt.set_preference("beats_scope", "auto")
+        ctl.selected = None
+        ctl.beats_menu.entries.clear(); ctl._fill_beats_menu()
+        subs_before = dict(ctl._beats_subs)
+        ctl.beats_menu.invoke_label("All beats")
+        check(not ctl.tracks, "a Beats pick runs after the menu has closed (not inside the menu's grab)")
+        run_afters()
+        check([t["name"] for t in ctl.tracks] == ["Beats"], "Beats \u25be > All beats makes a track")
+        check("Beats" in ctl.play_status_var.get() and "new track" in ctl.play_status_var.get(),
+              "...and says so on the status bar")
+        ctl.beats_menu.entries.clear(); ctl._fill_beats_menu()
+        check(ctl._beats_subs == subs_before and all(len(ctl._beats_subs[k].entries) > 0 for k in ctl._beats_subs),
+              "the cascades are refilled, not re-created, each time the menu opens")
+        sub = ctl._beats_subs["beat_n"]
+        sub.invoke_label("Beat 3"); run_afters()
+        check(ctl.tracks[-1]["name"] == "Beat 3", "Beat N of each bar \u25b8 Beat 3 works")
+        ctl.beats_menu.invoke_label("Bars (numbered)"); run_afters()
+        check(ctl.tracks[-1]["name"] == "Bars", "Bars works")
+
+        # a selected card with no beat 1 in it: the reason is shown, not hidden behind the card editor
+        tr = ctl._new_track("Lyrics")
+        card = ctl._add_mark("range", 1.0, 1.2, label="word", track_id=tr["id"])
+        ctl.selected = ("mark", card["id"]); ctl.render_waveform(); run_afters()
+        n_tracks = len(ctl.tracks)
+        ctl.run_beats("bars"); run_afters()
+        check(len(ctl.tracks) == n_tracks and ctl.panel.mode == "info" and "No track made" in ctl.info_text,
+              "no track made: the text panel shows why (the card editor no longer hides it)")
+        check("no track made" in ctl.play_status_var.get(), "...and the status bar points to it")
+
+        # detection fails on the first run: the error stays visible
+        ctl3, _c3, _t3, _tab3 = bare_controller(wt, fresh_copy(media, "r25b"), 20.0)
+        tr3 = ctl3._new_track("Lyrics")
+        card3 = ctl3._add_mark("range", 1.0, 5.0, label="x", track_id=tr3["id"])
+        ctl3.selected = ("mark", card3["id"]); ctl3.render_waveform(); run_afters()
+
+        def boom(path, progress=None):
+            raise RuntimeError("no backend")
+        aa.detect_beats = boom
+        ctl3.run_beats("beats"); run_afters()
+        check(ctl3.panel.mode == "info" and "Beat detection error" in ctl3.info_text and not ctl3._analysis_busy,
+              "a failed detection leaves its error on screen (card not re-selected over it)")
+        ctl3._analysis_busy = "stems"
+        ctl3.run_beats("beats")
+        check("wait" in ctl3.play_status_var.get(), "picking Beats while another job runs says why nothing happens")
+        ctl3._analysis_busy = None
+    finally:
+        aa.beats_available, aa.detect_beats = real_avail, real_detect
+
+
+
+XSQ_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<xsequence BaseChannel="0" FixedPointTiming="1">
+  <head>
+    <version>2025.13.1</version>
+    <author>Me</author>
+    <song>Jingle</song>
+    <sequenceTiming>25 ms</sequenceTiming>
+    <sequenceType>Media</sequenceType>
+    <mediaFile>C:\\\\Shows\\\\xsq_song.wav</mediaFile>
+    <sequenceDuration>90.500</sequenceDuration>
+  </head>
+  <DisplayElements>
+    <Element type="model" name="Yard" visible="1"/>
+    <Element type="model" name="Star" visible="0"/>
+    <Element type="model" name="MegaTree" visible="1"/>
+    <Element type="model" name="Ghost" visible="1"/>
+    <Element type="timing" name="Lyrics" visible="1"/>
+  </DisplayElements>
+  <ElementEffects>
+    <Element type="model" name="Yard">
+      <EffectLayer>
+        <Effect ref="0" name="On" startTime="0" endTime="1000"/>
+        <Effect ref="0" name="Twinkle" startTime="1000" endTime="2000"/>
+      </EffectLayer>
+      <EffectLayer/>
+    </Element>
+    <Element type="model" name="Star"><EffectLayer/></Element>
+    <Element type="model" name="MegaTree">
+      <EffectLayer><Effect ref="1" name="On" startTime="0" endTime="500"/></EffectLayer>
+      <SubModelEffectLayer name="Top"><Effect ref="1" name="Bars" startTime="0" endTime="500"/></SubModelEffectLayer>
+      <Strand index="0">
+        <Effect ref="1" name="On" startTime="0" endTime="500"/>
+        <Node index="2"><Effect ref="1" name="Off" startTime="0" endTime="500"/></Node>
+      </Strand>
+    </Element>
+    <Element type="timing" name="Lyrics">
+      <EffectLayer><Effect label="Hello world" startTime="0" endTime="1000"></Effect></EffectLayer>
+      <EffectLayer>
+        <Effect label="Hello" startTime="0" endTime="500"></Effect>
+        <Effect label="world" startTime="500" endTime="1000"></Effect>
+      </EffectLayer>
+    </Element>
+  </ElementEffects>
+</xsequence>
+"""
+
+
+def test_round26(th, aa, wt, media):
+    print("\n-- round 26: undo view, paste, card length/lock, Beats options, Structure --")
+    import timing_panel as tp
+    import utils
+    # 1. undo/redo bring back the zoom/scroll the change was made in
+    ctl, c, _t, _tab = bare_controller(wt, fresh_copy(media, "r26"), 100.0)
+    ctl.view_start, ctl.view_end = 40.0, 50.0
+    m = ctl._add_mark("range", 42.0, 44.0)
+    ctl.view_start, ctl.view_end = 0.0, 100.0           # zoomed out / scrolled away meanwhile
+    ctl.undo_marks()
+    check((ctl.view_start, ctl.view_end) == (40.0, 50.0), "undo returns to the zoom/scroll the change was made in")
+    ctl.view_start, ctl.view_end = 70.0, 80.0
+    ctl.redo_marks()
+    check((ctl.view_start, ctl.view_end) == (40.0, 50.0), "...and so does redo")
+    check(len(ctl._history_views) == len(ctl._mark_history), "one remembered view per undo step")
+
+    # 2. paste replaces the selection
+    class StubEntry:
+        def __init__(self, text, sel=None):
+            self.text, self.sel, self.cursor = text, sel, len(text)
+        def clipboard_get(self): return "1:02.500"
+        def cget(self, k): return "normal"
+        def selection_present(self): return self.sel is not None
+        def delete(self, a, b):
+            if (a, b) == ("sel.first", "sel.last"):
+                if self.sel is None:
+                    raise utils.tk.TclError("no selection")
+                i, j = self.sel
+                self.text, self.cursor, self.sel = self.text[:i] + self.text[j:], i, None
+        def insert(self, where, s):
+            self.text = self.text[:self.cursor] + s + self.text[self.cursor:]
+            self.cursor += len(s)
+    e = StubEntry("0:58.000", sel=(0, 8)); e.cursor = 8
+    check(utils.paste_replacing_selection(e) and e.text == "1:02.500", "Ctrl+V replaces a field's selected text")
+    e2 = StubEntry("0:58"); e2.cursor = 4
+    utils.paste_replacing_selection(e2)
+    check(e2.text == "0:581:02.500", "...and inserts at the cursor when nothing is selected")
+    binds = []
+    class Root:
+        def bind_class(self, cls, seq, fn): binds.append((cls, seq))
+    utils.install_paste_replaces_selection(Root())
+    check(sorted(binds) == [("Entry", "<<Paste>>"), ("TEntry", "<<Paste>>"), ("Text", "<<Paste>>")],
+          "...in every Entry and Text (only Tk's own <<Paste>> binding is replaced)")
+
+    # 3-5. card length, End = Start, too short, the length lock
+    ctl2, _c2, _t2, _tab2 = bare_controller(wt, fresh_copy(media, "r26b"), 100.0)
+    tr = ctl2._new_track("L")
+    a = ctl2._add_mark("range", 10.0, 12.5, label="a", track_id=tr["id"])
+    b = ctl2._add_mark("range", 20.0, 21.0, label="b", track_id=tr["id"])
+    ctl2.selected = ("track", tr["id"]); ctl2.render_waveform(); run_afters()
+    panel = ctl2.panel
+    card = panel.cards[a["id"]]
+    check(card["dur"].cget("text") == "2.500 s", "a card shows its length")
+    card["end"].delete(0, "end"); card["end"].insert(0, "0:10.005")
+    panel._commit_time(a["id"], "end")
+    shown_hint = panel._hint is not None
+    run_afters()
+    a = ctl2.mark_by_id(a["id"])
+    check(a["end"] == 12.5 and "at least 10 ms" in panel.last_hint and "End = Start" in panel.last_hint,
+          "too short an End is refused, with a note saying the minimum and how to make a mark")
+    check("at least 10 ms" in ctl2.play_status_var.get(), "...also on the status bar")
+    check(shown_hint and panel._hint is None, "...the note pops up under the field, then goes away by itself")
+    panel.hide_hint()
+    card["end"].delete(0, "end"); card["end"].insert(0, "0:10.000")
+    panel._commit_time(a["id"], "end"); run_afters()
+    a = ctl2.mark_by_id(a["id"])
+    check(a["type"] == "point" and a["end"] is None, "End = Start makes the card a mark (no length)")
+    check(panel.cards[a["id"]]["dur"].cget("text") == "mark", "...and its length reads \u201cmark\u201d")
+    ctl2.undo_marks(); run_afters()
+    a = ctl2.mark_by_id(a["id"])
+    check(a["end"] == 12.5, "(undo)")
+    panel._set_entry(panel.cards[a["id"]]["end"], "0:12.500")
+    panel.step_var.set("1.0")
+    ctl2.set_mark_times(a["id"], 10.0, 10.5); run_afters()
+    panel.last_hint = ""
+    panel._nudge(a["id"], "end", -1)
+    a = ctl2.mark_by_id(a["id"])
+    check(abs(a["end"] - 10.01) < 1e-9, "End \u2212 stops at the shortest length")
+    panel._nudge(a["id"], "end", -1)
+    check("at least 10 ms" in panel.last_hint, "...and pressing it again says why")
+    ctl2.set_mark_times(a["id"], 10.0, 12.5); run_afters()
+    # lock
+    panel.toggle_lock(a["id"])
+    check(panel.is_locked(a["id"]), "the padlock locks the card's length")
+    card = panel.cards[a["id"]]
+    card["start"].delete(0, "end"); card["start"].insert(0, "0:15.000")
+    panel._commit_time(a["id"], "start"); run_afters()
+    a = ctl2.mark_by_id(a["id"])
+    check((a["start"], a["end"]) == (15.0, 17.5), "locked: a new Start moves the whole card")
+    card = panel.cards[a["id"]]
+    card["end"].delete(0, "end"); card["end"].insert(0, "0:16.000")
+    panel._commit_time(a["id"], "end"); run_afters()
+    a = ctl2.mark_by_id(a["id"])
+    check((a["start"], a["end"]) == (13.5, 16.0), "...a new End too (the length stays 2.5 s)")
+    panel.step_var.set("0.5")
+    panel._nudge(a["id"], "start", 1)
+    a = ctl2.mark_by_id(a["id"])
+    check((a["start"], a["end"]) == (14.0, 16.5), "...and \u2212/+ move it as a whole")
+    panel._move_locked(a["id"], start=-5.0)
+    a = ctl2.mark_by_id(a["id"])
+    check((a["start"], a["end"]) == (0.0, 2.5), "...never before 0")
+    h = ctl2._mark_history_index
+    panel._move_locked(a["id"], start=4.0)
+    check(ctl2._mark_history_index == h + 1, "...one undo step per move")
+    panel.toggle_lock(a["id"])
+    check(not panel.is_locked(a["id"]), "click again: unlocked")
+    pt = ctl2._add_mark("point", 30.0, None, label="p", track_id=tr["id"]); ctl2.render_waveform(); run_afters()
+    check(panel.cards[pt["id"]]["lock"].cget("state") == "disabled", "a mark with no length has no lock")
+
+    # 6. Beats: length and labels
+    beats = [0.5 * i for i in range(17)]
+    specs = th.beat_marks(beats, 0.0, 8.0, 4, 0, "beat", 1)
+    fill = th.style_beat_marks(specs, "fill", True, beats=beats, end=8.0)
+    check([(m["start"], m["end"]) for m in fill] == [(0.0, 2.0), (2.0, 4.0), (4.0, 6.0), (6.0, 8.0)],
+          "Length: up to the next mark -- downbeats touch, the last one a bar long")
+    one = th.style_beat_marks(specs, "beat", True, beats=beats, end=8.0)
+    check([m["end"] - m["start"] for m in one] == [0.5] * 4, "Length: one beat")
+    lines = th.style_beat_marks(specs, "lines", False, beats=beats)
+    check(all(m["end"] is None and m["label"] == "" for m in lines), "Length: no length (lines), labels off")
+    real_avail, real_detect = aa.beats_available, aa.detect_beats
+    aa.beats_available = lambda: True
+    aa.detect_beats = lambda path, progress=None: {"tempo": 120.0, "beats": beats, "strength": [1.0] * 17,
+                                                   "bass": [3.0 if i % 4 == 0 else 0.1 for i in range(17)]}
+    try:
+        wt.set_preference("beats_scope", "all")
+        wt.set_preference("beats_length", "lines"); wt.set_preference("beats_labels", False)
+        ctl2.selected = None
+        ctl2.run_beats("beat", 1); run_afters()
+        bm = ctl2.track_marks(ctl2.tracks[-1]["id"])
+        check(bm and all(m["type"] == "point" and m["label"] == "" for m in bm),
+              "Beats \u25be with Length: lines and labels off makes unlabeled point marks")
+        ctl2.beats_menu.entries.clear(); ctl2._fill_beats_menu()
+        labels = ctl2.beats_menu.labels()
+        check(any(l.startswith("Length: No length") for l in labels)
+              and any(l.startswith("Label the marks") for l in labels), "the menu has Length \u25b8 and Label the marks")
+    finally:
+        aa.beats_available, aa.detect_beats = real_avail, real_detect
+        wt.set_preference("beats_length", "fill"); wt.set_preference("beats_labels", True)
+
+    # 7. Structure
+    import numpy as np
+    rng = np.random.default_rng(2)
+    pattern = "IABABCBBO"
+    proto = {L: rng.normal(size=25) for L in sorted(set(pattern))}
+    feats = [list(proto[L] + rng.normal(scale=0.7, size=25)) for L in pattern for _ in range(16)]
+    found = aa.find_sections(feats, list(range(0, len(feats), 4)), min_beats=16)
+    check(found["bounds"] == [0, 16, 32, 48, 64, 80, 96, 128, 144], "Structure: section boundaries at the changes")
+    check("".join(found["letters"]) == "ABCBCDCE", "...repeats get the same letter (B B in a row is one section)")
+    names = aa.name_sections(found["letters"], [0.2, 0.5, 0.9, 0.5, 0.9, 0.6, 0.9, 0.3])
+    check(names == ["Intro", "Verse 1", "Chorus 1", "Verse 2", "Chorus 2", "Bridge", "Chorus 3", "Outro"],
+          "...names: loudest repeat = Chorus, other repeat = Verse, one-offs = Intro/Bridge/Outro")
+    check(aa.name_sections(list("ABCBCA"), [0.2, 0.5, 0.9, 0.5, 0.9, 0.2])[0] == "Intro"
+          and aa.name_sections(list("ABCBCA"), [0.2, 0.5, 0.9, 0.5, 0.9, 0.2])[-1] == "Outro",
+          "...a part heard only at the start and the end is Intro / Outro")
+    check(aa.name_sections(list("ABCD"), [1, 1, 1, 1], vocal=[None, 0.0, 0.8, None])[1] == "Instrumental",
+          "...a one-off part without vocals (stems known) is Instrumental")
+    ctl3, _c3, _t3, _tab3 = bare_controller(wt, fresh_copy(media, "r26c"), 80.0)
+    times = [0.5 * i for i in range(len(feats))]
+    calls = {"n": 0}
+
+    def fake_struct(path, progress=None):
+        calls["n"] += 1
+        return {"tempo": 120.0, "beats": times, "strength": [1.0] * len(times),
+                "bass": [3.0 if i % 4 == 0 else 0.1 for i in range(len(times))],
+                "features": feats, "rms": [{"I": .2, "A": .5, "B": .9, "C": .6, "O": .3}[pattern[i // 16]]
+                                           for i in range(len(times))]}
+    real_s, real_sa = aa.structure_features, aa.structure_available
+    aa.structure_features, aa.structure_available = fake_struct, (lambda: True)
+    try:
+        wt.set_preference("structure_names", "guess"); wt.set_preference("structure_min_bars", 4)
+        ctl3.structure_menu.entries.clear(); ctl3._fill_structure_menu()
+        ctl3.structure_menu.invoke_label("Find sections \u2192 new \u201cStructure\u201d track"); run_afters()
+        tr3 = ctl3.tracks[-1]
+        sm = sorted(ctl3.track_marks(tr3["id"]), key=lambda m: m["start"])
+        check(tr3["name"] == "Structure" and [m["label"] for m in sm][:3] == ["Intro", "Verse 1", "Chorus 1"],
+              "Structure \u25be > Find sections makes a \u201cStructure\u201d track of named sections")
+        check(sm[0]["start"] == 0.0 and sm[-1]["end"] == 80.0 and all(m["source"] == "structure" for m in sm)
+              and all(abs(x["end"] - y["start"]) < 1e-9 for x, y in zip(sm, sm[1:])),
+              "...covering the whole song, touching")
+        check(getattr(ctl3, "_beat_cache", None) is not None, "...and Beats \u25be reuses its beats (no second analysis)")
+        wt.set_preference("structure_names", "both")
+        ctl3.run_structure(); run_afters()
+        sm2 = sorted(ctl3.track_marks(ctl3.tracks[-1]["id"]), key=lambda m: m["start"])
+        check(calls["n"] == 1 and sm2[1]["label"] == "Verse 1 \u00b7 B" and ctl3.tracks[-1]["name"] == "Structure 2",
+              "...run again: analyzed once per file; Names: Both adds the letter")
+        labels = ctl3.structure_menu.labels()
+        check(any(l.startswith("Shortest section: 4 bars") for l in labels) and any(l.startswith("Names:") for l in labels),
+              "the Structure menu has Names \u25b8 and Shortest section \u25b8")
+    finally:
+        aa.structure_features, aa.structure_available = real_s, real_sa
+        wt.set_preference("structure_names", "guess")
+
+
+def test_xsq_tab():
+    print("\n-- xsq_tab: an xLights sequence --")
+    import xsq_tab as xq
+    import utils
+    show = os.path.join(tempfile.mkdtemp(prefix="tracked_xsq_"), "xsqshow")     # nothing above it
+    seqdir = os.path.join(show, "Sequences", "2025")
+    os.makedirs(seqdir, exist_ok=True)
+    path = os.path.join(seqdir, "song.xsq")
+    with open(path, "w") as f:
+        f.write(XSQ_XML)
+    with open(os.path.join(seqdir, "xsq_song.wav"), "wb") as f:
+        f.write(b"RIFF")
+    other = os.path.join(TMP, "notseq.xsq")
+    with open(other, "w") as f:
+        f.write("<?xml version='1.0'?><something/>")
+    check(xq.is_xsq_file(path) and not xq.is_xsq_file(other), "only an .xsq with an <xsequence> root is taken")
+    seq = xq.parse_xsq(path)
+    info = seq["info"]
+    check(info["version"] == "2025.13.1" and info["duration"] == 90.5 and info["frame_ms"] == 25
+          and info["fps"] == 40.0, "head: version, duration, 25 ms frames = 40 fps")
+    mt = seq["elements"]["MegaTree"]
+    check(mt["own"] == 1 and mt["parts"] == {"Top": 1, "Strand 1": 1, "Strand 1 / Node 3": 1} and mt["effects"] == 4,
+          "effects counted on the model, its submodels, strands and nodes")
+    check(seq["order"] == ["Yard", "Star", "MegaTree", "Ghost"] and seq["elements"]["Star"]["visible"] is False,
+          "elements in the sequence's order, with Visible")
+    check(seq["timing"]["Lyrics"]["layers"] == [1, 2] and seq["total"] == 6,
+          "timing tracks: marks per layer (not counted as effects)")
+    check(xq.find_media(info["media"], path) == os.path.join(seqdir, "xsq_song.wav"),
+          "the media file (a Windows path) is found by name next to the sequence")
+    utils.set_preference(xq.PREF_SHOW_FOLDER, None)
+    check(xq.find_show_folder(path) is None, "no layout anywhere above: no show folder")
+    with open(os.path.join(show, "xlights_rgbeffects.xml"), "w") as f:
+        f.write(LAYOUT_XML)
+    check(xq.find_show_folder(path) == show, "the show folder is found two levels up")
+
+    canvas, text, tab = FakeCanvas(FakeWidget()), FakeText(), FakeTab()
+    check(xq.onload(path, canvas=canvas, text=text, tab=tab), "the plugin claims the sequence")
+    view = canvas._xsq_view
+    summary = text.get()
+    check("2025.13.1" in summary and "40 fps" in summary and "Lyrics: " in summary
+          and "1 group, 2 models, 1 not in the layout" in summary
+          and "found here as" in summary and tab.protect_file, "summary in the text panel; the file is protected")
+    rows = {r["element"]: r for r in view.shown}
+    check(rows["Yard"]["kind"] == "group" and rows["Star"]["kind"] == "model" and rows["Ghost"]["kind"] == "not in layout",
+          "Kind from the show folder's layout: group / model / not in layout")
+    tree = view.tree
+    check([tree.item(i)["text"] for i in tree.get_children()] == ["Yard", "Star", "MegaTree", "Ghost"],
+          "the list starts in the sequence's order")
+    check(len(tree.get_children("e:MegaTree")) == 3, "...submodels / strands / nodes as child rows")
+    view.sort_by("effects")
+    check([tree.item(i)["text"] for i in tree.get_children()][:2] == ["MegaTree", "Yard"],
+          "clicking Effects sorts most first")
+    view.only_fx.set(True); view._toggle_only_fx()
+    check(len(tree.get_children()) == 2, "Only with effects hides the empty ones")
+    view.only_fx.set(False); view._toggle_only_fx()
+    view.set_filter("types", "Twinkle")
+    check([tree.item(i)["text"] for i in tree.get_children()] == ["Yard"], "filter by effect type")
+    view.set_filter("effects", ">=2")
+    check(len(tree.get_children()) == 2, "...or by a count")
+    view.clear_filter(); view.file_order()
+    check(tree.item(tree.get_children()[0])["text"] == "Yard", "File order puts it back")
+    check(xq.types_text(xq.Counter({"On": 3, "Bars": 1, "Off": 1, "Twinkle": 1}), 2) == "On 3, Bars 1, +2 more",
+          "effect types: most used first")
+
+
+
+def test_round27(th, aa, wt, media):
+    print("\n-- round 27: option clicks keep the Beats / Structure / Stems menus open --")
+    ctl, _c, _t, _tab = bare_controller(wt, fresh_copy(media, "r27"), 30.0)
+    popped = []
+    for name in ("beats_menu", "structure_menu", "stems_menu"):
+        menu = getattr(ctl, name)
+        menu.tk_popup = lambda x, y, n=name: popped.append(n)
+    real_avail = aa.beats_available
+    aa.beats_available = lambda: True
+    try:
+        wt.set_preference("beats_labels", True); wt.set_preference("beats_length", "fill")
+        ctl.beats_menu.entries.clear(); ctl._fill_beats_menu()
+        ctl.beats_menu.invoke_label("Label the marks (beat / bar numbers)")
+        check(not popped, "(the menu comes back once Tk has closed it, not inside the click)")
+        run_afters()
+        check(popped == ["beats_menu"], "turning Label the marks on/off keeps the Beats menu open")
+        ctl._beats_subs["length"].invoke_label("No length (lines)"); run_afters()
+        check(popped[-1] == "beats_menu" and wt.get_preference("beats_length") == "lines",
+              "picking a Length opens the Beats menu again (its label shows the new choice)")
+        ctl.beats_menu.entries.clear(); ctl._fill_beats_menu()
+        check(any(e.get("label") == "Length: No length (lines)" for e in ctl.beats_menu.entries),
+              "...Length: No length (lines)")
+        for key, label in (("per_bar", "3"), ("where", wt.WaveformController.BEAT_SCOPES[1][1])):
+            n = len(popped)
+            ctl._beats_subs[key].invoke_label(label); run_afters()
+            check(len(popped) == n + 1, f"...also Beats per bar / Where ({key})")
+        ran = []
+        ctl.run_metronome = lambda *a, **k: ran.append("metronome")
+        ctl.beats_menu.entries.clear(); ctl._fill_beats_menu()
+        n = len(popped)
+        ctl.beats_menu.invoke_label("Metronome..."); run_afters()
+        check(ran == ["metronome"] and len(popped) == n, "an action (Metronome..., All beats...) still closes the menu")
+        ctl.structure_menu.entries.clear(); ctl._fill_structure_menu()
+        ctl._structure_subs["bars"].invoke_label("8 bars"); run_afters()
+        check(popped[-1] == "structure_menu" and wt.get_preference("structure_min_bars") == 8,
+              "Structure: Shortest section keeps its menu open")
+        ctl._structure_subs["names"].invoke_label(wt.WaveformController.STRUCTURE_NAMES[1][1]); run_afters()
+        check(popped[-1] == "structure_menu", "...and Names")
+        ctl._set_regions([{"start": 0.0, "end": 5.0, "kind": "vocal"}, {"start": 5.0, "end": 9.0, "kind": "novocal"}])
+        ctl.stems_menu.entries.clear(); ctl._fill_stems_menu()
+        ctl.stems_menu.invoke_label("   Merge touching regions of different stems"); run_afters()
+        check(popped[-1] == "stems_menu", "Stems \u25be: Merge touching regions keeps the menu open")
+    finally:
+        aa.beats_available = real_avail
+        wt.set_preference("beats_length", "fill"); wt.set_preference("beats_per_bar", 4)
+        wt.set_preference("beats_scope", "auto"); wt.set_preference("structure_min_bars", 4)
+        wt.set_preference("structure_names", "guess")
+
+
+
+def test_xsq_loops():
+    print("\n-- xsq_tab: loops, repeated passages, copied rows --")
+    import xsq_tab as xq
+
+    def eff(st, en, name="On", ref="1", pal="0"):
+        return f'<Effect ref="{ref}" name="{name}" startTime="{st}" endTime="{en}" palette="{pal}"/>'
+    # A and B: a 2 s pattern repeated 4 times from 4 s (back to back) -> one loop 4..12 s
+    # C: one-off effects; D: copy of A (same effects); E: 1 s passage at 1 s, again at 20 s
+    pat = lambda base: "".join(eff(base + o, base + o + 400, n, r)
+                               for o, n, r in ((0, "On", "1"), (500, "Twinkle", "2"), (1000, "Bars", "3")))
+    a = "".join(pat(4000 + 2000 * k) for k in range(4))
+    b = "".join(eff(4000 + 2000 * k + 1500, 4000 + 2000 * k + 1900, "Off", "4") for k in range(4))
+    passage = lambda base: "".join(eff(base + o, base + o + 300, "Fan", "5") for o in (0, 300, 600, 900))
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<xsequence><head><version>2025.1</version><sequenceTiming>50 ms</sequenceTiming>
+<mediaFile>x.wav</mediaFile><sequenceDuration>30.000</sequenceDuration></head>
+<DisplayElements><Element type="model" name="A"/><Element type="model" name="B"/><Element type="model" name="C"/>
+<Element type="model" name="D"/><Element type="model" name="E"/><Element type="model" name="Base"/></DisplayElements>
+<ElementEffects>
+<Element type="model" name="A"><EffectLayer>{a}</EffectLayer></Element>
+<Element type="model" name="B"><EffectLayer>{b}</EffectLayer><SubModelEffectLayer name="Top">{a}</SubModelEffectLayer></Element>
+<Element type="model" name="C"><EffectLayer>{eff(1000, 1500, "Text", "9")}{eff(14000, 15000, "Text", "9")}</EffectLayer></Element>
+<Element type="model" name="D"><EffectLayer/><EffectLayer>{a}</EffectLayer></Element>
+<Element type="model" name="E"><EffectLayer>{passage(16000)}{eff(18000, 18500, "Text", "8")}{passage(24000)}</EffectLayer></Element>
+<Element type="model" name="Base"><EffectLayer>{eff(0, 30000, "Color Wash", "7")}</EffectLayer></Element>
+</ElementEffects></xsequence>"""
+    path = os.path.join(tempfile.mkdtemp(prefix="tracked_xsql_"), "loops.xsq")
+    with open(path, "w") as f:
+        f.write(xml)
+    seq = xq.parse_xsq(path)
+    check(len(seq["rows"][("A", "")]) == 12 and len(seq["rows"][("B", "Top")]) == 12,
+          "each row's effects are kept (element, submodel) for comparing")
+    copies = xq.find_copied_rows(seq)
+    check(copies == [[("A", ""), ("B", "Top"), ("D", "")]],
+          "copied rows: A, B's submodel Top and D (another layer) have exactly the same effects")
+    found = xq.find_loops(seq, duration_ms=30000)
+    loops = found["loops"]
+    check(len(loops) == 1 and (loops[0]["start"], loops[0]["end"], loops[0]["period"]) == (4000, 12000, 2000)
+          and loops[0]["repeats"] == 4.0, "a loop: 0:04-0:12, every 2 s, 4 times")
+    check(("A", "") in loops[0]["rows"] and ("B", "") in loops[0]["rows"],
+          "...across all the rows that repeat (the whole-song Color Wash doesn't break it)")
+    ps = found["passages"]
+    check(len(ps) == 1 and (ps[0]["start"], ps[0]["end"], ps[0]["period"]) == (16000, 17200, 8000),
+          "a repeated passage: 0:16-0:17.2 again at 0:24 (something else in between)")
+    report = xq.loops_report(seq, found, copies)
+    check("Loop 1: {cyan}0:04.000\u20130:12.000" in report and "every 2.000 s (4\u00d7)" in report
+          and "again at {cyan}0:24.000" in report and "A, B / Top, D" in report, "the report lists them")
+    # a single strand of changes: no loop
+    check(xq.find_loops({"rows": {("X", ""): [(0, i * 1000, i * 1000 + 500, ("On", str(i), "0")) for i in range(20)]}},
+                        duration_ms=30000) == {"loops": [], "passages": []}, "all-different effects: no loops")
+    # overlapping finds: the longest wins, then the shorter period
+    rows = {("X", ""): [(0, i * 1000, i * 1000 + 500, ("On", "1", "0")) for i in range(20)]}
+    lp = xq.find_loops({"rows": rows}, duration_ms=20000)["loops"]
+    check(len(lp) == 1 and lp[0]["period"] == 1000 and (lp[0]["start"], lp[0]["end"]) == (0, 20000),
+          "overlapping loops (every 1 s / 2 s / ...): the largest, with the shortest period")
+
+    # the view: Same as column, Find loops in the background
+    canvas, text, tab = FakeCanvas(FakeWidget()), FakeText(), FakeTab()
+    xq.onload(path, canvas=canvas, text=text, tab=tab)
+    view = canvas._xsq_view
+    tree = view.tree
+    check(tree.item("e:A")["values"][-1] == "= B / Top, D" and tree.item("e:D")["values"][-1] == "= A, B / Top",
+          "Same as column names the copies")
+    check(tree.item("p:B/Top")["values"][-1] == "= A, D", "...also on a submodel's row")
+    check("Copied rows: " in text.get() and "1 set of rows" in text.get(), "the summary mentions copied rows")
+    view.set_filter("same", "A")
+    check([tree.item(i)["text"] for i in tree.get_children()] == ["D"], "filter on Same as")
+    view.clear_filter()
+    check(view.find_loops(), "Find loops starts")
+    view._loop_thread.join(10)
+    run_afters()
+    check(view._loop_thread is None and "Loop 1:" in text.get() and "[xsq_tab] {green}" not in text.get()
+          and "1 loop, 1 repeated passage, 1 copied set" == view.status_var.get(),
+          "...the report appears under the summary; the status line counts them")
+    before = text.get()
+    view.find_loops()
+    check(view._loop_thread is None and text.get() == before, "...a second click shows it again (no new search)")
+
+
+
+def test_xsq_loop_settings():
+    print("\n-- xsq_tab: nudge tolerance, rows left out of loop checking --")
+    import xsq_tab as xq
+    import xlayout_tab as xlt
+    import utils
+    sig = lambda n: ("On", str(n), "0")
+    # a 1 s pattern of 4 effects, repeated 10 times; repeats 3 and 7 nudged by 1 frame (50 ms)
+    def row(nudged=(3,), shift=50):
+        out = []
+        for k in range(10):
+            dk = shift if k in nudged else 0
+            for o, n in ((0, 1), (200, 2), (400, 3), (600, 4)):
+                out.append((0, k * 1000 + o + dk, k * 1000 + o + 150 + dk, sig(n)))
+        return out
+    seq = {"rows": {("M", ""): row(), ("N", ""): row(())}, "order": ["M", "N"], "info": {"frame_ms": 50}}
+    exact = xq.find_loops(seq, duration_ms=20000, tol_ms=0)["loops"]
+    loose = xq.find_loops(seq, duration_ms=20000, tol_ms=50)["loops"]
+    check(not any(l["end"] - l["start"] >= 9000 for l in exact), "exact matching: nudged repeats break the loop")
+    check(len(loose) == 1 and (loose[0]["start"], loose[0]["period"]) == (0, 1000) and loose[0]["end"] >= 10000,
+          "1 frame of tolerance: one 1 s loop across the nudges")
+    check(xq.find_copied_rows(seq, 0) == [] and xq.find_copied_rows(seq, 50) == [[("M", ""), ("N", "")]],
+          "copied rows: a nudged copy matches within the tolerance only")
+    check(xq.find_copied_rows(seq, 49) == [], "...not when the nudge is bigger than the tolerance")
+    check(xq._pick_shifts(xq.Counter({1000: 30, 1050: 3, 950: 3, 2000: 20}), 50, 4)[:2] == [1000, 2000],
+          "nearby repeat distances (nudges) are pooled; one distance per pool is tried")
+    # exclusions
+    check(xq.parse_patterns("Arch*\n# comment\n  Tree / Top  \nArch*\n\n") == ["Arch*", "Tree / Top"],
+          "the exclusion list: one per line, # comments, duplicates dropped")
+    seq2 = {"rows": {("Arch 1", ""): [], ("Arch 2", "Seg"): [], ("Tree", "Top"): [], ("Tree", ""): [],
+                     ("Star [1]", ""): []}, "order": []}
+    check(xq.excluded_rows(seq2, ["arch*"]) == {("Arch 1", ""), ("Arch 2", "Seg")},
+          "a wildcard (any case) leaves out models and all their submodels")
+    check(xq.excluded_rows(seq2, ["Tree / Top"]) == {("Tree", "Top")}, "\u201cModel / Submodel\u201d leaves out one part")
+    check(xq.excluded_rows(seq2, [xq.glob_escape("Star [1]")]) == {("Star [1]", "")},
+          "a name with [ ] * ? is matched literally when added by right-click")
+    # controller assignment from the layout
+    mc = xlt.model_controller
+    check(mc({"Controller": "Falcon F16"}) == "Falcon F16" and mc({"StartChannel": "!PixLite:1"}) == "PixLite"
+          and mc({"Controller": "No Controller", "StartChannel": "1"}) is not None
+          and mc({"Controller": "No Controller"}) is None and mc({}) is None,
+          "controller: the Controller attribute, a !Controller:n start channel, or an absolute channel")
+    layout = {"models": {"A": {"controller": "F16"}, "B": {"controller": None}, "C": {"controller": None}},
+              "groups": {"G1": {"models": ["B", "C"], "groups": []}, "G2": {"models": ["A", "B"], "groups": []},
+                         "G3": {"models": [], "groups": ["G1"]}}}
+    check(xq.no_controller_names(layout) == {"B", "C", "G1", "G3"},
+          "no controller: those models, and groups made only of them (nested too)")
+
+    # the view
+    path = os.path.join(tempfile.mkdtemp(prefix="tracked_xsqs_"), "set.xsq")
+    def effs(base_nudge=0):
+        return "".join(f'<Effect ref="{n}" name="On" startTime="{k*1000+o+(base_nudge if k == 4 else 0)}" '
+                       f'endTime="{k*1000+o+150+(base_nudge if k == 4 else 0)}" palette="0"/>'
+                       for k in range(8) for o, n in ((0, 1), (300, 2), (600, 3), (800, 4)))
+    with open(path, "w") as f:
+        f.write(f"""<?xml version="1.0"?><xsequence><head><sequenceTiming>50 ms</sequenceTiming>
+<sequenceDuration>10.000</sequenceDuration></head><DisplayElements>
+<Element type="model" name="Loop"/><Element type="model" name="Copy"/><Element type="model" name="Noise"/>
+</DisplayElements><ElementEffects>
+<Element type="model" name="Loop"><EffectLayer>{effs()}</EffectLayer></Element>
+<Element type="model" name="Copy"><EffectLayer>{effs(50)}</EffectLayer></Element>
+<Element type="model" name="Noise"><EffectLayer><Effect ref="9" name="Text" startTime="2500" endTime="2600" palette="0"/>
+</EffectLayer></Element></ElementEffects></xsequence>""")
+    utils.set_preference(xq.PREF_TOLERANCE, 1)
+    utils.set_preference(xq.PREF_EXCLUDE, [])
+    utils.set_preference(xq.PREF_SKIP_NO_CONTROLLER, False)
+    canvas, text, tab = FakeCanvas(FakeWidget()), FakeText(), FakeTab()
+    xq.onload(path, canvas=canvas, text=text, tab=tab)
+    view = canvas._xsq_view
+    check(view.tree.item("e:Loop")["values"][-1] == "= Copy", "Same as uses the tolerance (Copy is nudged 1 frame)")
+    view.find_loops(); view._loop_thread.join(10); run_afters()
+    check("Loop 2: 0:02.600" in text.get() and "within 50 ms (1 frame)" in text.get(),
+          "the Noise effect splits the loop in two; the report says how close times must be")
+    view.set_excluded([("Noise", "")], True); view._loop_thread and view._loop_thread.join(10); run_afters()
+    check(view.patterns() == ["Noise"] and "excluded" in view.tree.item("e:Noise")["tags"],
+          "right-click > Leave out: added to the list, the row is crossed out")
+    check("Loop 1: 0:00.000\u20130:08.000" in text.get() and "Loop 2:" not in text.get()
+          and "Not checked for loops (1 row): Noise" in text.get(),
+          "...the report is worked out again at once: one loop, and it says what wasn't checked")
+    view.set_excluded([("Noise", "")], False); view._loop_thread and view._loop_thread.join(10); run_afters()
+    check(view.patterns() == [] and "Loop 2:" in text.get(), "Check for loops again undoes it")
+    view.apply_settings(tolerance_frames=0); view._loop_thread and view._loop_thread.join(10); run_afters()
+    check(view.tree.item("e:Loop")["values"][-1] == "" and "exactly equal" in text.get(),
+          "tolerance 0: the nudged copy no longer counts")
+    view.loop_settings_dialog()
+    st = view._settings
+    check(st["tolerance"].get() == "0" and not st["no_controller"].get(), "Loop settings... shows the current settings")
+    st["tolerance"].set("2"); st["box"].insert("end", "No*\n# old stuff\n")
+    st["ok"](); view._loop_thread and view._loop_thread.join(10); run_afters()
+    check(view.tolerance_frames() == 2 and view.patterns() == ["No*"] and "Loop 1:" in text.get()
+          and "Loop 2:" not in text.get(),
+          "...OK saves them (and the report follows)")
+    utils.set_preference(xq.PREF_TOLERANCE, xq.DEFAULT_TOLERANCE_FRAMES)
+    utils.set_preference(xq.PREF_EXCLUDE, [])
+
 
 def main():
     th, aa, wt, used_fake_sf = load_modules()
@@ -5355,6 +6150,9 @@ def main():
     test_xlayout_view(layout_path)
     test_xlayout_round3(layout_path)
     test_logview_wrap()
+    test_xsq_tab()
+    test_xsq_loops()
+    test_xsq_loop_settings()
 
     if not HAVE_FFMPEG:
         print("\n-- media tests --\n  SKIP: ffmpeg/ffprobe not found on PATH")
@@ -5409,6 +6207,12 @@ def main():
         test_round20(th, aa, wt, media)
         test_round21(th, aa, wt, media)
         test_round22(th, aa, wt, media)
+        test_round23(th, aa, wt, media)
+        test_round24(th, aa, wt, media)
+        test_round25(th, aa, wt, media)
+        test_group_drag(th, aa, wt, media)
+        test_round26(th, aa, wt, media)
+        test_round27(th, aa, wt, media)
 
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n{'=' * 50}")

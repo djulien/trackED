@@ -175,6 +175,24 @@ def nodes_text(nodes: Optional[int], kind: str) -> str:
     return "" if k.startswith("dmx") or k in ("image", "label", "ruler") else "?"
 
 
+NO_CONTROLLER = ("", "no controller")
+
+
+def model_controller(attrs: Dict[str, str]) -> Optional[str]:
+    """The controller a model outputs to, or None when it isn't assigned:
+    its Controller attribute, else a "!Controller:channel" start channel;
+    an absolute start channel ("Use Start Channel") counts as assigned."""
+    ctrl = (attrs.get("Controller") or "").strip()
+    start = (attrs.get("StartChannel") or "").strip()
+    if ctrl.lower() not in NO_CONTROLLER and ctrl.lower() != "use start channel":
+        return ctrl
+    if start.startswith("!") and ":" in start:
+        return start[1:].split(":", 1)[0].strip() or None
+    if ctrl.lower() == "use start channel" or (start and start[0].isdigit()):
+        return "(start channel " + start + ")" if start else None
+    return None
+
+
 def parse_layout(path: str) -> Dict[str, Any]:
     """Read an xLights layout file:
     {"models": {name: {"name", "type", "nodes", "string_type", "submodels"}},
@@ -201,6 +219,7 @@ def parse_layout(path: str) -> Dict[str, Any]:
             "string_type": attrs.get("StringType", ""),
             "preview": attrs.get("LayoutGroup") or "Default",
             "submodels": [s.get("name", "") for s in el.findall("subModel")],
+            "controller": model_controller(attrs),
         }
     groups: Dict[str, Dict[str, Any]] = {}
     for el in root.iter("modelGroup"):
